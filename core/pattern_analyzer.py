@@ -1,5 +1,3 @@
-# core/pattern_analyzer.py
-
 """
 Модуль анализа паттернов
 """

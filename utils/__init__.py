@@ -1,19 +1,23 @@
 """
-Утилиты для Pattern Recognition Engine
+Пакет утилит для Pattern Recognition Engine
 """
 
 from .logger import setup_logger, logger
-from .mt5_connector import MT5Connector
-from .visualization import PatternVisualizer
-from .helpers import *
-
-__version__ = "1.0.0"
-__author__ = "Pattern Recognition Team"
+from .helpers import validate_data, calculate_metrics, format_datetime
+from .visualization import PatternVisualizer, plot_patterns, plot_interactive, plot_statistics
+from .mt5_connector import MT5Connector, mt5_connector
 
 __all__ = [
-    "setup_logger",
-    "logger",
-    "MT5Connector",
-    "PatternVisualizer",
+    'setup_logger',
+    'logger',
+    'validate_data',
+    'calculate_metrics',
+    'format_datetime',
+    'PatternVisualizer',
+    'plot_patterns',
+    'plot_interactive',
+    'plot_statistics',
+    'MT5Connector',
+    'mt5_connector'
 ]
 

@@ -230,21 +230,20 @@ class RiskManagementConfig:
 @dataclass
 class CONFIG:
     """Основная конфигурация приложения"""
-
     # Режимы работы
     MODE: str = "file"  # file, socket, websocket, api
     ENVIRONMENT: str = "development"  # development, testing, production
 
-    # Конфигурации подсистем
-    DATABASE: DatabaseConfig = DatabaseConfig()
-    MT5: MT5Config = MT5Config()
-    DETECTION: DetectionConfig = DetectionConfig()
-    ML: MLConfig = MLConfig()
-    BACKTESTING: BacktestingConfig = BacktestingConfig()
-    VISUALIZATION: VisualizationConfig = VisualizationConfig()
-    LOGGING: LoggingConfig = LoggingConfig()
-    API: APIConfig = APIConfig()
-    RISK_MANAGEMENT: RiskManagementConfig = RiskManagementConfig()
+    # Конфигурации подсистем - используем default_factory для каждого dataclass
+    DATABASE: DatabaseConfig = field(default_factory=DatabaseConfig)
+    MT5: MT5Config = field(default_factory=MT5Config)
+    DETECTION: DetectionConfig = field(default_factory=DetectionConfig)
+    ML: MLConfig = field(default_factory=MLConfig)
+    BACKTESTING: BacktestingConfig = field(default_factory=BacktestingConfig)
+    VISUALIZATION: VisualizationConfig = field(default_factory=VisualizationConfig)
+    LOGGING: LoggingConfig = field(default_factory=LoggingConfig)
+    API: APIConfig = field(default_factory=APIConfig)
+    RISK_MANAGEMENT: RiskManagementConfig = field(default_factory=RiskManagementConfig)
 
     # Производительность
     MAX_WORKERS: int = 4
@@ -262,6 +261,14 @@ class CONFIG:
         "logs_dir": str(LOGS_DIR),
         "config_dir": str(CONFIG_DIR)
     })
+
+    def __post_init__(self):
+        """Пост-инициализация для создания директорий"""
+        # Создаем директории при инициализации
+        for path_name, path_value in self.PATHS.items():
+            if path_name.endswith("_dir"):
+                path_obj = Path(path_value)
+                path_obj.mkdir(parents=True, exist_ok=True)
 
     def to_dict(self) -> Dict[str, Any]:
         """Конвертация конфигурации в словарь"""
@@ -281,7 +288,7 @@ class CONFIG:
         with open(filepath, 'r', encoding='utf-8') as f:
             config_dict = yaml.safe_load(f)
 
-        # Создаем экземпляр конфигурации
+        # Создаем экземпляр конфигурации с помощью default_factory
         config = cls()
 
         # Обновляем значения из файла
@@ -301,16 +308,6 @@ class CONFIG:
     def validate(self) -> List[str]:
         """Валидация конфигурации"""
         errors = []
-
-        # Проверка путей
-        for path_name, path_value in self.PATHS.items():
-            if path_name.endswith("_dir"):
-                path_obj = Path(path_value)
-                if not path_obj.exists():
-                    try:
-                        path_obj.mkdir(parents=True, exist_ok=True)
-                    except Exception as e:
-                        errors.append(f"Не удалось создать директорию {path_name}: {e}")
 
         # Проверка режимов
         if self.MODE not in ["file", "socket", "websocket", "api"]:
@@ -363,30 +360,48 @@ class CONFIG:
 # Глобальный экземпляр конфигурации
 config = CONFIG()
 
+# Обратная совместимость для старых импортов
+DATABASE_CONFIG = config.DATABASE
+MT5_CONFIG = config.MT5
+DETECTION_CONFIG = config.DETECTION
+ML_CONFIG = config.ML
+BACKTESTING_CONFIG = config.BACKTESTING
+VISUALIZATION_CONFIG = config.VISUALIZATION
+LOGGING_CONFIG = config.LOGGING
+API_CONFIG = config.API
+RISK_MANAGEMENT_CONFIG = config.RISK_MANAGEMENT
+
+# Для удобства - основные переменные
+SYMBOLS = config.MT5.SYMBOLS
+TIMEFRAMES = config.MT5.TIMEFRAMES
+DATABASE_PATH = config.DATABASE.NAME
+LOG_LEVEL = config.LOGGING.LEVEL
+
 # Создание дефолтных конфигурационных файлов для разных окружений
 def create_default_configs():
     """Создание дефолтных конфигурационных файлов"""
     environments = ["development", "testing", "production"]
 
     for env in environments:
-        config = CONFIG()
-        config.ENVIRONMENT = env
+        # Создаем новый экземпляр CONFIG для каждого окружения
+        current_config = CONFIG()
+        current_config.ENVIRONMENT = env
 
         # Настройки для разных окружений
         if env == "production":
-            config.LOGGING.LEVEL = "WARNING"
-            config.API.API_KEY_REQUIRED = True
-            config.DATABASE.TYPE = "postgresql"
-            config.MT5.AUTO_CONNECT = True
+            current_config.LOGGING.LEVEL = "WARNING"
+            current_config.API.API_KEY_REQUIRED = True
+            current_config.DATABASE.TYPE = "postgresql"
+            current_config.MT5.AUTO_CONNECT = True
 
         elif env == "testing":
-            config.LOGGING.LEVEL = "DEBUG"
-            config.DETECTION.MIN_PATTERN_QUALITY = 0.5
-            config.BACKTESTING.INITIAL_BALANCE = 1000.0
+            current_config.LOGGING.LEVEL = "DEBUG"
+            current_config.DETECTION.MIN_PATTERN_QUALITY = 0.5
+            current_config.BACKTESTING.INITIAL_BALANCE = 1000.0
 
         # Сохраняем конфигурацию
         config_file = CONFIG_DIR / f"config_{env}.yaml"
-        config.save(str(config_file))
+        current_config.save(str(config_file))
         print(f"Создан конфиг для окружения {env}: {config_file}")
 
 # Автоматическое создание конфигов при первом импорте

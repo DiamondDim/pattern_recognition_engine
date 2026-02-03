@@ -1,87 +1,74 @@
 """
-Модуль логирования
+Модуль для настройки логирования
 """
 
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any
-import structlog
-from datetime import datetime
+from typing import Optional
 
-from config import config
+try:
+    from config import config
+    LOGGING_CONFIG = config.LOGGING
+except ImportError:
+    # Для обратной совместимости
+    from config import LOGGING_CONFIG
 
-def setup_logger(level: str = None, log_file: str = None) -> structlog.BoundLogger:
+
+def setup_logger(name: str, log_file: Optional[str] = None, level: Optional[str] = None) -> logging.Logger:
     """
-    Настройка системы логирования
+    Настройка логгера
 
     Args:
-        level: Уровень логирования (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        log_file: Путь к файлу логов
+        name: Имя логгера
+        log_file: Путь к файлу лога
+        level: Уровень логирования
 
     Returns:
         Настроенный логгер
     """
     if level is None:
-        level = config.LOGGING.LEVEL
-
+        level = LOGGING_CONFIG.LEVEL
     if log_file is None:
-        log_file = config.LOGGING.FILE
+        log_file = LOGGING_CONFIG.FILE
 
-    # Создаем директорию для логов если её нет
-    log_path = Path(log_file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Настраиваем structlog
-    structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.UnicodeDecoder(),
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
-        ],
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        cache_logger_on_first_use=True,
-    )
-
-    # Настраиваем стандартное логирование
-    handler = logging.StreamHandler(sys.stdout)
-
-    # Добавляем файловый handler
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-
-    # Форматирование
-    formatter = logging.Formatter(
-        fmt=config.LOGGING.FORMAT,
-        datefmt=config.LOGGING.DATE_FORMAT
-    )
-
-    handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
-
-    # Получаем root логгер
-    logger = logging.getLogger()
+    # Создаем логгер
+    logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper()))
 
-    # Удаляем существующие handlers
-    for hdlr in logger.handlers[:]:
-        logger.removeHandler(hdlr)
+    # Проверяем, не добавлены ли уже обработчики
+    if logger.handlers:
+        return logger
 
-    # Добавляем наши handlers
-    logger.addHandler(handler)
-    logger.addHandler(file_handler)
+    # Форматтер
+    formatter = logging.Formatter(
+        LOGGING_CONFIG.FORMAT,
+        datefmt=LOGGING_CONFIG.DATE_FORMAT
+    )
 
-    # Создаем bound logger
-    bound_logger = structlog.get_logger()
+    # Обработчик для консоли
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
-    return bound_logger
+    # Обработчик для файла
+    if log_file:
+        # Создаем директорию для логов если ее нет
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
-# Глобальный логгер
-logger = setup_logger()
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=LOGGING_CONFIG.MAX_SIZE_MB * 1024 * 1024,
+            backupCount=LOGGING_CONFIG.BACKUP_COUNT
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+
+# Глобальный логгер по умолчанию
+logger = setup_logger("pattern_recognition_engine")
 

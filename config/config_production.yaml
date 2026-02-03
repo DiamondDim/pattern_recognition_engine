@@ -1,0 +1,147 @@
+API:
+  API_KEY_REQUIRED: true
+  CORS_ORIGINS:
+  - http://localhost:3000
+  ENABLED: false
+  HOST: 127.0.0.1
+  PORT: 8080
+  RATE_LIMIT_PER_MINUTE: 60
+  WEBSOCKET_ENABLED: false
+  WEBSOCKET_PORT: 8765
+  WORKERS: 4
+BACKTESTING:
+  COMMISSION: 0.0001
+  CONFIDENCE_LEVEL: 0.95
+  INITIAL_BALANCE: 10000.0
+  MAX_HOLDING_PERIOD: 100
+  MIN_TRADES_FOR_VALIDATION: 20
+  MONTE_CARLO_SIMULATIONS: 1000
+  OPTIMIZATION_METRIC: sharpe_ratio
+  RISK_PER_TRADE: 0.02
+  SLIPPAGE: 0.0001
+  WALK_FORWARD_STEP: 100
+  WALK_FORWARD_WINDOW: 500
+CACHE_SIZE: 1000
+DATABASE:
+  HOST: localhost
+  MAX_OVERFLOW: 20
+  NAME: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\patterns.db
+  PASSWORD: null
+  POOL_SIZE: 10
+  PORT: 5432
+  TYPE: postgresql
+  USERNAME: null
+DETECTION:
+  CONFIDENCE_THRESHOLD: 0.7
+  ENABLE_CANDLESTICK: true
+  ENABLE_GEOMETRIC: true
+  ENABLE_HARMONIC: true
+  FIBONACCI_TOLERANCE: 0.05
+  MAX_CANDLES_FOR_PATTERN: 100
+  MAX_PATTERNS_PER_SYMBOL: 50
+  MIN_CANDLES_FOR_PATTERN: 5
+  MIN_HARMONIC_POINTS: 4
+  MIN_PATTERN_QUALITY: 0.6
+  PRICE_TOLERANCE_PCT: 0.002
+  SYMMETRY_TOLERANCE: 0.15
+ENVIRONMENT: production
+LOGGING:
+  BACKUP_COUNT: 5
+  DATE_FORMAT: '%Y-%m-%d %H:%M:%S'
+  ENABLE_METRICS: true
+  FILE: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\logs\pre_engine.log
+  FORMAT: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  HEALTH_CHECK_INTERVAL: 60
+  LEVEL: WARNING
+  MAX_SIZE_MB: 100
+  METRICS_PORT: 9090
+MAX_WORKERS: 4
+ML:
+  ENABLED: true
+  ENSEMBLE_WEIGHTING: performance
+  FEATURE_WINDOW: 20
+  MODEL_TYPE: random_forest
+  NEURAL_NETWORK_PARAMS:
+    activation: relu
+    hidden_layer_sizes: !!python/tuple
+    - 64
+    - 32
+    max_iter: 1000
+    random_state: 42
+    solver: adam
+  RANDOM_FOREST_PARAMS:
+    max_depth: 10
+    n_estimators: 100
+    random_state: 42
+  RETRAIN_THRESHOLD: 0.1
+  TRAIN_INTERVAL: daily
+  USE_PATTERN_FEATURES: true
+  USE_TECHNICAL_INDICATORS: true
+MODE: file
+MT5:
+  AUTO_CONNECT: true
+  ENABLED: true
+  INPUT_FILE_PATH: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\data\input\mt5_data.csv
+  LOGIN: 2000067543
+  OUTPUT_FILE_PATH: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\data\output\patterns.json
+  PASSWORD: 9@b8X8C4eC
+  PATH: C:\Program Files\MetaTrader 5 Alfa-Forex\terminal64.exe
+  SERVER: AlfaForexRU-Real
+  SYMBOLS:
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - XAUUSD
+  - USDRUB
+  - EURGBP
+  SYMBOL_PREFIX: RFD.
+  TIMEFRAMES:
+  - M1
+  - M5
+  - M15
+  - M30
+  - H1
+  - H4
+  - D1
+  TIMEOUT: 10000
+  UPDATE_INTERVAL: 60
+PATHS:
+  config_dir: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\config
+  data_dir: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\data
+  input_dir: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\data\input
+  logs_dir: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\logs
+  models_dir: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\models
+  output_dir: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\data\output
+  project_root: C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine
+RISK_MANAGEMENT:
+  ENABLE_TRAILING_STOP: true
+  MAX_DAILY_LOSS_PERCENT: 5.0
+  MAX_OPEN_POSITIONS: 3
+  MAX_POSITION_SIZE_PERCENT: 2.0
+  STOP_LOSS_ATR_MULTIPLIER: 1.5
+  TAKE_PROFIT_RATIO: 2.0
+  TRAILING_STOP_ACTIVATION: 1.0
+  TRAILING_STOP_DISTANCE: 0.5
+USE_CACHE: true
+USE_NUMBA: true
+VISUALIZATION:
+  COLORS:
+    background: '#FFFFFF'
+    bearish: '#EF5350'
+    bullish: '#26A69A'
+    grid: '#E0E0E0'
+    neutral: '#78909C'
+    resistance: '#FF7043'
+    support: '#42A5F5'
+    volume_down: '#F44336'
+    volume_up: '#4CAF50'
+  ENABLE_PLOTTING: true
+  FIGURE_HEIGHT: 8
+  FIGURE_WIDTH: 15
+  INTERACTIVE_PLOTS: false
+  PLOT_DPI: 150
+  PLOT_FORMAT: png
+  SAVE_PLOTS: true
+  SUBPLOT_HEIGHT_RATIO:
+  - 3
+  - 1

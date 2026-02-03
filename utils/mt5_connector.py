@@ -1,453 +1,261 @@
-# utils/mt5_connector.py
-
 """
-Модуль подключения к MetaTrader 5
+Утилиты для работы с MetaTrader 5 с учетом специфики RFD-инструментов
 """
-
-import asyncio
+import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
-import json
-
-from config import config
-from utils.logger import logger
+from typing import Optional, Dict, List, Tuple
+import time
+import os
 
 try:
-    import MetaTrader5 as mt5
-    MT5_AVAILABLE = True
+    from config import config
 except ImportError:
-    MT5_AVAILABLE = False
-    logger.warning("MetaTrader5 не установлен. MT5 функциональность недоступна.")
+    # Для обратной совместимости
+    from config import config
 
 
 class MT5Connector:
-    """Класс для работы с MetaTrader 5"""
+    """Класс для работы с MetaTrader 5 с поддержкой RFD-префиксов"""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self):
-        self.logger = logger.bind(module="mt5_connector")
-        self.connected = False
+        if not hasattr(self, 'initialized'):
+            self.initialized = False
+            self.account_info = None
+            self.terminal_info = None
 
-        if not MT5_AVAILABLE:
-            self.logger.error("MetaTrader5 библиотека не установлена")
+            # Используем настройки из конфига
+            self.mt5_config = config.MT5
+            self._init_mt5()
 
-    async def connect(self) -> bool:
-        """Подключение к MetaTrader 5"""
-        if not MT5_AVAILABLE:
-            self.logger.error("MetaTrader5 библиотека недоступна")
-            return False
-
+    def _init_mt5(self):
+        """Инициализация подключения к MT5"""
         try:
-            # Инициализация MT5
-            if not mt5.initialize(
-                path=config.MT5.PATH,
-                login=config.MT5.LOGIN,
-                password=config.MT5.PASSWORD,
-                server=config.MT5.SERVER,
-                timeout=config.MT5.TIMEOUT
-            ):
-                self.logger.error(f"Ошибка инициализации MT5: {mt5.last_error()}")
-                return False
+            print(f"Инициализация MT5 с терминалом: {self.mt5_config.PATH}")
 
-            self.connected = True
-            self.logger.info("Успешное подключение к MetaTrader 5")
+            # Инициализируем MT5 с указанием пути к терминалу
+            if not mt5.initialize(
+                    path=self.mt5_config.PATH,
+                    login=self.mt5_config.LOGIN,
+                    password=self.mt5_config.PASSWORD,
+                    server=self.mt5_config.SERVER,
+                    timeout=self.mt5_config.TIMEOUT
+            ):
+                error = mt5.last_error()
+                print(f"Ошибка инициализации MT5: {error}")
+
+                # Пробуем инициализировать без пути (если терминал уже запущен)
+                print("Попытка подключения к запущенному терминалу...")
+                if not mt5.initialize():
+                    print(f"Ошибка подключения: {mt5.last_error()}")
+                    return False
+
+            self.initialized = True
+
+            # Получаем информацию о счете
+            self.account_info = mt5.account_info()
+            self.terminal_info = mt5.terminal_info()
+
+            print(f"Успешно подключены к MT5")
+            print(f"  Сервер: {self.terminal_info.community_server if self.terminal_info else 'N/A'}")
+            print(f"  Счет: {self.account_info.login if self.account_info else 'N/A'}")
+            print(f"  Баланс: {self.account_info.balance if self.account_info else 'N/A'}")
+            print(f"  Валюта: {self.account_info.currency if self.account_info else 'N/A'}")
+            print(f"  Префикс инструментов: {self.mt5_config.SYMBOL_PREFIX}")
+
             return True
 
         except Exception as e:
-            self.logger.error(f"Ошибка подключения к MT5: {e}")
+            print(f"Критическая ошибка инициализации MT5: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
-    async def disconnect(self):
-        """Отключение от MetaTrader 5"""
-        if MT5_AVAILABLE and self.connected:
-            mt5.shutdown()
-            self.connected = False
-            self.logger.info("Отключено от MetaTrader 5")
+    def add_symbol_prefix(self, symbol: str) -> str:
+        """Добавление префикса RFD к символу"""
+        return self.mt5_config.add_symbol_prefix(symbol)
 
-    async def get_historical_data(self,
-                                 symbol: str,
-                                 timeframe: str,
-                                 bars: int = 1000,
-                                 start_date: Optional[datetime] = None,
-                                 end_date: Optional[datetime] = None) -> Optional[pd.DataFrame]:
+    def remove_symbol_prefix(self, symbol: str) -> str:
+        """Удаление префикса RFD из символа"""
+        return self.mt5_config.remove_symbol_prefix(symbol)
+
+    def get_symbol_info(self, symbol: str) -> Optional[Dict]:
+        """Получение информации о торговом инструменте"""
+        try:
+            full_symbol = self.add_symbol_prefix(symbol)
+            info = mt5.symbol_info(full_symbol)
+
+            if info is None:
+                print(f"Инструмент {full_symbol} не найден")
+                # Пробуем получить список всех символов
+                symbols = mt5.symbols_get()
+                available = [s.name for s in symbols]
+                print(f"Доступные инструменты с префиксом {self.mt5_config.SYMBOL_PREFIX}:")
+                for s in available:
+                    if s.startswith(self.mt5_config.SYMBOL_PREFIX):
+                        print(f"  - {s}")
+                return None
+
+            return {
+                'name': self.remove_symbol_prefix(info.name),
+                'full_name': info.name,
+                'digits': info.digits,
+                'point': info.point,
+                'trade_mode': info.trade_mode,
+                'swap_mode': info.swap_mode,
+                'margin_rate': info.margin_rate,
+                'spread': info.spread,
+                'spread_float': info.spread_float,
+                'volume_min': info.volume_min,
+                'volume_max': info.volume_max,
+                'volume_step': info.volume_step
+            }
+
+        except Exception as e:
+            print(f"Ошибка получения информации о символе {symbol}: {e}")
+            return None
+
+    def get_historical_data(self, symbol: str, timeframe: str,
+                            bars: int = 1000, from_date: datetime = None) -> pd.DataFrame:
         """
-        Получение исторических данных
+        Получение исторических данных с учетом RFD-префиксов
 
         Args:
-            symbol: Торговый символ
-            timeframe: Таймфрейм
+            symbol: Название символа (без префикса)
+            timeframe: Таймфрейм ('M1', 'H1', 'D1' и т.д.)
             bars: Количество баров
-            start_date: Начальная дата
-            end_date: Конечная дата
+            from_date: Дата, начиная с которой получать данные
 
         Returns:
-            DataFrame с историческими данными или None
+            DataFrame с историческими данными
         """
-        if not self.connected:
-            if not await self.connect():
-                return None
-
         try:
-            # Конвертация таймфрейма
-            mt5_timeframe = self._convert_timeframe(timeframe)
-            if mt5_timeframe is None:
-                self.logger.error(f"Неподдерживаемый таймфрейм: {timeframe}")
-                return None
+            if not self.initialized:
+                if not self._init_mt5():
+                    return pd.DataFrame()
 
-            # Получение данных
-            if start_date and end_date:
-                rates = mt5.copy_rates_range(symbol, mt5_timeframe, start_date, end_date)
+            full_symbol = self.add_symbol_prefix(symbol)
+
+            # Конвертируем timeframe в формат MT5
+            tf_mapping = {
+                'M1': mt5.TIMEFRAME_M1,
+                'M5': mt5.TIMEFRAME_M5,
+                'M15': mt5.TIMEFRAME_M15,
+                'M30': mt5.TIMEFRAME_M30,
+                'H1': mt5.TIMEFRAME_H1,
+                'H4': mt5.TIMEFRAME_H4,
+                'D1': mt5.TIMEFRAME_D1,
+                'W1': mt5.TIMEFRAME_W1,
+                'MN1': mt5.TIMEFRAME_MN1
+            }
+
+            if timeframe not in tf_mapping:
+                print(f"Неподдерживаемый таймфрейм: {timeframe}")
+                return pd.DataFrame()
+
+            mt5_timeframe = tf_mapping[timeframe]
+
+            # Получаем данные
+            if from_date:
+                rates = mt5.copy_rates_from(full_symbol, mt5_timeframe, from_date, bars)
             else:
-                rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
+                rates = mt5.copy_rates_from_pos(full_symbol, mt5_timeframe, 0, bars)
 
-            if rates is None:
-                self.logger.error(f"Ошибка получения данных для {symbol}: {mt5.last_error()}")
-                return None
+            if rates is None or len(rates) == 0:
+                print(f"Не удалось получить данные для {full_symbol}")
+                return pd.DataFrame()
 
-            # Конвертация в DataFrame
+            # Конвертируем в DataFrame
             df = pd.DataFrame(rates)
-
-            # Конвертация времени
             df['time'] = pd.to_datetime(df['time'], unit='s')
+            df.set_index('time', inplace=True)
 
-            self.logger.info(f"Получено данных для {symbol}: {len(df)} баров")
+            # Переименовываем колонки
+            df.columns = ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume']
+
+            # Добавляем расчетные поля
+            df['returns'] = df['close'].pct_change()
+
+            print(f"Получено {len(df)} баров для {symbol} ({timeframe})")
             return df
 
         except Exception as e:
-            self.logger.error(f"Ошибка получения данных из MT5: {e}")
-            return None
+            print(f"Ошибка получения данных для {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            return pd.DataFrame()
 
-    async def get_current_price(self, symbol: str) -> Optional[Dict[str, float]]:
-        """
-        Получение текущей цены символа
-
-        Args:
-            symbol: Торговый символ
-
-        Returns:
-            Словарь с текущими ценами или None
-        """
-        if not self.connected:
-            if not await self.connect():
-                return None
-
+    def get_current_price(self, symbol: str) -> Optional[Dict]:
+        """Получение текущих цен bid/ask"""
         try:
-            tick = mt5.symbol_info_tick(symbol)
+            full_symbol = self.add_symbol_prefix(symbol)
+            tick = mt5.symbol_info_tick(full_symbol)
 
             if tick is None:
-                self.logger.error(f"Ошибка получения тика для {symbol}: {mt5.last_error()}")
                 return None
 
             return {
+                'symbol': symbol,
+                'time': pd.to_datetime(tick.time, unit='s'),
                 'bid': tick.bid,
                 'ask': tick.ask,
                 'last': tick.last,
-                'volume': tick.volume,
-                'time': pd.to_datetime(tick.time, unit='s').isoformat()
+                'volume': tick.volume
             }
-
         except Exception as e:
-            self.logger.error(f"Ошибка получения цены для {symbol}: {e}")
+            print(f"Ошибка получения текущей цены для {symbol}: {e}")
             return None
 
-    async def get_account_info(self) -> Optional[Dict[str, Any]]:
-        """Получение информации об аккаунте"""
-        if not self.connected:
-            if not await self.connect():
-                return None
-
+    def check_market_hours(self, symbol: str) -> bool:
+        """Проверка, открыт ли рынок для торговли"""
         try:
-            account_info = mt5.account_info()
+            full_symbol = self.add_symbol_prefix(symbol)
+            info = mt5.symbol_info(full_symbol)
 
-            if account_info is None:
-                self.logger.error(f"Ошибка получения информации об аккаунте: {mt5.last_error()}")
-                return None
-
-            return {
-                'login': account_info.login,
-                'name': account_info.name,
-                'server': account_info.server,
-                'currency': account_info.currency,
-                'balance': account_info.balance,
-                'equity': account_info.equity,
-                'margin': account_info.margin,
-                'free_margin': account_info.margin_free,
-                'leverage': account_info.leverage,
-                'profit': account_info.profit
-            }
-
-        except Exception as e:
-            self.logger.error(f"Ошибка получения информации об аккаунте: {e}")
-            return None
-
-    async def place_order(self,
-                         symbol: str,
-                         order_type: str,  # 'buy' или 'sell'
-                         volume: float,
-                         price: Optional[float] = None,
-                         sl: Optional[float] = None,
-                         tp: Optional[float] = None,
-                         comment: str = "PRE Order") -> Optional[Dict[str, Any]]:
-        """
-        Размещение ордера
-
-        Args:
-            symbol: Торговый символ
-            order_type: Тип ордера
-            volume: Объем
-            price: Цена (None для рыночного ордера)
-            sl: Стоп-лосс
-            tp: Тейк-профит
-            comment: Комментарий
-
-        Returns:
-            Информация об ордере или None
-        """
-        if not self.connected:
-            if not await self.connect():
-                return None
-
-        try:
-            # Получаем текущую цену если не указана
-            if price is None:
-                tick = mt5.symbol_info_tick(symbol)
-                if tick is None:
-                    self.logger.error(f"Не удалось получить цену для {symbol}")
-                    return None
-
-                if order_type.lower() == 'buy':
-                    price = tick.ask
-                else:
-                    price = tick.bid
-
-            # Определяем тип ордера
-            if order_type.lower() == 'buy':
-                order_type_mt5 = mt5.ORDER_TYPE_BUY
-            elif order_type.lower() == 'sell':
-                order_type_mt5 = mt5.ORDER_TYPE_SELL
-            else:
-                self.logger.error(f"Неизвестный тип ордера: {order_type}")
-                return None
-
-            # Подготавливаем запрос
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": volume,
-                "type": order_type_mt5,
-                "price": price,
-                "sl": sl,
-                "tp": tp,
-                "deviation": 10,
-                "magic": 234000,
-                "comment": comment,
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-
-            # Отправляем ордер
-            result = mt5.order_send(request)
-
-            if result is None:
-                self.logger.error(f"Ошибка отправки ордера: {mt5.last_error()}")
-                return None
-
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                self.logger.error(f"Ошибка ордера: {result.retcode} - {result.comment}")
-                return None
-
-            self.logger.info(f"Ордер размещен: {symbol} {order_type} {volume} @ {price}")
-
-            return {
-                'order_id': result.order,
-                'deal_id': result.deal,
-                'symbol': result.symbol,
-                'volume': result.volume,
-                'price': result.price,
-                'sl': result.sl,
-                'tp': result.tp,
-                'profit': result.profit,
-                'comment': result.comment
-            }
-
-        except Exception as e:
-            self.logger.error(f"Ошибка размещения ордера: {e}")
-            return None
-
-    async def get_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Получение списка открытых ордеров"""
-        if not self.connected:
-            if not await self.connect():
-                return []
-
-        try:
-            orders = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
-
-            if orders is None:
-                return []
-
-            order_list = []
-            for order in orders:
-                order_list.append({
-                    'ticket': order.ticket,
-                    'symbol': order.symbol,
-                    'type': 'buy' if order.type == 0 else 'sell',
-                    'volume': order.volume,
-                    'open_price': order.price_open,
-                    'current_price': order.price_current,
-                    'sl': order.sl,
-                    'tp': order.tp,
-                    'profit': order.profit,
-                    'open_time': pd.to_datetime(order.time, unit='s').isoformat()
-                })
-
-            return order_list
-
-        except Exception as e:
-            self.logger.error(f"Ошибка получения ордеров: {e}")
-            return []
-
-    async def close_order(self, ticket: int, volume: Optional[float] = None) -> bool:
-        """
-        Закрытие ордера
-
-        Args:
-            ticket: Номер тикета ордера
-            volume: Объем для закрытия (None для полного закрытия)
-
-        Returns:
-            Успешность закрытия
-        """
-        if not self.connected:
-            if not await self.connect():
+            if info is None:
                 return False
 
-        try:
-            # Получаем информацию об ордере
-            positions = mt5.positions_get(ticket=ticket)
-            if not positions:
-                self.logger.error(f"Ордер {ticket} не найден")
-                return False
+            # Проверяем время торговли (упрощенно)
+            current_time = datetime.now()
 
-            position = positions[0]
+            # Для Forex рынка обычно торгуем с воскресенья 22:00 до пятницы 22:00 GMT
+            # Но это зависит от брокера, уточните у Alfa-Forex расписание
+            weekday = current_time.weekday()
+            hour = current_time.hour
 
-            # Определяем тип закрытия
-            if position.type == mt5.POSITION_TYPE_BUY:
-                close_type = mt5.ORDER_TYPE_SELL
-            else:
-                close_type = mt5.ORDER_TYPE_BUY
+            # Пример: торгуем с понедельника по пятницу
+            if 0 <= weekday <= 4:  # Пн-Пт
+                return True
+            elif weekday == 5 and hour < 22:  # Суббота до 22:00
+                return True
+            elif weekday == 6 and hour >= 22:  # Воскресенье после 22:00
+                return True
 
-            # Получаем текущую цену
-            tick = mt5.symbol_info_tick(position.symbol)
-            if tick is None:
-                self.logger.error(f"Не удалось получить цену для {position.symbol}")
-                return False
-
-            close_price = tick.bid if position.type == mt5.POSITION_TYPE_BUY else tick.ask
-
-            # Объем для закрытия
-            close_volume = volume if volume is not None else position.volume
-
-            # Подготавливаем запрос
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": position.symbol,
-                "volume": close_volume,
-                "type": close_type,
-                "position": position.ticket,
-                "price": close_price,
-                "deviation": 10,
-                "magic": 234000,
-                "comment": "PRE Close",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-
-            # Отправляем запрос на закрытие
-            result = mt5.order_send(request)
-
-            if result is None:
-                self.logger.error(f"Ошибка закрытия ордера: {mt5.last_error()}")
-                return False
-
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                self.logger.error(f"Ошибка закрытия ордера: {result.retcode} - {result.comment}")
-                return False
-
-            self.logger.info(f"Ордер {ticket} закрыт: {close_volume} @ {close_price}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Ошибка закрытия ордера: {e}")
             return False
 
-    async def export_data_to_file(self,
-                                 symbol: str,
-                                 timeframe: str,
-                                 bars: int = 1000,
-                                 filepath: Optional[str] = None) -> bool:
-        """
-        Экспорт данных в файл
-
-        Args:
-            symbol: Торговый символ
-            timeframe: Таймфрейм
-            bars: Количество баров
-            filepath: Путь к файлу
-
-        Returns:
-            Успешность экспорта
-        """
-        if filepath is None:
-            filepath = config.MT5.INPUT_FILE_PATH
-
-        try:
-            # Получаем данные
-            df = await self.get_historical_data(symbol, timeframe, bars)
-
-            if df is None or df.empty:
-                self.logger.error("Не удалось получить данные для экспорта")
-                return False
-
-            # Сохраняем в файл
-            df.to_csv(filepath, index=False)
-
-            self.logger.info(f"Данные экспортированы в {filepath}: {len(df)} баров")
-            return True
-
         except Exception as e:
-            self.logger.error(f"Ошибка экспорта данных: {e}")
+            print(f"Ошибка проверки времени торговли: {e}")
             return False
 
-    def _convert_timeframe(self, timeframe: str) -> Optional[int]:
-        """Конвертация строкового таймфрейма в MT5 константу"""
-        if not MT5_AVAILABLE:
-            return None
+    def shutdown(self):
+        """Завершение работы с MT5"""
+        if self.initialized:
+            mt5.shutdown()
+            self.initialized = False
+            print("MT5 соединение закрыто")
 
-        timeframe_map = {
-            'M1': mt5.TIMEFRAME_M1,
-            'M2': mt5.TIMEFRAME_M2,
-            'M3': mt5.TIMEFRAME_M3,
-            'M4': mt5.TIMEFRAME_M4,
-            'M5': mt5.TIMEFRAME_M5,
-            'M6': mt5.TIMEFRAME_M6,
-            'M10': mt5.TIMEFRAME_M10,
-            'M12': mt5.TIMEFRAME_M12,
-            'M15': mt5.TIMEFRAME_M15,
-            'M20': mt5.TIMEFRAME_M20,
-            'M30': mt5.TIMEFRAME_M30,
-            'H1': mt5.TIMEFRAME_H1,
-            'H2': mt5.TIMEFRAME_H2,
-            'H3': mt5.TIMEFRAME_H3,
-            'H4': mt5.TIMEFRAME_H4,
-            'H6': mt5.TIMEFRAME_H6,
-            'H8': mt5.TIMEFRAME_H8,
-            'H12': mt5.TIMEFRAME_H12,
-            'D1': mt5.TIMEFRAME_D1,
-            'W1': mt5.TIMEFRAME_W1,
-            'MN1': mt5.TIMEFRAME_MN1
-        }
+    def __del__(self):
+        self.shutdown()
 
-        return timeframe_map.get(timeframe.upper())
+
+# Синглтон экземпляр
+mt5_connector = MT5Connector()
 
