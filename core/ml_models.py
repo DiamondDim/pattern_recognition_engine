@@ -1,514 +1,455 @@
 """
-Модуль машинного обучения для распознавания паттернов
+Модуль машинного обучения для классификации паттернов
 """
 
-import numpy as np
 import pandas as pd
-from typing import Dict, List, Any, Optional, Tuple, Union
-from datetime import datetime
-import joblib
-from pathlib import Path
-import warnings
-
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Any
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import joblib
+import warnings
+from datetime import datetime
+import os
 
-import xgboost as xgb
-import lightgbm as lgb
-import catboost as cb
+# Исправляем импорт для обратной совместимости
+try:
+    from config import config, ML_CONFIG, ML_MODEL_CONFIG
+except ImportError:
+    # Для обратной совместимости
+    try:
+        from config import ML_CONFIG as ML_MODEL_CONFIG
+    except ImportError:
+        # Создаем fallback конфиг
+        ML_MODEL_CONFIG = type('Config', (), {
+            'MODEL_TYPE': 'random_forest',
+            'RANDOM_FOREST_PARAMS': {
+                'n_estimators': 100,
+                'max_depth': 10,
+                'random_state': 42
+            },
+            'NEURAL_NETWORK_PARAMS': {
+                'hidden_layer_sizes': (64, 32),
+                'activation': 'relu',
+                'solver': 'adam',
+                'max_iter': 1000,
+                'random_state': 42
+            },
+            'FEATURE_WINDOW': 20,
+            'USE_TECHNICAL_INDICATORS': True
+        })()
 
-from config import ML_CONFIG, DATA_DIR
-from utils.logger import logger
 
+class MLModel:
+    """Базовый класс модели машинного обучения"""
 
-class PatternClassifier:
-    """Классификатор паттернов"""
-
-    def __init__(self, model_type: str = 'random_forest', config: ML_CONFIG = None):
-        self.config = config or ML_CONFIG
-        self.model_type = model_type
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.ml_config = ML_MODEL_CONFIG
         self.model = None
         self.scaler = StandardScaler()
-        self.feature_importances_ = None
-        self.classes_ = None
-        self.logger = logger.bind(module="PatternClassifier")
+        self.feature_columns = []
+        self.is_trained = False
 
-        self._initialize_model()
+    def create_model(self) -> Any:
+        """Создание модели в зависимости от конфигурации"""
+        model_type = self.ml_config.MODEL_TYPE
 
-    def _initialize_model(self):
-        """Инициализация модели"""
-        if self.model_type == 'random_forest':
-            self.model = RandomForestClassifier(
-                n_estimators=self.config.RANDOM_FOREST.N_ESTIMATORS,
-                max_depth=self.config.RANDOM_FOREST.MAX_DEPTH,
-                min_samples_split=self.config.RANDOM_FOREST.MIN_SAMPLES_SPLIT,
-                min_samples_leaf=self.config.RANDOM_FOREST.MIN_SAMPLES_LEAF,
-                random_state=self.config.RANDOM_SEED,
-                n_jobs=-1
-            )
-        elif self.model_type == 'gradient_boosting':
+        if model_type == 'random_forest':
+            params = self.ml_config.RANDOM_FOREST_PARAMS
+            self.model = RandomForestClassifier(**params)
+
+        elif model_type == 'gradient_boosting':
             self.model = GradientBoostingClassifier(
-                n_estimators=self.config.GRADIENT_BOOSTING.N_ESTIMATORS,
-                learning_rate=self.config.GRADIENT_BOOSTING.LEARNING_RATE,
-                max_depth=self.config.GRADIENT_BOOSTING.MAX_DEPTH,
-                random_state=self.config.RANDOM_SEED
+                n_estimators=100,
+                learning_rate=0.1,
+                random_state=42
             )
-        elif self.model_type == 'svm':
-            self.model = SVC(
-                C=self.config.SVM.C,
-                kernel=self.config.SVM.KERNEL,
-                probability=True,
-                random_state=self.config.RANDOM_SEED
-            )
-        elif self.model_type == 'mlp':
-            self.model = MLPClassifier(
-                hidden_layer_sizes=self.config.MLP.HIDDEN_LAYERS,
-                activation=self.config.MLP.ACTIVATION,
-                solver=self.config.MLP.SOLVER,
-                alpha=self.config.MLP.ALPHA,
-                learning_rate=self.config.MLP.LEARNING_RATE,
-                max_iter=self.config.MLP.MAX_ITER,
-                random_state=self.config.RANDOM_SEED
-            )
-        elif self.model_type == 'xgboost':
-            self.model = xgb.XGBClassifier(
-                n_estimators=self.config.XGBOOST.N_ESTIMATORS,
-                max_depth=self.config.XGBOOST.MAX_DEPTH,
-                learning_rate=self.config.XGBOOST.LEARNING_RATE,
-                subsample=self.config.XGBOOST.SUBSAMPLE,
-                colsample_bytree=self.config.XGBOOST.COLSAMPLE_BYTREE,
-                random_state=self.config.RANDOM_SEED,
-                n_jobs=-1
-            )
-        elif self.model_type == 'lightgbm':
-            self.model = lgb.LGBMClassifier(
-                n_estimators=self.config.LIGHTGBM.N_ESTIMATORS,
-                max_depth=self.config.LIGHTGBM.MAX_DEPTH,
-                learning_rate=self.config.LIGHTGBM.LEARNING_RATE,
-                num_leaves=self.config.LIGHTGBM.NUM_LEAVES,
-                random_state=self.config.RANDOM_SEED,
-                n_jobs=-1
-            )
-        elif self.model_type == 'catboost':
-            self.model = cb.CatBoostClassifier(
-                iterations=self.config.CATBOOST.ITERATIONS,
-                depth=self.config.CATBOOST.DEPTH,
-                learning_rate=self.config.CATBOOST.LEARNING_RATE,
-                random_seed=self.config.RANDOM_SEED,
-                verbose=False
-            )
-        else:
-            raise ValueError(f"Неизвестный тип модели: {self.model_type}")
 
-    def prepare_features(self, patterns: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+        elif model_type == 'svm':
+            self.model = SVC(
+                kernel='rbf',
+                C=1.0,
+                gamma='scale',
+                random_state=42
+            )
+
+        elif model_type == 'neural_network':
+            params = self.ml_config.NEURAL_NETWORK_PARAMS
+            self.model = MLPClassifier(**params)
+
+        else:
+            # По умолчанию используем Random Forest
+            self.model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                random_state=42
+            )
+
+        return self.model
+
+    def extract_features(self, price_data: pd.DataFrame, pattern_data: Dict = None) -> pd.DataFrame:
         """
-        Подготовка признаков для обучения
+        Извлечение признаков из ценовых данных
 
         Args:
-            patterns: Список паттернов
+            price_data: DataFrame с OHLC данными
+            pattern_data: Данные паттерна (опционально)
 
         Returns:
-            Матрица признаков и метки классов
+            DataFrame с признаками
         """
-        if not patterns:
-            return np.array([]), np.array([])
+        features = pd.DataFrame(index=price_data.index)
 
-        features = []
-        labels = []
+        # Базовые ценовые признаки
+        features['returns'] = price_data['close'].pct_change()
+        features['log_returns'] = np.log(price_data['close'] / price_data['close'].shift(1))
 
-        for pattern in patterns:
-            # Извлекаем признаки
-            pattern_features = self._extract_pattern_features(pattern)
-            if pattern_features is not None:
-                features.append(pattern_features)
+        # Волатильность
+        features['volatility'] = price_data['close'].rolling(20).std()
+        features['atr'] = self._calculate_atr(price_data)
 
-                # Извлекаем метку (направление паттерна)
-                direction = pattern.get('direction', 'neutral')
-                label = self._encode_direction(direction)
-                labels.append(label)
+        # Технические индикаторы
+        if self.ml_config.USE_TECHNICAL_INDICATORS:
+            # Скользящие средние
+            features['sma_10'] = price_data['close'].rolling(10).mean()
+            features['sma_20'] = price_data['close'].rolling(20).mean()
+            features['sma_50'] = price_data['close'].rolling(50).mean()
 
-        if not features:
-            return np.array([]), np.array([])
+            # RSI
+            features['rsi'] = self._calculate_rsi(price_data['close'])
 
-        X = np.array(features)
-        y = np.array(labels)
+            # MACD
+            macd, signal = self._calculate_macd(price_data['close'])
+            features['macd'] = macd
+            features['macd_signal'] = signal
+            features['macd_histogram'] = macd - signal
 
-        # Масштабирование признаков
-        if len(X) > 0:
-            X = self.scaler.fit_transform(X)
+        # Объем
+        if 'volume' in price_data.columns:
+            features['volume'] = price_data['volume']
+            features['volume_sma'] = price_data['volume'].rolling(20).mean()
+            features['volume_ratio'] = price_data['volume'] / features['volume_sma']
 
-        return X, y
+        # Признаки из паттерна
+        if pattern_data and self.ml_config.USE_PATTERN_FEATURES:
+            features = self._add_pattern_features(features, pattern_data)
 
-    def _extract_pattern_features(self, pattern: Dict[str, Any]) -> Optional[np.ndarray]:
-        """Извлечение признаков из паттерна"""
-        try:
-            points = pattern.get('points', [])
-            statistics = pattern.get('statistics', {})
-            targets = pattern.get('targets', {})
-            metadata = pattern.get('metadata', {})
+        # Лаговые признаки
+        window = self.ml_config.FEATURE_WINDOW
+        for lag in range(1, min(6, window)):
+            features[f'returns_lag_{lag}'] = features['returns'].shift(lag)
 
-            if len(points) < 2:
-                return None
+        # Удаляем NaN значения
+        features = features.dropna()
 
-            # Координаты точек
-            point_prices = [p.get('price', 0) for p in points]
-            point_indices = [p.get('index', 0) for p in points]
+        # Сохраняем названия столбцов признаков
+        self.feature_columns = features.columns.tolist()
 
-            # Базовые статистики
-            min_price = min(point_prices)
-            max_price = max(point_prices)
-            price_range = max_price - min_price
-            avg_price = np.mean(point_prices)
+        return features
 
-            # Относительные координаты
-            normalized_prices = [(p - min_price) / price_range if price_range > 0 else 0
-                               for p in point_prices]
+    def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Расчет Average True Range"""
+        high = data['high']
+        low = data['low']
+        close = data['close'].shift(1)
 
-            # Углы между точками
-            angles = []
-            if len(points) >= 3:
-                for i in range(len(points) - 2):
-                    p1 = np.array([point_indices[i], point_prices[i]])
-                    p2 = np.array([point_indices[i+1], point_prices[i+1]])
-                    p3 = np.array([point_indices[i+2], point_prices[i+2]])
+        tr1 = high - low
+        tr2 = abs(high - close)
+        tr3 = abs(low - close)
 
-                    v1 = p2 - p1
-                    v2 = p3 - p2
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
 
-                    if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
-                        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-                        cos_angle = np.clip(cos_angle, -1, 1)
-                        angle = np.arccos(cos_angle)
-                        angles.append(angle)
-                    else:
-                        angles.append(0)
+        return atr
 
-            # Признаки из статистики
-            hist_matches = statistics.get('historical_matches', 0)
-            hist_success = statistics.get('historical_success_rate', 0)
-            quality_score = metadata.get('quality_score', 0)
-            confidence = metadata.get('confidence', 0)
+    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """Расчет Relative Strength Index"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
 
-            # Признаки из целевых уровней
-            entry_price = targets.get('entry_price', 0)
-            stop_loss = targets.get('stop_loss', 0)
-            take_profit = targets.get('take_profit', 0)
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
 
-            if entry_price > 0 and stop_loss > 0:
-                risk = abs(entry_price - stop_loss)
-                reward = abs(take_profit - entry_price) if take_profit > 0 else 0
-                risk_reward = reward / risk if risk > 0 else 0
-            else:
-                risk_reward = 0
+        return rsi
 
-            # Формируем вектор признаков
-            feature_vector = [
-                # Базовые характеристики
-                len(points),
-                min_price,
-                max_price,
-                price_range,
-                avg_price,
-                np.std(point_prices) if len(point_prices) > 1 else 0,
+    def _calculate_macd(self, prices: pd.Series,
+                       fast_period: int = 12,
+                       slow_period: int = 26,
+                       signal_period: int = 9) -> Tuple[pd.Series, pd.Series]:
+        """Расчет MACD"""
+        ema_fast = prices.ewm(span=fast_period, adjust=False).mean()
+        ema_slow = prices.ewm(span=slow_period, adjust=False).mean()
 
-                # Относительные координаты
-                np.mean(normalized_prices),
-                np.std(normalized_prices),
+        macd = ema_fast - ema_slow
+        signal = macd.ewm(span=signal_period, adjust=False).mean()
 
-                # Угловые характеристики
-                np.mean(angles) if angles else 0,
-                np.std(angles) if angles else 0,
+        return macd, signal
 
-                # Статистические признаки
-                hist_matches,
-                hist_success,
-                quality_score,
-                confidence,
+    def _add_pattern_features(self, features: pd.DataFrame, pattern_data: Dict) -> pd.DataFrame:
+        """Добавление признаков из данных паттерна"""
+        # Базовые признаки паттерна
+        if 'quality' in pattern_data:
+            features['pattern_quality'] = pattern_data['quality']
 
-                # Риск-менеджмент
-                risk_reward,
+        if 'type' in pattern_data:
+            # Кодируем тип паттерна
+            pattern_type = pattern_data['type']
+            type_mapping = {
+                'candlestick': 1,
+                'geometric': 2,
+                'harmonic': 3
+            }
+            features['pattern_type'] = type_mapping.get(pattern_type, 0)
 
-                # Временные характеристики
-                metadata.get('timeframe_multiplier', 1),
-                metadata.get('pattern_age', 0)
-            ]
+        if 'direction' in pattern_data:
+            # Кодируем направление
+            direction = pattern_data['direction']
+            direction_mapping = {
+                'bullish': 1,
+                'bearish': -1,
+                'neutral': 0
+            }
+            features['pattern_direction'] = direction_mapping.get(direction, 0)
 
-            # Добавляем индивидуальные координаты точек
-            for i in range(min(10, len(normalized_prices))):
-                feature_vector.append(normalized_prices[i] if i < len(normalized_prices) else 0)
+        return features
 
-            return np.array(feature_vector)
+    def prepare_training_data(self, features: pd.DataFrame,
+                            target: pd.Series) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """
+        Подготовка данных для обучения
 
-        except Exception as e:
-            self.logger.error(f"Ошибка извлечения признаков: {e}")
-            return None
+        Args:
+            features: DataFrame с признаками
+            target: Серия с целевой переменной
 
-    def _encode_direction(self, direction: str) -> int:
-        """Кодирование направления паттерна"""
-        direction_map = {
-            'bullish': 1,
-            'bearish': 0,
-            'neutral': 2
-        }
-        return direction_map.get(direction.lower(), 2)
+        Returns:
+            Кортеж с признаками, целевой переменной и именами признаков
+        """
+        # Объединяем признаки и цель
+        data = features.copy()
+        data['target'] = target
 
-    def train(self, X: np.ndarray, y: np.ndarray, validation_split: float = 0.2) -> Dict[str, Any]:
+        # Удаляем строки с NaN
+        data = data.dropna()
+
+        if len(data) == 0:
+            return np.array([]), np.array([]), []
+
+        # Разделяем признаки и цель
+        X = data.drop('target', axis=1).values
+        y = data['target'].values
+
+        # Сохраняем имена признаков
+        feature_names = data.drop('target', axis=1).columns.tolist()
+
+        return X, y, feature_names
+
+    def train(self, X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
         """
         Обучение модели
 
         Args:
             X: Матрица признаков
-            y: Метки классов
-            validation_split: Доля данных для валидации
+            y: Вектор целевой переменной
 
         Returns:
-            Словарь с метриками обучения
+            Метрики обучения
         """
         if len(X) == 0 or len(y) == 0:
-            self.logger.error("Нет данных для обучения")
             return {}
 
-        # Разделение данных
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y,
-            test_size=validation_split,
-            random_state=self.config.RANDOM_SEED,
-            stratify=y if len(np.unique(y)) > 1 else None
+        # Разделение на train/test
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=False
         )
 
-        # Обучение модели
-        self.model.fit(X_train, y_train)
+        # Масштабирование признаков
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
 
-        # Сохранение классов
-        self.classes_ = self.model.classes_
+        # Создание и обучение модели
+        if self.model is None:
+            self.create_model()
 
-        # Предсказания
-        y_train_pred = self.model.predict(X_train)
-        y_val_pred = self.model.predict(X_val)
+        self.model.fit(X_train_scaled, y_train)
+        self.is_trained = True
 
-        # Вычисление метрик
+        # Оценка модели
+        y_pred = self.model.predict(X_test_scaled)
+
         metrics = {
-            'train_accuracy': accuracy_score(y_train, y_train_pred),
-            'val_accuracy': accuracy_score(y_val, y_val_pred),
-            'train_precision': precision_score(y_train, y_train_pred, average='weighted', zero_division=0),
-            'val_precision': precision_score(y_val, y_val_pred, average='weighted', zero_division=0),
-            'train_recall': recall_score(y_train, y_train_pred, average='weighted', zero_division=0),
-            'val_recall': recall_score(y_val, y_val_pred, average='weighted', zero_division=0),
-            'train_f1': f1_score(y_train, y_train_pred, average='weighted', zero_division=0),
-            'val_f1': f1_score(y_val, y_val_pred, average='weighted', zero_division=0),
+            'accuracy': accuracy_score(y_test, y_pred),
+            'precision': precision_score(y_test, y_pred, average='weighted', zero_division=0),
+            'recall': recall_score(y_test, y_pred, average='weighted', zero_division=0),
+            'f1_score': f1_score(y_test, y_pred, average='weighted', zero_division=0),
             'train_samples': len(X_train),
-            'val_samples': len(X_val),
-            'classes': list(self.classes_)
+            'test_samples': len(X_test)
         }
-
-        # Важность признаков
-        if hasattr(self.model, 'feature_importances_'):
-            self.feature_importances_ = self.model.feature_importances_
-            metrics['feature_importances'] = self.feature_importances_.tolist()
-
-        # Матрица ошибок
-        metrics['confusion_matrix'] = confusion_matrix(y_val, y_val_pred).tolist()
-
-        self.logger.info(f"Обучение завершено. Точность на валидации: {metrics['val_accuracy']:.4f}")
 
         return metrics
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, features: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Предсказание классов
+        Прогнозирование на новых данных
 
         Args:
-            X: Матрица признаков
+            features: DataFrame с признаками
 
         Returns:
-            Предсказанные классы
+            Кортеж с предсказаниями и вероятностями
         """
-        if self.model is None:
-            raise ValueError("Модель не обучена")
+        if not self.is_trained or self.model is None:
+            return np.array([]), np.array([])
 
-        if len(X) == 0:
-            return np.array([])
+        # Проверяем, что есть все необходимые признаки
+        missing_cols = set(self.feature_columns) - set(features.columns)
+        if missing_cols:
+            # Добавляем недостающие колонки с нулями
+            for col in missing_cols:
+                features[col] = 0
+
+        # Упорядочиваем колонки как при обучении
+        features = features[self.feature_columns]
+
+        # Удаляем NaN
+        features = features.dropna()
+
+        if len(features) == 0:
+            return np.array([]), np.array([])
 
         # Масштабирование
-        X_scaled = self.scaler.transform(X)
+        X_scaled = self.scaler.transform(features.values)
 
-        # Предсказание
+        # Прогнозирование
         predictions = self.model.predict(X_scaled)
 
-        return predictions
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """
-        Предсказание вероятностей классов
-
-        Args:
-            X: Матрица признаков
-
-        Returns:
-            Вероятности классов
-        """
-        if self.model is None:
-            raise ValueError("Модель не обучена")
-
-        if len(X) == 0:
-            return np.array([])
-
-        # Масштабирование
-        X_scaled = self.scaler.transform(X)
-
-        # Предсказание вероятностей
+        # Вероятности (если модель их поддерживает)
         if hasattr(self.model, 'predict_proba'):
             probabilities = self.model.predict_proba(X_scaled)
         else:
-            # Для моделей без predict_proba
-            predictions = self.predict(X_scaled)
-            probabilities = np.zeros((len(predictions), len(self.classes_)))
-            for i, pred in enumerate(predictions):
-                probabilities[i, pred] = 1.0
+            probabilities = np.zeros((len(predictions), 2))
 
-        return probabilities
+        return predictions, probabilities
 
     def save_model(self, filepath: str):
-        """
-        Сохранение модели
-
-        Args:
-            filepath: Путь для сохранения
-        """
-        if self.model is None:
-            self.logger.warning("Модель не обучена, нечего сохранять")
-            return
-
-        try:
-            model_data = {
+        """Сохранение модели на диск"""
+        if self.model is not None:
+            joblib.dump({
                 'model': self.model,
                 'scaler': self.scaler,
-                'model_type': self.model_type,
-                'feature_importances': self.feature_importances_,
-                'classes': self.classes_
-            }
+                'feature_columns': self.feature_columns,
+                'config': self.config
+            }, filepath)
 
-            joblib.dump(model_data, filepath)
-            self.logger.info(f"Модель сохранена: {filepath}")
-
-        except Exception as e:
-            self.logger.error(f"Ошибка сохранения модели: {e}")
-
-    def load_model(self, filepath: str):
-        """
-        Загрузка модели
-
-        Args:
-            filepath: Путь к файлу модели
-        """
+    def load_model(self, filepath: str) -> bool:
+        """Загрузка модели с диска"""
         try:
-            model_data = joblib.load(filepath)
-
-            self.model = model_data['model']
-            self.scaler = model_data['scaler']
-            self.model_type = model_data['model_type']
-            self.feature_importances_ = model_data.get('feature_importances')
-            self.classes_ = model_data.get('classes')
-
-            self.logger.info(f"Модель загружена: {filepath}")
-
+            if os.path.exists(filepath):
+                data = joblib.load(filepath)
+                self.model = data['model']
+                self.scaler = data['scaler']
+                self.feature_columns = data['feature_columns']
+                self.config = data.get('config', {})
+                self.is_trained = True
+                return True
         except Exception as e:
-            self.logger.error(f"Ошибка загрузки модели: {e}")
+            print(f"Ошибка загрузки модели: {e}")
+
+        return False
 
 
-class PatternClusterer:
-    """Кластеризация паттернов"""
+class PatternClassifier(MLModel):
+    """Классификатор паттернов"""
 
-    def __init__(self, method: str = 'kmeans', n_clusters: int = 5):
-        self.method = method
-        self.n_clusters = n_clusters
-        self.model = None
-        self.scaler = StandardScaler()
-        self.labels_ = None
-        self.logger = logger.bind(module="PatternClusterer")
+    def __init__(self, config: Optional[Dict] = None):
+        super().__init__(config)
+        self.pattern_classes = ['bullish', 'bearish', 'neutral']
+        self.class_mapping = {cls: i for i, cls in enumerate(self.pattern_classes)}
+        self.reverse_mapping = {i: cls for i, cls in enumerate(self.pattern_classes)}
 
-        self._initialize_model()
-
-    def _initialize_model(self):
-        """Инициализация модели кластеризации"""
-        if self.method == 'kmeans':
-            self.model = KMeans(
-                n_clusters=self.n_clusters,
-                random_state=42,
-                n_init=10
-            )
-        elif self.method == 'dbscan':
-            self.model = DBSCAN(
-                eps=0.5,
-                min_samples=5
-            )
-        else:
-            raise ValueError(f"Неизвестный метод кластеризации: {self.method}")
-
-    def fit(self, patterns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def prepare_pattern_data(self, patterns: List[Dict], price_data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         """
-        Кластеризация паттернов
+        Подготовка данных паттернов для обучения
 
         Args:
             patterns: Список паттернов
+            price_data: DataFrame с ценовыми данными
 
         Returns:
-            Результаты кластеризации
+            Кортеж с признаками и целевой переменной
         """
-        if not patterns:
-            return {}
+        features_list = []
+        targets_list = []
 
-        # Подготовка признаков
-        classifier = PatternClassifier()
-        X, _ = classifier.prepare_features(patterns)
+        for pattern in patterns:
+            # Извлекаем признаки для паттерна
+            pattern_features = self.extract_features(price_data, pattern)
 
-        if len(X) == 0:
-            return {}
+            if len(pattern_features) > 0:
+                # Берем последнюю строку (момент паттерна)
+                latest_features = pattern_features.iloc[-1:]
 
-        # Применение PCA для визуализации
-        pca = PCA(n_components=2)
-        X_pca = pca.fit_transform(X)
+                # Определяем целевую переменную
+                pattern_direction = pattern.get('direction', 'neutral')
+                target = self.class_mapping.get(pattern_direction, 2)  # neutral по умолчанию
 
-        # Кластеризация
-        self.labels_ = self.model.fit_predict(X)
+                features_list.append(latest_features)
+                targets_list.append(target)
 
-        # Статистика по кластерам
-        cluster_stats = {}
-        unique_labels = np.unique(self.labels_)
+        if features_list:
+            all_features = pd.concat(features_list, ignore_index=True)
+            all_targets = pd.Series(targets_list)
+            return all_features, all_targets
 
-        for label in unique_labels:
-            if label == -1:  # Для DBSCAN - шум
-                continue
+        return pd.DataFrame(), pd.Series([])
 
-            cluster_indices = np.where(self.labels_ == label)[0]
-            cluster_patterns = [patterns[i] for i in cluster_indices]
+    def classify_pattern(self, pattern: Dict, price_data: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Классификация паттерна
 
-            # Статистика паттернов в кластере
-            directions = [p.get('direction', 'neutral') for p in cluster_patterns]
-            bullish_count = directions.count('bullish')
-            bearish_count = directions.count('bearish')
+        Args:
+            pattern: Данные паттерна
+            price_data: Ценовые данные
 
-            success_rates = [p.get('statistics', {}).get('historical_success_rate', 0)
-                           for p in cluster_patterns]
+        Returns:
+            Результаты классификации
+        """
+        if not self.is_trained:
+            return {'error': 'Модель не обучена'}
 
-            cluster_stats[label] = {
-                'size': len(cluster_indices),
-                'bullish_ratio': bullish_count / len(cluster_indices) if cluster_indices.size > 0 else 0,
-                'bearish_ratio': bearish_count / len(cluster_indices) if cluster_indices.size > 0 else 0,
-                'avg_success_rate': np.mean(success_rates) if success_rates else 0,
-                'patterns_indices': cluster_indices.tolist()
-            }
+        # Извлекаем признаки
+        features = self.extract_features(price_data, pattern)
 
-        return {
-            'labels': self.labels_.tolist(),
-            'cluster_stats': cluster_stats,
-            'pca_components': X_pca.tolist(),
-            'explained_variance': pca.explained_variance_ratio_.tolist()
+        if len(features) == 0:
+            return {'error': 'Не удалось извлечь признаки'}
+
+        # Прогнозирование
+        predictions, probabilities = self.predict(features)
+
+        if len(predictions) == 0:
+            return {'error': 'Не удалось сделать прогноз'}
+
+        # Интерпретация результатов
+        predicted_class_idx = predictions[-1]
+        predicted_class = self.reverse_mapping.get(predicted_class_idx, 'neutral')
+
+        result = {
+            'predicted_class': predicted_class,
+            'confidence': 0.0,
+            'probabilities': {}
         }
+
+        if len(probabilities) > 0:
+            for i, cls in enumerate(self.pattern_classes):
+                result['probabilities'][cls] = float(probabilities[-1, i])
+
+            result['confidence'] = float(np.max(probabilities[-1]))
+
+        return result
 

@@ -1,23 +1,26 @@
 """
-Core modules for Pattern Recognition Engine
+Пакет ядра Pattern Recognition Engine
 """
 
-__version__ = "1.0.0"
-__author__ = "Pattern Recognition Team"
-
-from .pattern_detector import PatternDetector
-from .pattern_analyzer import PatternAnalyzer
-from .pattern_database import PatternDatabase
 from .data_feeder import DataFeeder
-from .ml_models import PatternMLModel
-from .backtesting import PatternBacktester
+from .pattern_detector import PatternDetector
+from .pattern_analyzer import PatternAnalyzer, pattern_analyzer
+from .pattern_database import PatternDatabase
+from .backtesting import BacktestEngine
+from .statistics import calculate_statistics, StatisticsCalculator
+from .ml_models import MLModel, PatternClassifier
+from .pattern_analyzer import PatternAnalyzer  # Дублируем импорт для обратной совместимости
 
 __all__ = [
-    "PatternDetector",
-    "PatternAnalyzer",
-    "PatternDatabase",
-    "DataFeeder",
-    "PatternMLModel",
-    "PatternBacktester",
+    'DataFeeder',
+    'PatternDetector',
+    'PatternAnalyzer',
+    'pattern_analyzer',
+    'PatternDatabase',
+    'BacktestEngine',
+    'calculate_statistics',
+    'StatisticsCalculator',
+    'MLModel',
+    'PatternClassifier'
 ]
 

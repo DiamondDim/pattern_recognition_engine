@@ -430,3 +430,68 @@ if __name__ != "__main__":
             print("=" * 40)
             sys.exit(1)
 
+# Глобальный экземпляр конфигурации
+config = CONFIG()
+
+# Обратная совместимость для старых импортов
+DATABASE_CONFIG = config.DATABASE
+MT5_CONFIG = config.MT5
+DETECTION_CONFIG = config.DETECTION
+ML_CONFIG = config.ML
+BACKTESTING_CONFIG = config.BACKTESTING
+VISUALIZATION_CONFIG = config.VISUALIZATION
+LOGGING_CONFIG = config.LOGGING
+API_CONFIG = config.API
+RISK_MANAGEMENT_CONFIG = config.RISK_MANAGEMENT
+
+# Для удобства - основные переменные
+SYMBOLS = config.MT5.SYMBOLS
+TIMEFRAMES = config.MT5.TIMEFRAMES
+DATABASE_PATH = config.DATABASE.NAME
+LOG_LEVEL = config.LOGGING.LEVEL
+
+# Дополнительные переменные для обратной совместимости
+ANALYSIS_CONFIG = config.DETECTION  # Алиас для ANALYSIS_CONFIG
+PATTERN_DETECTOR_CONFIG = config.DETECTION  # Алиас для PATTERN_DETECTOR_CONFIG
+STATISTICS_CONFIG = config.ML  # Алиас для STATISTICS_CONFIG
+ML_MODEL_CONFIG = config.ML  # Алиас для ML_MODEL_CONFIG
+
+# Экспорт всех необходимых переменных
+__all__ = [
+    'config',
+    'CONFIG',
+    'DatabaseConfig',
+    'MT5Config',
+    'DetectionConfig',
+    'MLConfig',
+    'BacktestingConfig',
+    'VisualizationConfig',
+    'LoggingConfig',
+    'APIConfig',
+    'RiskManagementConfig',
+    'DATABASE_CONFIG',
+    'MT5_CONFIG',
+    'DETECTION_CONFIG',
+    'ML_CONFIG',
+    'BACKTESTING_CONFIG',
+    'VISUALIZATION_CONFIG',
+    'LOGGING_CONFIG',
+    'API_CONFIG',
+    'RISK_MANAGEMENT_CONFIG',
+    'ANALYSIS_CONFIG',
+    'PATTERN_DETECTOR_CONFIG',
+    'STATISTICS_CONFIG',
+    'ML_MODEL_CONFIG',
+    'SYMBOLS',
+    'TIMEFRAMES',
+    'DATABASE_PATH',
+    'LOG_LEVEL',
+    'PROJECT_ROOT',
+    'DATA_DIR',
+    'INPUT_DIR',
+    'OUTPUT_DIR',
+    'MODELS_DIR',
+    'LOGS_DIR',
+    'CONFIG_DIR'
+]
+
