@@ -1,604 +1,456 @@
 """
-Коннектор для работы с MetaTrader 5
+Модуль подключения к MetaTrader 5
 """
 
-import socket
 import asyncio
-import json
-from typing import Dict, Any, Optional, List
 import pandas as pd
-from datetime import datetime
-import aiofiles
-import websockets
+import numpy as np
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime, timedelta
+import json
 
-from config import MT5_CONFIG, DATA_DIR, INPUT_DIR, OUTPUT_DIR
+from config import config
 from utils.logger import logger
 
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    logger.warning("MetaTrader5 не установлен. MT5 функциональность недоступна.")
 
 class MT5Connector:
-    """Класс для подключения к MetaTrader 5"""
+    """Класс для работы с MetaTrader 5"""
 
-    def __init__(self, mode: str = None):
-        self.mode = mode or MT5_CONFIG.CONNECTION_MODE
-        self.logger = logger.bind(name="MT5Connector")
+    def __init__(self):
+        self.logger = logger.bind(module="mt5_connector")
+        self.connected = False
 
-        # Настройки подключения
-        self.host = MT5_CONFIG.SOCKET_HOST
-        self.port = MT5_CONFIG.SOCKET_PORT
-
-        # Состояние подключения
-        self.is_connected = False
-        self.socket = None
-        self.ws = None
-
-        # Буферы данных
-        self.data_buffer = []
-        self.command_buffer = []
-
-        # Статистика
-        self.stats = {
-            'connection_attempts': 0,
-            'successful_connections': 0,
-            'data_received': 0,
-            'data_sent': 0,
-            'errors': 0,
-            'last_connection': None
-        }
+        if not MT5_AVAILABLE:
+            self.logger.error("MetaTrader5 библиотека не установлена")
 
     async def connect(self) -> bool:
-        """
-        Подключение к MT5
-
-        Returns:
-            True если подключение успешно
-        """
-        if self.mode == 'socket':
-            return await self._connect_socket()
-        elif self.mode == 'websocket':
-            return await self._connect_websocket()
-        else:
-            self.logger.info("Режим файлового обмена не требует подключения")
-            self.is_connected = True
-            return True
-
-    async def _connect_socket(self) -> bool:
-        """Подключение через TCP сокет"""
-        self.stats['connection_attempts'] += 1
+        """Подключение к MetaTrader 5"""
+        if not MT5_AVAILABLE:
+            self.logger.error("MetaTrader5 библиотека недоступна")
+            return False
 
         try:
-            self.logger.info(f"Подключение к MT5 через сокет {self.host}:{self.port}")
+            # Инициализация MT5
+            if not mt5.initialize(
+                path=config.MT5.PATH,
+                login=config.MT5.LOGIN,
+                password=config.MT5.PASSWORD,
+                server=config.MT5.SERVER,
+                timeout=config.MT5.TIMEOUT
+            ):
+                self.logger.error(f"Ошибка инициализации MT5: {mt5.last_error()}")
+                return False
 
-            # Создаем сокет
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(10)
-
-            # Подключаемся
-            self.socket.connect((self.host, self.port))
-
-            self.is_connected = True
-            self.stats['successful_connections'] += 1
-            self.stats['last_connection'] = datetime.now()
-
-            self.logger.info("Подключение к MT5 установлено")
+            self.connected = True
+            self.logger.info("Успешное подключение к MetaTrader 5")
             return True
 
         except Exception as e:
             self.logger.error(f"Ошибка подключения к MT5: {e}")
-            self.stats['errors'] += 1
-            self.is_connected = False
             return False
-
-    async def _connect_websocket(self) -> bool:
-        """Подключение через WebSocket"""
-        self.stats['connection_attempts'] += 1
-
-        try:
-            self.logger.info(f"Подключение к MT5 через WebSocket ws://{self.host}:{self.port}")
-
-            # Подключаемся через WebSocket
-            self.ws = await websockets.connect(f"ws://{self.host}:{self.port}")
-
-            self.is_connected = True
-            self.stats['successful_connections'] += 1
-            self.stats['last_connection'] = datetime.now()
-
-            self.logger.info("WebSocket подключение к MT5 установлено")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Ошибка WebSocket подключения к MT5: {e}")
-            self.stats['errors'] += 1
-            self.is_connected = False
-            return False
-
-    async def send_data(self, data: Dict[str, Any]) -> bool:
-        """
-        Отправка данных в MT5
-
-        Args:
-            data: Данные для отправки
-
-        Returns:
-            True если отправка успешна
-        """
-        if not self.is_connected:
-            self.logger.warning("Нет подключения к MT5")
-            return False
-
-        try:
-            # Конвертируем данные в JSON
-            json_data = json.dumps(data, default=str)
-
-            if self.mode == 'socket':
-                # Отправляем через сокет
-                self.socket.sendall(json_data.encode('utf-8'))
-
-            elif self.mode == 'websocket':
-                # Отправляем через WebSocket
-                await self.ws.send(json_data)
-
-            self.stats['data_sent'] += 1
-            self.logger.debug(f"Данные отправлены в MT5: {len(json_data)} байт")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Ошибка отправки данных в MT5: {e}")
-            self.stats['errors'] += 1
-            return False
-
-    async def receive_data(self) -> Optional[Dict[str, Any]]:
-        """
-        Получение данных от MT5
-
-        Returns:
-            Полученные данные или None при ошибке
-        """
-        if not self.is_connected:
-            self.logger.warning("Нет подключения к MT5")
-            return None
-
-        try:
-            if self.mode == 'socket':
-                # Получаем через сокет
-                buffer_size = 4096
-                data = b""
-
-                while True:
-                    chunk = self.socket.recv(buffer_size)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if len(chunk) < buffer_size:
-                        break
-
-            elif self.mode == 'websocket':
-                # Получаем через WebSocket
-                data = await self.ws.recv()
-                if isinstance(data, bytes):
-                    data = data.decode('utf-8')
-
-            # Парсим JSON
-            json_data = json.loads(data)
-
-            self.stats['data_received'] += 1
-            self.logger.debug(f"Данные получены от MT5: {len(data)} байт")
-
-            return json_data
-
-        except Exception as e:
-            self.logger.error(f"Ошибка получения данных от MT5: {e}")
-            self.stats['errors'] += 1
-            return None
-
-    async def send_command(self, command: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
-        """
-        Отправка команды в MT5 и получение ответа
-
-        Args:
-            command: Команда
-            params: Параметры команды
-
-        Returns:
-            Ответ от MT5 или None при ошибке
-        """
-        # Формируем команду
-        cmd_data = {
-            'command': command,
-            'timestamp': datetime.now().isoformat(),
-            'params': params or {}
-        }
-
-        # Отправляем команду
-        if not await self.send_data(cmd_data):
-            return None
-
-        # Ждем ответ (если команда требует ответа)
-        if command in ['get_data', 'get_indicators', 'execute_trade']:
-            response = await self.receive_data()
-            return response
-
-        return {'status': 'sent'}
 
     async def disconnect(self):
-        """Отключение от MT5"""
-        try:
-            if self.mode == 'socket' and self.socket:
-                self.socket.close()
-                self.logger.info("Сокет подключение к MT5 закрыто")
+        """Отключение от MetaTrader 5"""
+        if MT5_AVAILABLE and self.connected:
+            mt5.shutdown()
+            self.connected = False
+            self.logger.info("Отключено от MetaTrader 5")
 
-            elif self.mode == 'websocket' and self.ws:
-                await self.ws.close()
-                self.logger.info("WebSocket подключение к MT5 закрыто")
-
-        except Exception as e:
-            self.logger.error(f"Ошибка отключения от MT5: {e}")
-
-        finally:
-            self.is_connected = False
-
-    async def check_connection(self) -> bool:
-        """Проверка подключения к MT5"""
-        if not self.is_connected:
-            return False
-
-        try:
-            # Отправляем ping-команду
-            response = await self.send_command('ping')
-            return response is not None
-
-        except Exception as e:
-            self.logger.error(f"Ошибка проверки подключения: {e}")
-            self.is_connected = False
-            return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики подключения"""
-        return self.stats.copy()
-
-
-class FileConnector:
-    """Коннектор для файлового обмена с MT5"""
-
-    def __init__(self):
-        self.logger = logger.bind(name="FileConnector")
-
-        # Пути к файлам
-        self.input_file = INPUT_DIR / "mt5_data.csv"
-        self.output_file = OUTPUT_DIR / "patterns.json"
-
-        # Статистика
-        self.stats = {
-            'files_read': 0,
-            'files_written': 0,
-            'last_read': None,
-            'last_write': None,
-            'errors': 0
-        }
-
-    def read_data(self) -> Optional[pd.DataFrame]:
+    async def get_historical_data(self,
+                                 symbol: str,
+                                 timeframe: str,
+                                 bars: int = 1000,
+                                 start_date: Optional[datetime] = None,
+                                 end_date: Optional[datetime] = None) -> Optional[pd.DataFrame]:
         """
-        Чтение данных из файла
+        Получение исторических данных
+
+        Args:
+            symbol: Торговый символ
+            timeframe: Таймфрейм
+            bars: Количество баров
+            start_date: Начальная дата
+            end_date: Конечная дата
 
         Returns:
-            DataFrame с данными или None при ошибке
+            DataFrame с историческими данными или None
         """
+        if not self.connected:
+            if not await self.connect():
+                return None
+
         try:
-            if not self.input_file.exists():
-                self.logger.warning(f"Входной файл не найден: {self.input_file}")
+            # Конвертация таймфрейма
+            mt5_timeframe = self._convert_timeframe(timeframe)
+            if mt5_timeframe is None:
+                self.logger.error(f"Неподдерживаемый таймфрейм: {timeframe}")
                 return None
 
-            # Читаем CSV
-            df = pd.read_csv(self.input_file)
+            # Получение данных
+            if start_date and end_date:
+                rates = mt5.copy_rates_range(symbol, mt5_timeframe, start_date, end_date)
+            else:
+                rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
 
-            # Проверяем необходимые колонки
-            required_cols = ['timestamp', 'open', 'high', 'low', 'close']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-
-            if missing_cols:
-                self.logger.error(f"Отсутствуют колонки: {missing_cols}")
+            if rates is None:
+                self.logger.error(f"Ошибка получения данных для {symbol}: {mt5.last_error()}")
                 return None
 
-            # Конвертируем timestamp
-            if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            # Конвертация в DataFrame
+            df = pd.DataFrame(rates)
 
-            self.stats['files_read'] += 1
-            self.stats['last_read'] = datetime.now()
+            # Конвертация времени
+            df['time'] = pd.to_datetime(df['time'], unit='s')
 
-            self.logger.debug(f"Данные прочитаны из файла: {len(df)} строк")
+            self.logger.info(f"Получено данных для {symbol}: {len(df)} баров")
             return df
 
         except Exception as e:
-            self.logger.error(f"Ошибка чтения данных из файла: {e}")
-            self.stats['errors'] += 1
+            self.logger.error(f"Ошибка получения данных из MT5: {e}")
             return None
 
-    def write_patterns(self, patterns: List[Dict[str, Any]]) -> bool:
+    async def get_current_price(self, symbol: str) -> Optional[Dict[str, float]]:
         """
-        Запись паттернов в файл
+        Получение текущей цены символа
 
         Args:
-            patterns: Список паттернов
+            symbol: Торговый символ
 
         Returns:
-            True если запись успешна
+            Словарь с текущими ценами или None
         """
+        if not self.connected:
+            if not await self.connect():
+                return None
+
         try:
-            # Подготавливаем данные для записи
-            output_data = {
-                'timestamp': datetime.now().isoformat(),
-                'patterns_count': len(patterns),
-                'patterns': patterns
+            tick = mt5.symbol_info_tick(symbol)
+
+            if tick is None:
+                self.logger.error(f"Ошибка получения тика для {symbol}: {mt5.last_error()}")
+                return None
+
+            return {
+                'bid': tick.bid,
+                'ask': tick.ask,
+                'last': tick.last,
+                'volume': tick.volume,
+                'time': pd.to_datetime(tick.time, unit='s').isoformat()
             }
 
-            # Записываем в JSON
-            with open(self.output_file, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, default=str)
-
-            self.stats['files_written'] += 1
-            self.stats['last_write'] = datetime.now()
-
-            self.logger.debug(f"Паттерны записаны в файл: {len(patterns)} паттернов")
-            return True
-
         except Exception as e:
-            self.logger.error(f"Ошибка записи паттернов в файл: {e}")
-            self.stats['errors'] += 1
-            return False
+            self.logger.error(f"Ошибка получения цены для {symbol}: {e}")
+            return None
 
-    def write_signals(self, signals: List[Dict[str, Any]]) -> bool:
-        """
-        Запись торговых сигналов в файл
+    async def get_account_info(self) -> Optional[Dict[str, Any]]:
+        """Получение информации об аккаунте"""
+        if not self.connected:
+            if not await self.connect():
+                return None
 
-        Args:
-            signals: Список сигналов
-
-        Returns:
-            True если запись успешна
-        """
         try:
-            signals_file = OUTPUT_DIR / "signals.json"
+            account_info = mt5.account_info()
 
-            output_data = {
-                'timestamp': datetime.now().isoformat(),
-                'signals_count': len(signals),
-                'signals': signals
+            if account_info is None:
+                self.logger.error(f"Ошибка получения информации об аккаунте: {mt5.last_error()}")
+                return None
+
+            return {
+                'login': account_info.login,
+                'name': account_info.name,
+                'server': account_info.server,
+                'currency': account_info.currency,
+                'balance': account_info.balance,
+                'equity': account_info.equity,
+                'margin': account_info.margin,
+                'free_margin': account_info.margin_free,
+                'leverage': account_info.leverage,
+                'profit': account_info.profit
             }
 
-            with open(signals_file, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, default=str)
-
-            self.logger.debug(f"Сигналы записаны в файл: {len(signals)} сигналов")
-            return True
-
         except Exception as e:
-            self.logger.error(f"Ошибка записи сигналов в файл: {e}")
-            return False
+            self.logger.error(f"Ошибка получения информации об аккаунте: {e}")
+            return None
 
-    def cleanup_old_files(self, days_to_keep: int = 7) -> int:
+    async def place_order(self,
+                         symbol: str,
+                         order_type: str,  # 'buy' или 'sell'
+                         volume: float,
+                         price: Optional[float] = None,
+                         sl: Optional[float] = None,
+                         tp: Optional[float] = None,
+                         comment: str = "PRE Order") -> Optional[Dict[str, Any]]:
         """
-        Очистка старых файлов
+        Размещение ордера
 
         Args:
-            days_to_keep: Количество дней для хранения
+            symbol: Торговый символ
+            order_type: Тип ордера
+            volume: Объем
+            price: Цена (None для рыночного ордера)
+            sl: Стоп-лосс
+            tp: Тейк-профит
+            comment: Комментарий
 
         Returns:
-            Количество удаленных файлов
+            Информация об ордере или None
         """
-        try:
-            import os
-            import time
-
-            cutoff_time = time.time() - (days_to_keep * 24 * 3600)
-            deleted_count = 0
-
-            # Очищаем входные файлы
-            for file_path in INPUT_DIR.glob("*.csv"):
-                if os.path.getmtime(file_path) < cutoff_time:
-                    os.remove(file_path)
-                    deleted_count += 1
-
-            # Очищаем выходные файлы
-            for file_path in OUTPUT_DIR.glob("*.json"):
-                if os.path.getmtime(file_path) < cutoff_time:
-                    os.remove(file_path)
-                    deleted_count += 1
-
-            if deleted_count > 0:
-                self.logger.info(f"Удалено {deleted_count} старых файлов")
-
-            return deleted_count
-
-        except Exception as e:
-            self.logger.error(f"Ошибка очистки старых файлов: {e}")
-            return 0
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики файлового обмена"""
-        return self.stats.copy()
-
-
-class MT5DataExporter:
-    """Экспортер данных из MT5"""
-
-    def __init__(self, connector_type: str = 'file'):
-        self.connector_type = connector_type
-        self.logger = logger.bind(name="MT5DataExporter")
-
-        # Инициализация коннектора
-        if connector_type == 'socket':
-            self.connector = MT5Connector(mode='socket')
-        elif connector_type == 'websocket':
-            self.connector = MT5Connector(mode='websocket')
-        else:
-            self.connector = FileConnector()
-
-        # Статистика экспорта
-        self.export_stats = {
-            'symbols_exported': 0,
-            'timeframes_exported': 0,
-            'total_candles': 0,
-            'last_export': None,
-            'export_errors': 0
-        }
-
-    async def export_data(self,
-                          symbols: List[str] = None,
-                          timeframes: List[str] = None,
-                          bars_count: int = 1000) -> bool:
-        """
-        Экспорт данных из MT5
-
-        Args:
-            symbols: Список символов
-            timeframes: Список таймфреймов
-            bars_count: Количество свечей
-
-        Returns:
-            True если экспорт успешен
-        """
-        symbols = symbols or MT5_CONFIG.SYMBOLS
-        timeframes = timeframes or MT5_CONFIG.EXPORT_TIMEFRAMES
+        if not self.connected:
+            if not await self.connect():
+                return None
 
         try:
-            self.logger.info(f"Экспорт данных для {len(symbols)} символов")
+            # Получаем текущую цену если не указана
+            if price is None:
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is None:
+                    self.logger.error(f"Не удалось получить цену для {symbol}")
+                    return None
 
-            all_data = {}
+                if order_type.lower() == 'buy':
+                    price = tick.ask
+                else:
+                    price = tick.bid
 
-            for symbol in symbols:
-                for timeframe in timeframes:
-                    try:
-                        # Экспортируем данные для символа и таймфрейма
-                        data = await self._export_symbol_data(
-                            symbol, timeframe, bars_count
-                        )
-
-                        if data is not None:
-                            key = f"{symbol}_{timeframe}"
-                            all_data[key] = data
-
-                            self.export_stats['symbols_exported'] = len(set(
-                                key.split('_')[0] for key in all_data.keys()
-                            ))
-                            self.export_stats['timeframes_exported'] = len(set(
-                                key.split('_')[1] for key in all_data.keys()
-                            ))
-                            self.export_stats['total_candles'] += len(data.get('close', []))
-
-                    except Exception as e:
-                        self.logger.error(f"Ошибка экспорта {symbol} {timeframe}: {e}")
-                        self.export_stats['export_errors'] += 1
-
-            # Сохраняем данные
-            if all_data:
-                await self._save_exported_data(all_data)
-                self.export_stats['last_export'] = datetime.now()
-                return True
+            # Определяем тип ордера
+            if order_type.lower() == 'buy':
+                order_type_mt5 = mt5.ORDER_TYPE_BUY
+            elif order_type.lower() == 'sell':
+                order_type_mt5 = mt5.ORDER_TYPE_SELL
             else:
-                self.logger.warning("Нет данных для экспорта")
+                self.logger.error(f"Неизвестный тип ордера: {order_type}")
+                return None
+
+            # Подготавливаем запрос
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": order_type_mt5,
+                "price": price,
+                "sl": sl,
+                "tp": tp,
+                "deviation": 10,
+                "magic": 234000,
+                "comment": comment,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            # Отправляем ордер
+            result = mt5.order_send(request)
+
+            if result is None:
+                self.logger.error(f"Ошибка отправки ордера: {mt5.last_error()}")
+                return None
+
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                self.logger.error(f"Ошибка ордера: {result.retcode} - {result.comment}")
+                return None
+
+            self.logger.info(f"Ордер размещен: {symbol} {order_type} {volume} @ {price}")
+
+            return {
+                'order_id': result.order,
+                'deal_id': result.deal,
+                'symbol': result.symbol,
+                'volume': result.volume,
+                'price': result.price,
+                'sl': result.sl,
+                'tp': result.tp,
+                'profit': result.profit,
+                'comment': result.comment
+            }
+
+        except Exception as e:
+            self.logger.error(f"Ошибка размещения ордера: {e}")
+            return None
+
+    async def get_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Получение списка открытых ордеров"""
+        if not self.connected:
+            if not await self.connect():
+                return []
+
+        try:
+            orders = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+
+            if orders is None:
+                return []
+
+            order_list = []
+            for order in orders:
+                order_list.append({
+                    'ticket': order.ticket,
+                    'symbol': order.symbol,
+                    'type': 'buy' if order.type == 0 else 'sell',
+                    'volume': order.volume,
+                    'open_price': order.price_open,
+                    'current_price': order.price_current,
+                    'sl': order.sl,
+                    'tp': order.tp,
+                    'profit': order.profit,
+                    'open_time': pd.to_datetime(order.time, unit='s').isoformat()
+                })
+
+            return order_list
+
+        except Exception as e:
+            self.logger.error(f"Ошибка получения ордеров: {e}")
+            return []
+
+    async def close_order(self, ticket: int, volume: Optional[float] = None) -> bool:
+        """
+        Закрытие ордера
+
+        Args:
+            ticket: Номер тикета ордера
+            volume: Объем для закрытия (None для полного закрытия)
+
+        Returns:
+            Успешность закрытия
+        """
+        if not self.connected:
+            if not await self.connect():
                 return False
+
+        try:
+            # Получаем информацию об ордере
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                self.logger.error(f"Ордер {ticket} не найден")
+                return False
+
+            position = positions[0]
+
+            # Определяем тип закрытия
+            if position.type == mt5.POSITION_TYPE_BUY:
+                close_type = mt5.ORDER_TYPE_SELL
+            else:
+                close_type = mt5.ORDER_TYPE_BUY
+
+            # Получаем текущую цену
+            tick = mt5.symbol_info_tick(position.symbol)
+            if tick is None:
+                self.logger.error(f"Не удалось получить цену для {position.symbol}")
+                return False
+
+            close_price = tick.bid if position.type == mt5.POSITION_TYPE_BUY else tick.ask
+
+            # Объем для закрытия
+            close_volume = volume if volume is not None else position.volume
+
+            # Подготавливаем запрос
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": position.symbol,
+                "volume": close_volume,
+                "type": close_type,
+                "position": position.ticket,
+                "price": close_price,
+                "deviation": 10,
+                "magic": 234000,
+                "comment": "PRE Close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            # Отправляем запрос на закрытие
+            result = mt5.order_send(request)
+
+            if result is None:
+                self.logger.error(f"Ошибка закрытия ордера: {mt5.last_error()}")
+                return False
+
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                self.logger.error(f"Ошибка закрытия ордера: {result.retcode} - {result.comment}")
+                return False
+
+            self.logger.info(f"Ордер {ticket} закрыт: {close_volume} @ {close_price}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Ошибка закрытия ордера: {e}")
+            return False
+
+    async def export_data_to_file(self,
+                                 symbol: str,
+                                 timeframe: str,
+                                 bars: int = 1000,
+                                 filepath: Optional[str] = None) -> bool:
+        """
+        Экспорт данных в файл
+
+        Args:
+            symbol: Торговый символ
+            timeframe: Таймфрейм
+            bars: Количество баров
+            filepath: Путь к файлу
+
+        Returns:
+            Успешность экспорта
+        """
+        if filepath is None:
+            filepath = config.MT5.INPUT_FILE_PATH
+
+        try:
+            # Получаем данные
+            df = await self.get_historical_data(symbol, timeframe, bars)
+
+            if df is None or df.empty:
+                self.logger.error("Не удалось получить данные для экспорта")
+                return False
+
+            # Сохраняем в файл
+            df.to_csv(filepath, index=False)
+
+            self.logger.info(f"Данные экспортированы в {filepath}: {len(df)} баров")
+            return True
 
         except Exception as e:
             self.logger.error(f"Ошибка экспорта данных: {e}")
-            self.export_stats['export_errors'] += 1
             return False
 
-    async def _export_symbol_data(self,
-                                  symbol: str,
-                                  timeframe: str,
-                                  bars_count: int) -> Optional[Dict[str, Any]]:
-        """
-        Экспорт данных для конкретного символа
+    def _convert_timeframe(self, timeframe: str) -> Optional[int]:
+        """Конвертация строкового таймфрейма в MT5 константу"""
+        timeframe_map = {
+            'M1': mt5.TIMEFRAME_M1,
+            'M2': mt5.TIMEFRAME_M2,
+            'M3': mt5.TIMEFRAME_M3,
+            'M4': mt5.TIMEFRAME_M4,
+            'M5': mt5.TIMEFRAME_M5,
+            'M6': mt5.TIMEFRAME_M6,
+            'M10': mt5.TIMEFRAME_M10,
+            'M12': mt5.TIMEFRAME_M12,
+            'M15': mt5.TIMEFRAME_M15,
+            'M20': mt5.TIMEFRAME_M20,
+            'M30': mt5.TIMEFRAME_M30,
+            'H1': mt5.TIMEFRAME_H1,
+            'H2': mt5.TIMEFRAME_H2,
+            'H3': mt5.TIMEFRAME_H3,
+            'H4': mt5.TIMEFRAME_H4,
+            'H6': mt5.TIMEFRAME_H6,
+            'H8': mt5.TIMEFRAME_H8,
+            'H12': mt5.TIMEFRAME_H12,
+            'D1': mt5.TIMEFRAME_D1,
+            'W1': mt5.TIMEFRAME_W1,
+            'MN1': mt5.TIMEFRAME_MN1
+        }
 
-        Args:
-            symbol: Символ
-            timeframe: Таймфрейм
-            bars_count: Количество свечей
+        return timeframe_map.get(timeframe.upper())
 
-        Returns:
-            Данные или None при ошибке
-        """
-        if self.connector_type in ['socket', 'websocket']:
-            # Запрашиваем данные через сокет/WebSocket
-            command_params = {
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'bars_count': bars_count
-            }
+    async def __aenter__(self):
+        """Контекстный менеджер - вход"""
+        await self.connect()
+        return self
 
-            response = await self.connector.send_command('get_data', command_params)
-
-            if response and 'data' in response:
-                return response['data']
-            else:
-                return None
-
-        else:
-            # В файловом режиме данные уже должны быть в файле
-            # MT5 скрипт должен записывать данные самостоятельно
-            self.logger.debug(f"Ожидание данных от MT5 скрипта: {symbol} {timeframe}")
-            return None
-
-    async def _save_exported_data(self, data: Dict[str, Any]):
-        """Сохранение экспортированных данных"""
-        if self.connector_type in ['socket', 'websocket']:
-            # Отправляем данные через коннектор
-            await self.connector.send_data({
-                'type': 'exported_data',
-                'data': data,
-                'timestamp': datetime.now().isoformat()
-            })
-
-        else:
-            # Сохраняем в файл
-            if isinstance(self.connector, FileConnector):
-                # Для каждого символа/таймфрейма создаем отдельный файл
-                for key, symbol_data in data.items():
-                    symbol, timeframe = key.split('_')
-
-                    # Конвертируем в DataFrame
-                    df = pd.DataFrame(symbol_data)
-
-                    # Сохраняем в CSV
-                    filename = f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-                    filepath = INPUT_DIR / filename
-
-                    df.to_csv(filepath, index=False)
-                    self.logger.debug(f"Данные сохранены в {filepath}")
-
-    async def import_patterns_to_mt5(self, patterns: List[Dict[str, Any]]) -> bool:
-        """
-        Импорт паттернов обратно в MT5 для отрисовки
-
-        Args:
-            patterns: Список паттернов
-
-        Returns:
-            True если импорт успешен
-        """
-        try:
-            if self.connector_type in ['socket', 'websocket']:
-                # Отправляем паттерны через коннектор
-                response = await self.connector.send_command('draw_patterns', {'patterns': patterns})
-                return response is not None
-
-            else:
-                # Сохраняем паттерны в файл для MT5
-                if isinstance(self.connector, FileConnector):
-                    return self.connector.write_patterns(patterns)
-
-            return False
-
-        except Exception as e:
-            self.logger.error(f"Ошибка импорта паттернов в MT5: {e}")
-            return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики экспорта"""
-        return self.export_stats.copy()
-
-    async def close(self):
-        """Закрытие соединений"""
-        if hasattr(self.connector, 'disconnect'):
-            await self.connector.disconnect()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Контекстный менеджер - выход"""
+        await self.disconnect()
 

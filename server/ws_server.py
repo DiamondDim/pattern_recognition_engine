@@ -5,598 +5,401 @@ WebSocket сервер для Pattern Recognition Engine
 import asyncio
 import json
 import websockets
-from typing import Dict, Any, Set, Optional
+from typing import Dict, Any, Optional, Set, List
 from datetime import datetime
-import signal
-import sys
-from pathlib import Path
+from dataclasses import dataclass, asdict
 
-# Добавляем путь к проекту
-sys.path.append(str(Path(__file__).parent.parent))
-
-from config import CONFIG, MT5_CONFIG
+from config import config
+from utils.logger import logger
 from core.pattern_detector import PatternDetector
 from core.pattern_analyzer import PatternAnalyzer
-from core.pattern_database import PatternDatabase
-from core.ml_models import PatternSuccessPredictor
-from utils.logger import logger
+from core.ml_models import PatternMLModel
 
+@dataclass
+class ClientInfo:
+    """Информация о подключенном клиенте"""
+    websocket: websockets.WebSocketServerProtocol
+    client_id: str
+    subscribed_symbols: Set[str]
+    connected_at: datetime
+    last_activity: datetime
 
 class WebSocketServer:
-    """WebSocket сервер для реального времени"""
+    """WebSocket сервер для передачи данных в реальном времени"""
 
-    def __init__(self, host: str = None, port: int = None):
-        self.host = host or MT5_CONFIG.SOCKET_HOST
-        self.port = port or MT5_CONFIG.SOCKET_PORT + 1  # Другой порт для сервера
+    def __init__(self,
+                 host: str = "127.0.0.1",
+                 port: int = 8765,
+                 detector: Optional[PatternDetector] = None,
+                 analyzer: Optional[PatternAnalyzer] = None,
+                 ml_model: Optional[PatternMLModel] = None):
 
-        # Инициализация компонентов
-        self.detector = PatternDetector()
-        self.analyzer = PatternAnalyzer()
-        self.database = PatternDatabase()
-        self.predictor = PatternSuccessPredictor()
+        self.host = host
+        self.port = port
+        self.logger = logger.bind(module="ws_server")
+
+        # Компоненты системы
+        self.detector = detector or PatternDetector()
+        self.analyzer = analyzer or PatternAnalyzer()
+        self.ml_model = ml_model
 
         # Клиенты
-        self.clients: Set[websockets.WebSocketServerProtocol] = set()
-        self.mt5_clients: Set[websockets.WebSocketServerProtocol] = set()
-        self.gui_clients: Set[websockets.WebSocketServerProtocol] = set()
-
-        # Состояние сервера
-        self.is_running = False
-        self.server = None
+        self.clients: Dict[str, ClientInfo] = {}
+        self.server: Optional[websockets.WebSocketServer] = None
 
         # Статистика
         self.stats = {
-            'start_time': None,
-            'clients_connected': 0,
-            'messages_received': 0,
+            'connections_total': 0,
             'messages_sent': 0,
-            'patterns_detected': 0,
+            'messages_received': 0,
             'errors': 0
         }
 
-        self.logger = logger.bind(name="WebSocketServer")
-
     async def start(self):
         """Запуск WebSocket сервера"""
-        self.logger.info(f"Запуск WebSocket сервера на {self.host}:{self.port}")
-
-        # Загрузка ML модели
-        await self._load_ml_model()
-
-        # Запуск сервера
-        self.server = await websockets.serve(
-            self.handle_connection,
-            self.host,
-            self.port,
-            ping_interval=30,
-            ping_timeout=10,
-            close_timeout=10
-        )
-
-        self.is_running = True
-        self.stats['start_time'] = datetime.now()
-
-        self.logger.info("WebSocket сервер запущен")
-
-        # Запуск фоновых задач
-        asyncio.create_task(self._background_tasks())
-
-        # Ожидание остановки
-        await self.server.wait_closed()
-
-    async def _load_ml_model(self):
-        """Загрузка ML модели"""
         try:
-            # Ищем последнюю сохраненную модель
-            models_dir = Path(__file__).parent.parent / "models"
-            if models_dir.exists():
-                model_files = list(models_dir.glob("pattern_model_*.joblib"))
-                if model_files:
-                    latest_model = max(model_files, key=lambda x: x.stat().st_mtime)
-                    self.predictor.ml_model.load_model(str(latest_model))
-                    self.logger.info(f"ML модель загружена: {latest_model.name}")
-        except Exception as e:
-            self.logger.error(f"Ошибка загрузки ML модели: {e}")
-
-    async def handle_connection(self, websocket: websockets.WebSocketServerProtocol, path: str):
-        """Обработка подключения клиента"""
-        client_type = self._determine_client_type(path)
-        client_id = f"{client_type}_{len(self.clients)}"
-
-        self.clients.add(websocket)
-        self.stats['clients_connected'] += 1
-
-        self.logger.info(f"Новое подключение: {client_id} ({len(self.clients)} клиентов)")
-
-        try:
-            # Отправка приветственного сообщения
-            await self._send_welcome(websocket, client_id, client_type)
-
-            # Обработка сообщений от клиента
-            async for message in websocket:
-                self.stats['messages_received'] += 1
-                await self.handle_message(websocket, message, client_id, client_type)
-
-        except websockets.exceptions.ConnectionClosed:
-            self.logger.info(f"Клиент отключен: {client_id}")
-
-        except Exception as e:
-            self.logger.error(f"Ошибка обработки подключения {client_id}: {e}")
-            self.stats['errors'] += 1
-
-        finally:
-            # Удаление клиента
-            self.clients.remove(websocket)
-            if client_type == 'mt5':
-                self.mt5_clients.remove(websocket)
-            elif client_type == 'gui':
-                self.gui_clients.remove(websocket)
-
-            self.logger.info(f"Клиент удален: {client_id} ({len(self.clients)} клиентов осталось)")
-
-    def _determine_client_type(self, path: str) -> str:
-        """Определение типа клиента по пути"""
-        if path == '/mt5':
-            return 'mt5'
-        elif path == '/gui':
-            return 'gui'
-        else:
-            return 'unknown'
-
-    async def _send_welcome(self, websocket, client_id: str, client_type: str):
-        """Отправка приветственного сообщения"""
-        welcome_msg = {
-            'type': 'welcome',
-            'client_id': client_id,
-            'client_type': client_type,
-            'server_time': datetime.now().isoformat(),
-            'version': CONFIG.VERSION,
-            'supported_commands': ['analyze', 'get_patterns', 'get_stats', 'train_model']
-        }
-
-        await self._send_json(websocket, welcome_msg)
-
-    async def handle_message(self, websocket, message: str, client_id: str, client_type: str):
-        """Обработка сообщения от клиента"""
-        try:
-            data = json.loads(message)
-            message_type = data.get('type', 'unknown')
-
-            self.logger.debug(f"Сообщение от {client_id}: {message_type}")
-
-            # Обработка в зависимости от типа сообщения
-            if message_type == 'analyze':
-                await self._handle_analyze(websocket, data, client_id)
-
-            elif message_type == 'get_patterns':
-                await self._handle_get_patterns(websocket, data)
-
-            elif message_type == 'get_stats':
-                await self._handle_get_stats(websocket)
-
-            elif message_type == 'train_model':
-                await self._handle_train_model(websocket, data)
-
-            elif message_type == 'subscribe':
-                await self._handle_subscribe(websocket, data, client_type)
-
-            elif message_type == 'ping':
-                await self._handle_ping(websocket)
-
-            else:
-                self.logger.warning(f"Неизвестный тип сообщения: {message_type}")
-                await self._send_error(websocket, f"Unknown message type: {message_type}")
-
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Ошибка парсинга JSON: {e}")
-            await self._send_error(websocket, f"Invalid JSON: {str(e)}")
-
-        except Exception as e:
-            self.logger.error(f"Ошибка обработки сообщения: {e}")
-            self.stats['errors'] += 1
-            await self._send_error(websocket, f"Processing error: {str(e)}")
-
-    async def _handle_analyze(self, websocket, data: Dict[str, Any], client_id: str):
-        """Обработка запроса на анализ"""
-        try:
-            # Извлекаем данные
-            symbol = data.get('symbol', 'UNKNOWN')
-            timeframe = data.get('timeframe', 'H1')
-            ohlc_data = data.get('data', {})
-
-            if not ohlc_data:
-                await self._send_error(websocket, "No data provided")
-                return
-
-            self.logger.info(f"Анализ данных: {symbol} {timeframe} от {client_id}")
-
-            # Конвертация данных
-            opens = np.array(ohlc_data.get('open', []), dtype=float)
-            highs = np.array(ohlc_data.get('high', []), dtype=float)
-            lows = np.array(ohlc_data.get('low', []), dtype=float)
-            closes = np.array(ohlc_data.get('close', []), dtype=float)
-            volumes = np.array(ohlc_data.get('volume', []), dtype=float)
-
-            if len(closes) < 20:
-                await self._send_error(websocket, "Insufficient data (minimum 20 candles)")
-                return
-
-            # Детектирование паттернов
-            detection_result = self.detector.detect_all_patterns(
-                symbol=symbol,
-                timeframe=timeframe,
-                data={
-                    'open': opens,
-                    'high': highs,
-                    'low': lows,
-                    'close': closes,
-                    'volume': volumes
-                }
+            self.server = await websockets.serve(
+                self._handle_client,
+                self.host,
+                self.port
             )
 
-            # Анализ найденных паттернов
-            analyzed_patterns = []
-            for pattern in detection_result.patterns:
-                # Получаем исторические аналоги
-                historical_patterns = self.database.get_patterns(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    pattern_type=pattern.get('type'),
-                    direction=pattern.get('direction'),
-                    limit=50
-                )
+            self.logger.info(f"WebSocket сервер запущен на ws://{self.host}:{self.port}")
 
-                historical_dicts = [p.to_dict() for p in historical_patterns]
+            # Запуск фоновых задач
+            asyncio.create_task(self._broadcast_market_data())
+            asyncio.create_task(self._cleanup_inactive_clients())
 
-                # Анализ качества
-                quality_analysis = self.analyzer.analyze_pattern_quality(pattern)
-                pattern['quality_analysis'] = quality_analysis
-
-                # ML предсказание
-                ml_prediction = self.predictor.predict_pattern_success(pattern)
-                pattern['ml_prediction'] = ml_prediction
-
-                # Сохранение в базу данных
-                self.database.save_pattern(pattern)
-
-                analyzed_patterns.append(pattern)
-
-                # Логирование
-                self.logger.info(
-                    f"Обнаружен паттерн: {pattern['name']} "
-                    f"({pattern['direction']}) "
-                    f"Качество: {quality_analysis.get('overall_score', 0):.2f}"
-                )
-
-            self.stats['patterns_detected'] += len(analyzed_patterns)
-
-            # Отправка результатов
-            response = {
-                'type': 'analysis_result',
-                'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'patterns_count': len(analyzed_patterns),
-                'patterns': analyzed_patterns[:10],  # Ограничиваем количество
-                'statistics': detection_result.statistics
-            }
-
-            await self._send_json(websocket, response)
-
-            # Рассылка GUI клиентам
-            if analyzed_patterns:
-                await self._broadcast_to_gui({
-                    'type': 'new_patterns',
-                    'timestamp': datetime.now().isoformat(),
-                    'symbol': symbol,
-                    'timeframe': timeframe,
-                    'patterns_count': len(analyzed_patterns),
-                    'sample_patterns': analyzed_patterns[:3]
-                })
+            # Ожидание завершения
+            await self.server.wait_closed()
 
         except Exception as e:
-            self.logger.error(f"Ошибка анализа: {e}")
-            await self._send_error(websocket, f"Analysis error: {str(e)}")
-
-    async def _handle_get_patterns(self, websocket, data: Dict[str, Any]):
-        """Обработка запроса на получение паттернов"""
-        try:
-            symbol = data.get('symbol')
-            timeframe = data.get('timeframe')
-            pattern_type = data.get('pattern_type')
-            direction = data.get('direction')
-            limit = data.get('limit', 100)
-
-            # Получаем паттерны из базы данных
-            patterns = self.database.get_patterns(
-                symbol=symbol,
-                timeframe=timeframe,
-                pattern_type=pattern_type,
-                direction=direction,
-                limit=limit
-            )
-
-            # Конвертируем в словари
-            patterns_dict = [p.to_dict() for p in patterns]
-
-            # Отправка ответа
-            response = {
-                'type': 'patterns_list',
-                'timestamp': datetime.now().isoformat(),
-                'count': len(patterns_dict),
-                'patterns': patterns_dict
-            }
-
-            await self._send_json(websocket, response)
-
-        except Exception as e:
-            self.logger.error(f"Ошибка получения паттернов: {e}")
-            await self._send_error(websocket, f"Get patterns error: {str(e)}")
-
-    async def _handle_get_stats(self, websocket):
-        """Обработка запроса статистики"""
-        try:
-            # Статистика сервера
-            server_stats = self.stats.copy()
-            server_stats['uptime'] = str(datetime.now() - server_stats['start_time'])
-
-            # Статистика детектора
-            detector_stats = self.detector.get_statistics()
-
-            # Статистика анализатора
-            analyzer_stats = self.analyzer.get_statistics()
-
-            # Статистика базы данных
-            db_stats = self.database.get_database_stats()
-
-            # Статистика предиктора
-            predictor_stats = self.predictor.get_stats()
-
-            response = {
-                'type': 'stats',
-                'timestamp': datetime.now().isoformat(),
-                'server': server_stats,
-                'detector': detector_stats,
-                'analyzer': analyzer_stats,
-                'database': db_stats,
-                'predictor': predictor_stats,
-                'clients_count': len(self.clients),
-                'mt5_clients_count': len(self.mt5_clients),
-                'gui_clients_count': len(self.gui_clients)
-            }
-
-            await self._send_json(websocket, response)
-
-        except Exception as e:
-            self.logger.error(f"Ошибка получения статистики: {e}")
-            await self._send_error(websocket, f"Get stats error: {str(e)}")
-
-    async def _handle_train_model(self, websocket, data: Dict[str, Any]):
-        """Обработка запроса на обучение модели"""
-        try:
-            days_back = data.get('days_back', 30)
-
-            self.logger.info(f"Обучение ML модели на данных за {days_back} дней")
-
-            # Получаем исторические данные
-            historical_patterns = self.database.get_historical_patterns_for_analysis(
-                days_back=days_back,
-                min_quality=0.6
-            )
-
-            if len(historical_patterns) < 100:
-                await self._send_error(websocket, f"Insufficient historical data: {len(historical_patterns)} patterns")
-                return
-
-            # Обучение модели
-            success = self.predictor.train_ml_model(historical_patterns)
-
-            response = {
-                'type': 'training_result',
-                'timestamp': datetime.now().isoformat(),
-                'success': success,
-                'patterns_count': len(historical_patterns),
-                'model_info': self.predictor.ml_model.get_model_info() if success else None
-            }
-
-            await self._send_json(websocket, response)
-
-        except Exception as e:
-            self.logger.error(f"Ошибка обучения модели: {e}")
-            await self._send_error(websocket, f"Training error: {str(e)}")
-
-    async def _handle_subscribe(self, websocket, data: Dict[str, Any], client_type: str):
-        """Обработка подписки на обновления"""
-        try:
-            subscription_type = data.get('subscription_type', 'all')
-
-            # Добавляем клиента в соответствующую группу
-            if client_type == 'mt5':
-                self.mt5_clients.add(websocket)
-            elif client_type == 'gui':
-                self.gui_clients.add(websocket)
-
-            response = {
-                'type': 'subscription_confirmed',
-                'timestamp': datetime.now().isoformat(),
-                'subscription_type': subscription_type,
-                'client_type': client_type
-            }
-
-            await self._send_json(websocket, response)
-
-            self.logger.info(f"Клиент подписался: {client_type} -> {subscription_type}")
-
-        except Exception as e:
-            self.logger.error(f"Ошибка подписки: {e}")
-            await self._send_error(websocket, f"Subscription error: {str(e)}")
-
-    async def _handle_ping(self, websocket):
-        """Обработка ping запроса"""
-        response = {
-            'type': 'pong',
-            'timestamp': datetime.now().isoformat(),
-            'server_time': datetime.now().isoformat()
-        }
-
-        await self._send_json(websocket, response)
-
-    async def _send_json(self, websocket, data: Dict[str, Any]):
-        """Отправка JSON сообщения"""
-        try:
-            message = json.dumps(data, default=str)
-            await websocket.send(message)
-            self.stats['messages_sent'] += 1
-        except Exception as e:
-            self.logger.error(f"Ошибка отправки сообщения: {e}")
-
-    async def _send_error(self, websocket, error_message: str):
-        """Отправка сообщения об ошибке"""
-        error_response = {
-            'type': 'error',
-            'timestamp': datetime.now().isoformat(),
-            'error': error_message
-        }
-
-        await self._send_json(websocket, error_response)
-
-    async def _broadcast_to_gui(self, message: Dict[str, Any]):
-        """Рассылка сообщений всем GUI клиентам"""
-        if not self.gui_clients:
-            return
-
-        message_json = json.dumps(message, default=str)
-
-        tasks = []
-        for client in self.gui_clients:
-            try:
-                tasks.append(client.send(message_json))
-            except Exception as e:
-                self.logger.error(f"Ошибка рассылки GUI клиенту: {e}")
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _background_tasks(self):
-        """Фоновые задачи сервера"""
-        self.logger.info("Запуск фоновых задач")
-
-        while self.is_running:
-            try:
-                # Отправка heartbeat
-                await self._send_heartbeat()
-
-                # Очистка старых данных
-                await self._cleanup_old_data()
-
-                # Сохранение статистики
-                await self._save_statistics()
-
-                # Пауза между итерациями
-                await asyncio.sleep(60)  # Каждую минуту
-
-            except Exception as e:
-                self.logger.error(f"Ошибка в фоновой задаче: {e}")
-                await asyncio.sleep(10)
-
-    async def _send_heartbeat(self):
-        """Отправка heartbeat сообщений"""
-        heartbeat = {
-            'type': 'heartbeat',
-            'timestamp': datetime.now().isoformat(),
-            'clients_count': len(self.clients),
-            'patterns_detected': self.stats['patterns_detected']
-        }
-
-        heartbeat_json = json.dumps(heartbeat, default=str)
-
-        tasks = []
-        for client in self.clients:
-            try:
-                tasks.append(client.send(heartbeat_json))
-            except Exception:
-                pass  # Игнорируем отключенных клиентов
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _cleanup_old_data(self):
-        """Очистка старых данных"""
-        try:
-            # Очистка старых паттернов
-            deleted = self.database.cleanup_old_patterns(days_to_keep=90)
-            if deleted > 0:
-                self.logger.info(f"Очищено {deleted} старых паттернов")
-
-            # Очистка кэша предиктора
-            self.predictor.clear_cache()
-
-        except Exception as e:
-            self.logger.error(f"Ошибка очистки данных: {e}")
-
-    async def _save_statistics(self):
-        """Сохранение статистики сервера"""
-        try:
-            stats_file = Path(__file__).parent.parent / "data" / "server_stats.json"
-
-            stats_data = {
-                'server': self.stats,
-                'detector': self.detector.get_statistics(),
-                'analyzer': self.analyzer.get_statistics(),
-                'predictor': self.predictor.get_stats(),
-                'timestamp': datetime.now().isoformat()
-            }
-
-            with open(stats_file, 'w', encoding='utf-8') as f:
-                json.dump(stats_data, f, indent=2, default=str)
-
-        except Exception as e:
-            self.logger.error(f"Ошибка сохранения статистики: {e}")
+            self.logger.error(f"Ошибка запуска WebSocket сервера: {e}")
 
     async def stop(self):
-        """Остановка сервера"""
-        self.logger.info("Остановка WebSocket сервера...")
-
-        self.is_running = False
-
+        """Остановка WebSocket сервера"""
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+            self.logger.info("WebSocket сервер остановлен")
 
-        # Закрытие всех подключений
+    async def _handle_client(self, websocket: websockets.WebSocketServerProtocol, path: str):
+        """Обработка подключения клиента"""
+        client_id = f"client_{self.stats['connections_total'] + 1}"
+
+        # Создаем информацию о клиенте
+        client_info = ClientInfo(
+            websocket=websocket,
+            client_id=client_id,
+            subscribed_symbols=set(),
+            connected_at=datetime.now(),
+            last_activity=datetime.now()
+        )
+
+        self.clients[client_id] = client_info
+        self.stats['connections_total'] += 1
+
+        self.logger.info(f"Клиент подключен: {client_id}")
+
+        try:
+            # Отправляем приветственное сообщение
+            await self._send_to_client(client_id, {
+                'type': 'welcome',
+                'client_id': client_id,
+                'timestamp': datetime.now().isoformat(),
+                'message': 'Connected to Pattern Recognition Engine WebSocket Server'
+            })
+
+            # Обработка сообщений от клиента
+            async for message in websocket:
+                await self._process_client_message(client_id, message)
+
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.info(f"Клиент отключен: {client_id}")
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки клиента {client_id}: {e}")
+            self.stats['errors'] += 1
+        finally:
+            # Удаляем клиента
+            if client_id in self.clients:
+                del self.clients[client_id]
+
+    async def _process_client_message(self, client_id: str, message: str):
+        """Обработка сообщения от клиента"""
+        try:
+            data = json.loads(message)
+            self.stats['messages_received'] += 1
+
+            client_info = self.clients.get(client_id)
+            if not client_info:
+                return
+
+            # Обновляем время последней активности
+            client_info.last_activity = datetime.now()
+
+            message_type = data.get('type', 'unknown')
+
+            if message_type == 'subscribe':
+                # Подписка на символы
+                symbols = data.get('symbols', [])
+                if isinstance(symbols, list):
+                    client_info.subscribed_symbols.update(symbols)
+
+                    await self._send_to_client(client_id, {
+                        'type': 'subscription_confirmed',
+                        'symbols': list(client_info.subscribed_symbols),
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                    self.logger.info(f"Клиент {client_id} подписался на: {symbols}")
+
+            elif message_type == 'unsubscribe':
+                # Отписка от символов
+                symbols = data.get('symbols', [])
+                if isinstance(symbols, list):
+                    for symbol in symbols:
+                        client_info.subscribed_symbols.discard(symbol)
+
+                    await self._send_to_client(client_id, {
+                        'type': 'unsubscription_confirmed',
+                        'symbols': list(client_info.subscribed_symbols),
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+            elif message_type == 'get_patterns':
+                # Запрос на получение паттернов
+                symbol = data.get('symbol', 'EURUSD')
+                timeframe = data.get('timeframe', 'H1')
+                bars = data.get('bars', 100)
+
+                await self._process_pattern_request(client_id, symbol, timeframe, bars)
+
+            elif message_type == 'analyze':
+                # Запрос на анализ
+                symbol = data.get('symbol', 'EURUSD')
+                pattern_data = data.get('pattern', {})
+
+                await self._process_analysis_request(client_id, symbol, pattern_data)
+
+            elif message_type == 'ping':
+                # Ping-запрос
+                await self._send_to_client(client_id, {
+                    'type': 'pong',
+                    'timestamp': datetime.now().isoformat()
+                })
+
+            else:
+                self.logger.warning(f"Неизвестный тип сообщения от клиента {client_id}: {message_type}")
+
+        except json.JSONDecodeError:
+            self.logger.error(f"Невалидный JSON от клиента {client_id}")
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки сообщения от клиента {client_id}: {e}")
+
+    async def _process_pattern_request(self, client_id: str, symbol: str, timeframe: str, bars: int):
+        """Обработка запроса на получение паттернов"""
+        try:
+            # Здесь должна быть логика загрузки данных и детектирования паттернов
+            # Для примера отправляем заглушку
+
+            await self._send_to_client(client_id, {
+                'type': 'patterns',
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'patterns': [],
+                'timestamp': datetime.now().isoformat(),
+                'message': 'Pattern detection not implemented in WebSocket example'
+            })
+
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки запроса паттернов: {e}")
+
+            await self._send_to_client(client_id, {
+                'type': 'error',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+
+    async def _process_analysis_request(self, client_id: str, symbol: str, pattern_data: Dict[str, Any]):
+        """Обработка запроса на анализ"""
+        try:
+            # Здесь должна быть логика анализа паттерна
+            # Для примера отправляем заглушку
+
+            await self._send_to_client(client_id, {
+                'type': 'analysis',
+                'symbol': symbol,
+                'pattern': pattern_data,
+                'analysis': {
+                    'quality': 0.75,
+                    'confidence': 0.8,
+                    'direction': 'bullish',
+                    'targets': {
+                        'entry': 1.1000,
+                        'stop_loss': 1.0950,
+                        'take_profit': 1.1100
+                    }
+                },
+                'timestamp': datetime.now().isoformat()
+            })
+
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки запроса анализа: {e}")
+
+            await self._send_to_client(client_id, {
+                'type': 'error',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+
+    async def _broadcast_market_data(self):
+        """Рассылка рыночных данных всем подписанным клиентам"""
+        import time
+        import random
+
+        while True:
+            try:
+                if not self.clients:
+                    await asyncio.sleep(1)
+                    continue
+
+                # Собираем все подписанные символы
+                all_symbols = set()
+                for client_info in self.clients.values():
+                    all_symbols.update(client_info.subscribed_symbols)
+
+                # Для каждого символа генерируем обновление цены
+                for symbol in all_symbols:
+                    # Генерация случайного изменения цены
+                    price_change = random.uniform(-0.001, 0.001)
+
+                    # Создаем сообщение
+                    message = {
+                        'type': 'price_update',
+                        'symbol': symbol,
+                        'bid': 1.1000 + price_change,
+                        'ask': 1.1005 + price_change,
+                        'high': 1.1020 + price_change,
+                        'low': 1.0980 + price_change,
+                        'volume': random.randint(1000, 10000),
+                        'timestamp': datetime.now().isoformat()
+                    }
+
+                    # Отправляем всем клиентам, подписанным на этот символ
+                    for client_id, client_info in self.clients.items():
+                        if symbol in client_info.subscribed_symbols:
+                            await self._send_to_client(client_id, message)
+
+                # Интервал обновления
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                self.logger.error(f"Ошибка рассылки рыночных данных: {e}")
+                await asyncio.sleep(5)
+
+    async def _cleanup_inactive_clients(self):
+        """Очистка неактивных клиентов"""
+        while True:
+            try:
+                current_time = datetime.now()
+                inactive_clients = []
+
+                for client_id, client_info in self.clients.items():
+                    # Клиент считается неактивным если не было активности 5 минут
+                    inactivity_period = current_time - client_info.last_activity
+                    if inactivity_period.total_seconds() > 300:  # 5 минут
+                        inactive_clients.append(client_id)
+
+                # Закрываем соединения с неактивными клиентами
+                for client_id in inactive_clients:
+                    client_info = self.clients.get(client_id)
+                    if client_info:
+                        try:
+                            await client_info.websocket.close()
+                            self.logger.info(f"Закрыто соединение с неактивным клиентом: {client_id}")
+                        except:
+                            pass
+
+                await asyncio.sleep(60)  # Проверка каждую минуту
+
+            except Exception as e:
+                self.logger.error(f"Ошибка очистки неактивных клиентов: {e}")
+                await asyncio.sleep(60)
+
+    async def _send_to_client(self, client_id: str, data: Dict[str, Any]):
+        """Отправка данных конкретному клиенту"""
+        try:
+            client_info = self.clients.get(client_id)
+            if client_info and not client_info.websocket.closed:
+                await client_info.websocket.send(json.dumps(data))
+                self.stats['messages_sent'] += 1
+        except Exception as e:
+            self.logger.error(f"Ошибка отправки данных клиенту {client_id}: {e}")
+
+    async def broadcast_to_all(self, data: Dict[str, Any]):
+        """Широковещательная рассылка всем клиентам"""
         tasks = []
-        for client in self.clients:
-            tasks.append(client.close())
+        for client_id in list(self.clients.keys()):
+            tasks.append(self._send_to_client(client_id, data))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.logger.info("WebSocket сервер остановлен")
+    def get_stats(self) -> Dict[str, Any]:
+        """Получение статистики сервера"""
+        return {
+            **self.stats,
+            'connected_clients': len(self.clients),
+            'timestamp': datetime.now().isoformat()
+        }
 
+    async def send_pattern_detection(self,
+                                    symbol: str,
+                                    timeframe: str,
+                                    patterns: List[Dict[str, Any]]):
+        """Отправка обнаруженных паттернов всем подписанным клиентам"""
+        message = {
+            'type': 'pattern_detection',
+            'symbol': symbol,
+            'timeframe': timeframe,
+            'patterns': patterns,
+            'timestamp': datetime.now().isoformat()
+        }
 
-async def main():
-    """Основная функция запуска сервера"""
-    server = WebSocketServer()
+        await self.broadcast_to_all(message)
 
-    # Обработка сигналов для корректного завершения
-    loop = asyncio.get_running_loop()
+    async def send_trading_signal(self,
+                                 symbol: str,
+                                 signal: Dict[str, Any]):
+        """Отправка торгового сигнала всем подписанным клиентам"""
+        message = {
+            'type': 'trading_signal',
+            'symbol': symbol,
+            'signal': signal,
+            'timestamp': datetime.now().isoformat()
+        }
 
-    def signal_handler():
-        loop.create_task(server.stop())
+        await self.broadcast_to_all(message)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
+def run_websocket_server():
+    """Запуск WebSocket сервера (точка входа)"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="WebSocket Server for Pattern Recognition Engine")
+    parser.add_argument("--host", default="127.0.0.1", help="Host address")
+    parser.add_argument("--port", type=int, default=8765, help="Port number")
+
+    args = parser.parse_args()
+
+    server = WebSocketServer(host=args.host, port=args.port)
 
     try:
-        await server.start()
+        asyncio.run(server.start())
     except KeyboardInterrupt:
-        logger.info("Сервер остановлен по запросу пользователя")
+        print("\nСервер остановлен")
     except Exception as e:
         logger.error(f"Ошибка запуска сервера: {e}")
-    finally:
-        await server.stop()
-
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_websocket_server()
 

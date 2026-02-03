@@ -1,904 +1,832 @@
 """
-Классы свечных паттернов
+Модуль свечных паттернов
 """
 
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 import talib
 
-from .base_pattern import (
-    BasePattern, PatternType, PatternDirection,
-    PatternPoint, MarketContext
-)
-from config import DETECTION_CONFIG
+from .base_pattern import BasePattern, PatternPoint, PatternResult
+from config import config
 
+@dataclass
+class Candle:
+    """Свеча"""
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: Optional[float] = None
 
-class CandlestickPattern(BasePattern):
-    """Базовый класс для свечных паттернов"""
+class CandlestickPatterns(BasePattern):
+    """Класс для детектирования свечных паттернов"""
 
-    def __init__(self, name: str, abbreviation: str = ""):
-        super().__init__(PatternType.CANDLESTICK, name, abbreviation)
-        self.required_candles = 3  # По умолчанию для большинства свечных паттернов
-        self.body_ratio_threshold = 0.1  # Порог для определения доджи
+    def __init__(self):
+        super().__init__(name="candlestick_patterns", min_points=1)
 
-    def _calculate_candle_metrics(self, opens: np.ndarray, highs: np.ndarray,
-                                  lows: np.ndarray, closes: np.ndarray) -> Dict[str, np.ndarray]:
-        """Расчет метрик свечей"""
-        metrics = {}
+        # Паттерны которые мы будем искать
+        self.patterns = {
+            'doji': self._detect_doji,
+            'hammer': self._detect_hammer,
+            'shooting_star': self._detect_shooting_star,
+            'engulfing': self._detect_engulfing,
+            'harami': self._detect_harami,
+            'morning_star': self._detect_morning_star,
+            'evening_star': self._detect_evening_star,
+            'three_white_soldiers': self._detect_three_white_soldiers,
+            'three_black_crows': self._detect_three_black_crows,
+            'piercing_line': self._detect_piercing_line,
+            'dark_cloud_cover': self._detect_dark_cloud_cover
+        }
 
-        # Тела свечей
-        metrics['bodies'] = closes - opens
-        metrics['body_sizes'] = np.abs(metrics['bodies'])
-
-        # Высоты свечей
-        metrics['heights'] = highs - lows
-
-        # Тени
-        metrics['upper_shadows'] = np.where(
-            metrics['bodies'] > 0,
-            highs - closes,  # Для бычьих свечей
-            highs - opens  # Для медвежьих свечей
-        )
-
-        metrics['lower_shadows'] = np.where(
-            metrics['bodies'] > 0,
-            opens - lows,  # Для бычьих свечей
-            closes - lows  # Для медвежьих свечей
-        )
-
-        # Соотношения
-        with np.errstate(divide='ignore', invalid='ignore'):
-            metrics['body_to_height_ratio'] = np.where(
-                metrics['heights'] > 0,
-                metrics['body_sizes'] / metrics['heights'],
-                0
-            )
-
-            metrics['upper_shadow_ratio'] = np.where(
-                metrics['heights'] > 0,
-                metrics['upper_shadows'] / metrics['heights'],
-                0
-            )
-
-            metrics['lower_shadow_ratio'] = np.where(
-                metrics['heights'] > 0,
-                metrics['lower_shadows'] / metrics['heights'],
-                0
-            )
-
-        return metrics
-
-    def _is_doji(self, body_size: float, height: float) -> bool:
-        """Определение доджи"""
-        if height == 0:
-            return False
-        return body_size / height < self.body_ratio_threshold
-
-    def _is_long_candle(self, body_size: float, avg_body_size: float) -> bool:
-        """Определение длинной свечи"""
-        return body_size > avg_body_size * 1.5
-
-    def _is_engulfing(self, prev_open: float, prev_close: float,
-                      curr_open: float, curr_close: float) -> Tuple[bool, bool]:
-        """Определение поглощения"""
-        prev_body = abs(prev_close - prev_open)
-        curr_body = abs(curr_close - curr_open)
-
-        # Бычье поглощение
-        bullish = (prev_close < prev_open and  # Предыдущая медвежья
-                   curr_close > curr_open and  # Текущая бычья
-                   curr_open < prev_close and  # Открытие ниже закрытия предыдущей
-                   curr_close > prev_open)  # Закрытие выше открытия предыдущей
-
-        # Медвежье поглощение
-        bearish = (prev_close > prev_open and  # Предыдущая бычья
-                   curr_close < curr_open and  # Текущая медвежья
-                   curr_open > prev_close and  # Открытие выше закрытия предыдущей
-                   curr_close < prev_open)  # Закрытие ниже открытия предыдущей
-
-        return bullish, bearish
-
-
-class EngulfingPattern(CandlestickPattern):
-    """Паттерн Поглощение"""
-
-    def __init__(self, is_bullish: bool = True):
-        name = "Bullish Engulfing" if is_bullish else "Bearish Engulfing"
-        abbreviation = "BENG" if is_bullish else "SENG"
-        super().__init__(name, abbreviation)
-
-        self.is_bullish = is_bullish
-        self.required_candles = 2
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        opens = kwargs.get('opens', np.array([]))
-
-        if len(opens) < 2 or len(closes) < 2:
-            return False
-
-        # Берем последние две свечи
-        prev_open = opens[-2]
-        prev_close = closes[-2]
-        curr_open = opens[-1]
-        curr_close = closes[-1]
-
-        # Определяем поглощение
-        bullish_engulfing, bearish_engulfing = self._is_engulfing(
-            prev_open, prev_close, curr_open, curr_close
-        )
-
-        if self.is_bullish and bullish_engulfing:
-            self.direction = PatternDirection.BULLISH
-            self._save_points([-2, -1], opens, closes, highs, lows, timestamps)
-            self._is_detected = True
-            return True
-        elif not self.is_bullish and bearish_engulfing:
-            self.direction = PatternDirection.BEARISH
-            self._save_points([-2, -1], opens, closes, highs, lows, timestamps)
-            self._is_detected = True
-            return True
-
-        return False
-
-    def _save_points(self, indices, opens, closes, highs, lows, timestamps):
-        """Сохранение точек паттерна"""
-        self.points = []
-
-        for idx_offset in indices:
-            idx = len(opens) + idx_offset if idx_offset < 0 else idx_offset
-            if 0 <= idx < len(opens):
-                self.points.append(
-                    PatternPoint(
-                        index=idx,
-                        timestamp=timestamps[idx],
-                        price=closes[idx],
-                        point_type='candle_close'
-                    )
-                )
-
-    def calculate_quality(self) -> float:
-        if not self._is_detected or len(self.points) < 2:
-            return 0.0
-
-        scores = []
-
-        # 1. Размер поглощающей свечи
-        if len(self.points) == 2:
-            # Сравниваем тела свечей
-            # Для этого нужно иметь доступ к opens и closes
-            if hasattr(self, '_opens') and hasattr(self, '_closes'):
-                idx1 = self.points[0].index
-                idx2 = self.points[1].index
-
-                if idx1 < len(self._opens) and idx2 < len(self._opens):
-                    prev_body = abs(self._closes[idx1] - self._opens[idx1])
-                    curr_body = abs(self._closes[idx2] - self._opens[idx2])
-
-                    if prev_body > 0:
-                        size_ratio = curr_body / prev_body
-                        size_score = min(size_ratio / 2, 1.0)  # Чем больше, тем лучше
-                        scores.append(size_score)
-
-        # 2. Объем
-        if self.metadata.volume_confirmation:
-            scores.append(0.8)
-        else:
-            scores.append(0.5)
-
-        # 3. Положение в тренде
-        if self.metadata.market_context == MarketContext.DOWNTREND and self.is_bullish:
-            scores.append(0.9)  # Бычье поглощение в нисходящем тренде - хорошо
-        elif self.metadata.market_context == MarketContext.UPTREND and not self.is_bullish:
-            scores.append(0.9)  # Медвежье поглощение в восходящем тренде - хорошо
-        else:
-            scores.append(0.6)
-
-        return np.mean(scores) if scores else 0.0
-
-    def calculate_targets(self, current_price: float):
-        # Для свечных паттернов используем стандартный расчет
-        return super().calculate_targets(current_price)
-
-
-class DojiPattern(CandlestickPattern):
-    """Паттерн Доджи"""
-
-    def __init__(self, doji_type: str = "standard"):
+    def detect(self, data: Dict[str, np.ndarray]) -> List[PatternResult]:
         """
+        Детектирование всех свечных паттернов
+
         Args:
-            doji_type: "standard", "long_legged", "dragonfly", "gravestone"
+            data: Входные данные OHLC
+
+        Returns:
+            Список обнаруженных паттернов
         """
-        name = f"{doji_type.replace('_', ' ').title()} Doji"
-        abbreviation = {
-            "standard": "DOJI",
-            "long_legged": "LLD",
-            "dragonfly": "DFD",
-            "gravestone": "GSD"
-        }.get(doji_type, "DOJI")
-
-        super().__init__(name, abbreviation)
-
-        self.doji_type = doji_type
-        self.required_candles = 1
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        opens = kwargs.get('opens', np.array([]))
-
-        if len(opens) < 1:
-            return False
-
-        # Берем последнюю свечу
-        curr_open = opens[-1]
-        curr_close = closes[-1]
-        curr_high = highs[-1]
-        curr_low = lows[-1]
-
-        # Расчет метрик
-        body_size = abs(curr_close - curr_open)
-        height = curr_high - curr_low
-
-        if height == 0:
-            return False
-
-        # Проверяем доджи
-        if not self._is_doji(body_size, height):
-            return False
-
-        # Определяем тип доджи
-        upper_shadow = curr_high - max(curr_open, curr_close)
-        lower_shadow = min(curr_open, curr_close) - curr_low
-
-        # Стандартный доджи
-        if self.doji_type == "standard":
-            # У стандартного доджи тени примерно равны
-            if abs(upper_shadow - lower_shadow) / height < 0.3:
-                self.direction = PatternDirection.NEUTRAL
-                self._save_points([-1], opens, closes, highs, lows, timestamps)
-                self._is_detected = True
-                return True
-
-        # Доджи с длинными ногами
-        elif self.doji_type == "long_legged":
-            # Длинные верхняя и нижняя тени
-            if upper_shadow > height * 0.4 and lower_shadow > height * 0.4:
-                self.direction = PatternDirection.NEUTRAL
-                self._save_points([-1], opens, closes, highs, lows, timestamps)
-                self._is_detected = True
-                return True
-
-        # Доджи-стрекоза
-        elif self.doji_type == "dragonfly":
-            # Очень маленькая или отсутствующая верхняя тень, длинная нижняя
-            if upper_shadow < height * 0.1 and lower_shadow > height * 0.7:
-                self.direction = PatternDirection.BULLISH
-                self._save_points([-1], opens, closes, highs, lows, timestamps)
-                self._is_detected = True
-                return True
-
-        # Доджи-надгробие
-        elif self.doji_type == "gravestone":
-            # Очень маленькая или отсутствующая нижняя тень, длинная верхняя
-            if lower_shadow < height * 0.1 and upper_shadow > height * 0.7:
-                self.direction = PatternDirection.BEARISH
-                self._save_points([-1], opens, closes, highs, lows, timestamps)
-                self._is_detected = True
-                return True
-
-        return False
-
-    def _save_points(self, indices, opens, closes, highs, lows, timestamps):
-        """Сохранение точек паттерна"""
-        self.points = []
-
-        for idx_offset in indices:
-            idx = len(opens) + idx_offset if idx_offset < 0 else idx_offset
-            if 0 <= idx < len(opens):
-                self.points.append(
-                    PatternPoint(
-                        index=idx,
-                        timestamp=timestamps[idx],
-                        price=closes[idx],
-                        point_type='doji_center'
-                    )
-                )
-
-    def calculate_quality(self) -> float:
-        if not self._is_detected or not self.points:
-            return 0.0
-
-        scores = []
-
-        # 1. Четкость доджи
-        if hasattr(self, '_opens') and hasattr(self, '_closes') and \
-                hasattr(self, '_highs') and hasattr(self, '_lows'):
-
-            idx = self.points[0].index
-            if idx < len(self._opens):
-                open_price = self._opens[idx]
-                close_price = self._closes[idx]
-                high = self._highs[idx]
-                low = self._lows[idx]
-
-                body_size = abs(close_price - open_price)
-                height = high - low
-
-                if height > 0:
-                    doji_score = 1 - (body_size / height) / self.body_ratio_threshold
-                    scores.append(max(0, doji_score))
-
-        # 2. Длина теней в соответствии с типом
-        if self.doji_type in ["dragonfly", "gravestone", "long_legged"]:
-            if hasattr(self, '_opens') and hasattr(self, '_closes') and \
-                    hasattr(self, '_highs') and hasattr(self, '_lows'):
-
-                idx = self.points[0].index
-                if idx < len(self._opens):
-                    open_price = self._opens[idx]
-                    close_price = self._closes[idx]
-                    high = self._highs[idx]
-                    low = self._lows[idx]
-
-                    upper_shadow = high - max(open_price, close_price)
-                    lower_shadow = min(open_price, close_price) - low
-                    height = high - low
-
-                    if height > 0:
-                        if self.doji_type == "dragonfly":
-                            # Длинная нижняя тень, короткая верхняя
-                            lower_ratio = lower_shadow / height
-                            upper_ratio = upper_shadow / height
-                            shadow_score = min(lower_ratio / 0.7, 1.0) * (1 - min(upper_ratio / 0.1, 1.0))
-                            scores.append(shadow_score)
-
-                        elif self.doji_type == "gravestone":
-                            # Длинная верхняя тень, короткая нижняя
-                            upper_ratio = upper_shadow / height
-                            lower_ratio = lower_shadow / height
-                            shadow_score = min(upper_ratio / 0.7, 1.0) * (1 - min(lower_ratio / 0.1, 1.0))
-                            scores.append(shadow_score)
-
-                        elif self.doji_type == "long_legged":
-                            # Длинные обе тени
-                            upper_ratio = upper_shadow / height
-                            lower_ratio = lower_shadow / height
-                            shadow_score = min(upper_ratio / 0.4, 1.0) * min(lower_ratio / 0.4, 1.0)
-                            scores.append(shadow_score)
-
-        # 3. Объем
-        if self.metadata.volume_confirmation:
-            scores.append(0.7)
-        else:
-            scores.append(0.4)
-
-        return np.mean(scores) if scores else 0.0
-
-    def calculate_targets(self, current_price: float):
-        # Доджи обычно не дает четких целей, используем стандартный расчет
-        return super().calculate_targets(current_price)
-
-
-class HammerPattern(CandlestickPattern):
-    """Паттерны Молот и Висячий человек"""
-
-    def __init__(self, is_hammer: bool = True):
-        name = "Hammer" if is_hammer else "Hanging Man"
-        abbreviation = "HAM" if is_hammer else "HGM"
-        super().__init__(name, abbreviation)
-
-        self.is_hammer = is_hammer
-        self.required_candles = 1
-
-        # Параметры для определения
-        self.min_lower_shadow_ratio = 2.0  # Нижняя тень минимум в 2 раза больше тела
-        self.max_upper_shadow_ratio = 0.3  # Верхняя тень не более 30% от высоты
-        self.max_body_to_height_ratio = 0.3  # Тело не более 30% от высоты
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        opens = kwargs.get('opens', np.array([]))
-
-        if len(opens) < 1:
-            return False
-
-        # Берем последнюю свечу
-        curr_open = opens[-1]
-        curr_close = closes[-1]
-        curr_high = highs[-1]
-        curr_low = lows[-1]
-
-        # Расчет метрик
-        body_size = abs(curr_close - curr_open)
-        height = curr_high - curr_low
-
-        if height == 0:
-            return False
-
-        upper_shadow = curr_high - max(curr_open, curr_close)
-        lower_shadow = min(curr_open, curr_close) - curr_low
-
-        # Соотношения
-        body_to_height = body_size / height
-        lower_to_body = lower_shadow / body_size if body_size > 0 else 0
-        upper_to_height = upper_shadow / height
-
-        # Проверяем условия для молота/висячего человека
-        is_valid = (
-                body_to_height <= self.max_body_to_height_ratio and  # Маленькое тело
-                lower_to_body >= self.min_lower_shadow_ratio and  # Длинная нижняя тень
-                upper_to_height <= self.max_upper_shadow_ratio  # Короткая или отсутствующая верхняя тень
-        )
-
-        if not is_valid:
-            return False
-
-        # Определяем направление
-        # Молот - бычий паттерн, обычно в конце нисходящего тренда
-        # Висячий человек - медвежий паттерн, обычно в конце восходящего тренда
-        if self.is_hammer:
-            self.direction = PatternDirection.BULLISH
-        else:
-            self.direction = PatternDirection.BEARISH
-
-        self._save_points([-1], opens, closes, highs, lows, timestamps)
-        self._is_detected = True
-        return True
-
-    def _save_points(self, indices, opens, closes, highs, lows, timestamps):
-        """Сохранение точек паттерна"""
-        self.points = []
-
-        for idx_offset in indices:
-            idx = len(opens) + idx_offset if idx_offset < 0 else idx_offset
-            if 0 <= idx < len(opens):
-                # Сохраняем точку закрытия и точку минимума (для молота)
-                self.points.append(
-                    PatternPoint(
-                        index=idx,
-                        timestamp=timestamps[idx],
-                        price=closes[idx],
-                        point_type='candle_close'
-                    )
-                )
-
-                self.points.append(
-                    PatternPoint(
-                        index=idx,
-                        timestamp=timestamps[idx],
-                        price=lows[idx],
-                        point_type='hammer_low'
-                    )
-                )
-
-    def calculate_quality(self) -> float:
-        if not self._is_detected or not self.points:
-            return 0.0
-
-        scores = []
-
-        # 1. Соотношение теней
-        if hasattr(self, '_opens') and hasattr(self, '_closes') and \
-                hasattr(self, '_highs') and hasattr(self, '_lows'):
-
-            idx = self.points[0].index
-            if idx < len(self._opens):
-                open_price = self._opens[idx]
-                close_price = self._closes[idx]
-                high = self._highs[idx]
-                low = self._lows[idx]
-
-                body_size = abs(close_price - open_price)
-                height = high - low
-                lower_shadow = min(open_price, close_price) - low
-                upper_shadow = high - max(open_price, close_price)
-
-                if body_size > 0 and height > 0:
-                    # Нижняя тень должна быть длинной
-                    lower_ratio = lower_shadow / body_size
-                    lower_score = min(lower_ratio / self.min_lower_shadow_ratio, 1.0)
-                    scores.append(lower_score)
-
-                    # Верхняя тень должна быть короткой
-                    upper_ratio = upper_shadow / height
-                    upper_score = 1 - min(upper_ratio / self.max_upper_shadow_ratio, 1.0)
-                    scores.append(upper_score)
-
-                    # Тело должно быть маленьким
-                    body_ratio = body_size / height
-                    body_score = 1 - min(body_ratio / self.max_body_to_height_ratio, 1.0)
-                    scores.append(body_score)
-
-        # 2. Положение в тренде
-        if self.is_hammer:
-            # Молот лучше работает в нисходящем тренде
-            if self.metadata.market_context == MarketContext.DOWNTREND:
-                scores.append(0.9)
-            else:
-                scores.append(0.6)
-        else:
-            # Висячий человек лучше работает в восходящем тренде
-            if self.metadata.market_context == MarketContext.UPTREND:
-                scores.append(0.9)
-            else:
-                scores.append(0.6)
-
-        # 3. Объем
-        if self.metadata.volume_confirmation:
-            scores.append(0.7)
-        else:
-            scores.append(0.4)
-
-        return np.mean(scores) if scores else 0.0
-
-    def calculate_targets(self, current_price: float):
-        # Для молота/висячего человека цели рассчитываем от высоты свечи
-        if not self._is_detected or not self.points:
-            return super().calculate_targets(current_price)
-
-        if hasattr(self, '_highs') and hasattr(self, '_lows'):
-            idx = self.points[0].index
-            if idx < len(self._highs):
-                high = self._highs[idx]
-                low = self._lows[idx]
-                height = high - low
-
-                if self.is_hammer:
-                    # Бычий молот - цель вверх
-                    self.targets.entry_price = current_price
-                    self.targets.stop_loss = low * 0.995  # 0.5% ниже минимума
-                    self.targets.take_profit = current_price + height
-
-                    self.targets.target1 = current_price + height * 0.5
-                    self.targets.target2 = current_price + height
-                    self.targets.target3 = current_price + height * 1.5
+        results = []
+
+        # Проверка входных данных
+        required = ['open', 'high', 'low', 'close']
+        if not all(key in data for key in required):
+            return results
+
+        # Создаем массив свечей
+        candles = self._create_candles(data)
+
+        # Ищем каждый паттерн
+        for pattern_name, detector in self.patterns.items():
+            if config.DETECTION.ENABLE_CANDLESTICK:
+                pattern_results = detector(candles, data)
+                results.extend(pattern_results)
+
+        # Фильтрация результатов
+        filtered_results = self._filter_results(results)
+
+        return filtered_results
+
+    def _create_candles(self, data: Dict[str, np.ndarray]) -> List[Candle]:
+        """Создание списка свечей из данных"""
+        candles = []
+
+        opens = data['open']
+        highs = data['high']
+        lows = data['low']
+        closes = data['close']
+        volumes = data.get('volume', np.zeros_like(opens))
+
+        n = min(len(opens), len(highs), len(lows), len(closes))
+
+        for i in range(n):
+            candle = Candle(
+                open=opens[i],
+                high=highs[i],
+                low=lows[i],
+                close=closes[i],
+                volume=volumes[i] if i < len(volumes) else None
+            )
+            candles.append(candle)
+
+        return candles
+
+    def _detect_doji(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Дожи"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 1:
+                continue
+
+            candle = candles[i]
+            body_size = abs(candle.close - candle.open)
+            total_range = candle.high - candle.low
+
+            if total_range == 0:
+                continue
+
+            # Дожи - маленькое тело и длинные тени
+            body_to_range_ratio = body_size / total_range
+
+            if body_to_range_ratio < 0.1:  # Тело меньше 10% от общего диапазона
+                # Проверяем тренд
+                prev_candle = candles[i-1]
+
+                # Определение направления
+                if prev_candle.close > prev_candle.open:
+                    direction = 'bearish'  # Бычий тренд, затем Дожи - возможен разворот
                 else:
-                    # Медвежий висячий человек - цель вниз
-                    self.targets.entry_price = current_price
-                    self.targets.stop_loss = high * 1.005  # 0.5% выше максимума
-                    self.targets.take_profit = current_price - height
+                    direction = 'bullish'  # Медвежий тренд, затем Дожи - возможен разворот
 
-                    self.targets.target1 = current_price - height * 0.5
-                    self.targets.target2 = current_price - height
-                    self.targets.target3 = current_price - height * 1.5
-
-                # Риск/прибыль
-                if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-                    risk = abs(self.targets.entry_price - self.targets.stop_loss)
-                    reward = abs(self.targets.take_profit - self.targets.entry_price)
-                    self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
-
-        return self.targets
-
-
-class MorningStarPattern(CandlestickPattern):
-    """Паттерн Утренняя звезда"""
-
-    def __init__(self):
-        super().__init__("Morning Star", "MST")
-        self.required_candles = 3
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        opens = kwargs.get('opens', np.array([]))
-
-        if len(opens) < 3:
-            return False
-
-        # Берем последние три свечи
-        candle1_open = opens[-3]
-        candle1_close = closes[-3]
-
-        candle2_open = opens[-2]
-        candle2_close = closes[-2]
-        candle2_high = highs[-2]
-        candle2_low = lows[-2]
-
-        candle3_open = opens[-1]
-        candle3_close = closes[-1]
-
-        # Условия для Утренней звезды:
-        # 1. Первая свеча - длинная медвежья
-        # 2. Вторая свеча - маленькое тело (доджи или маленькая свеча), может быть гэпом
-        # 3. Третья свеча - длинная бычья, закрывается выше середины тела первой свечи
-
-        # Проверяем первую свечу
-        candle1_body = abs(candle1_close - candle1_open)
-        candle1_height = highs[-3] - lows[-3]
-
-        if candle1_height == 0:
-            return False
-
-        # Первая свеча должна быть медвежьей и длинной
-        is_candle1_bearish = candle1_close < candle1_open
-        is_candle1_long = candle1_body / candle1_height > 0.6
-
-        if not (is_candle1_bearish and is_candle1_long):
-            return False
-
-        # Проверяем вторую свечу
-        candle2_body = abs(candle2_close - candle2_open)
-        candle2_height = candle2_high - candle2_low
-
-        if candle2_height == 0:
-            return False
-
-        # Вторая свеча должна иметь маленькое тело (возможно доджи)
-        is_candle2_small = candle2_body / candle2_height < 0.3
-
-        # Вторая свеча может открыться с гэпом вниз
-        has_gap_down = candle2_open < candle1_close
-
-        if not (is_candle2_small or has_gap_down):
-            return False
-
-        # Проверяем третью свечу
-        candle3_body = abs(candle3_close - candle3_open)
-        candle3_height = highs[-1] - lows[-1]
-
-        if candle3_height == 0:
-            return False
-
-        # Третья свеча должна быть бычьей и длинной
-        is_candle3_bullish = candle3_close > candle3_open
-        is_candle3_long = candle3_body / candle3_height > 0.6
-
-        if not (is_candle3_bullish and is_candle3_long):
-            return False
-
-        # Третья свеча должна закрыться выше середины тела первой свечи
-        candle1_mid = (candle1_open + candle1_close) / 2
-        if candle3_close <= candle1_mid:
-            return False
-
-        # Третья свеча должна закрыться выше открытия первой свечи (идеально)
-        if candle3_close > candle1_open:
-            quality_boost = True
-
-        # Все условия выполнены
-        self.direction = PatternDirection.BULLISH
-        self._save_points([-3, -2, -1], opens, closes, highs, lows, timestamps)
-        self._is_detected = True
-        return True
-
-    def _save_points(self, indices, opens, closes, highs, lows, timestamps):
-        """Сохранение точек паттерна"""
-        self.points = []
-
-        for idx_offset in indices:
-            idx = len(opens) + idx_offset if idx_offset < 0 else idx_offset
-            if 0 <= idx < len(opens):
-                point_type = 'star_candle'
-                if idx_offset == -3:
-                    point_type = 'first_candle'
-                elif idx_offset == -2:
-                    point_type = 'star'
-                elif idx_offset == -1:
-                    point_type = 'third_candle'
-
-                self.points.append(
-                    PatternPoint(
-                        index=idx,
-                        timestamp=timestamps[idx],
-                        price=closes[idx],
-                        point_type=point_type
-                    )
+                # Создаем точку паттерна
+                point = PatternPoint(
+                    index=i,
+                    price=candle.close,
+                    type='doji',
+                    metadata={
+                        'body_size': float(body_size),
+                        'total_range': float(total_range),
+                        'body_ratio': float(body_to_range_ratio)
+                    }
                 )
 
-    def calculate_quality(self) -> float:
-        if not self._is_detected or len(self.points) < 3:
-            return 0.0
+                # Расчет качества
+                quality = 1.0 - body_to_range_ratio  # Чем меньше тело, тем лучше
 
-        scores = []
+                # Расчет уверенности
+                volume_factor = 1.0
+                if candle.volume and i > 0 and candles[i-1].volume:
+                    volume_ratio = candle.volume / candles[i-1].volume
+                    volume_factor = min(1.0, volume_ratio / 2.0)  # Высокий объем увеличивает уверенность
 
-        # 1. Длина свечей
-        if hasattr(self, '_opens') and hasattr(self, '_closes') and \
-                hasattr(self, '_highs') and hasattr(self, '_lows'):
+                confidence = 0.6 * volume_factor
 
-            # Первая свеча (медвежья)
-            idx1 = self.points[0].index
-            candle1_body = abs(self._closes[idx1] - self._opens[idx1])
-            candle1_height = self._highs[idx1] - self._lows[idx1]
+                # Создаем результат
+                result = self.create_result(
+                    name='doji',
+                    points=[point],
+                    quality=quality,
+                    confidence=confidence,
+                    targets={
+                        'entry_price': candle.close,
+                        'stop_loss': candle.high if direction == 'bearish' else candle.low,
+                        'take_profit': candle.close + (candle.high - candle.low) if direction == 'bullish'
+                                     else candle.close - (candle.high - candle.low)
+                    }
+                )
 
-            # Вторая свеча (звезда)
-            idx2 = self.points[1].index
-            candle2_body = abs(self._closes[idx2] - self._opens[idx2])
-            candle2_height = self._highs[idx2] - self._lows[idx2]
+                results.append(result)
 
-            # Третья свеча (бычья)
-            idx3 = self.points[2].index
-            candle3_body = abs(self._closes[idx3] - self._opens[idx3])
-            candle3_height = self._highs[idx3] - self._lows[idx3]
+        return results
 
-            if candle1_height > 0 and candle2_height > 0 and candle3_height > 0:
-                # Первая свеча должна быть длинной
-                candle1_ratio = candle1_body / candle1_height
-                candle1_score = min(candle1_ratio / 0.6, 1.0)
-                scores.append(candle1_score)
+    def _detect_hammer(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Молота"""
+        results = []
 
-                # Вторая свеча должна быть маленькой
-                candle2_ratio = candle2_body / candle2_height
-                candle2_score = 1 - min(candle2_ratio / 0.3, 1.0)
-                scores.append(candle2_score)
+        for i in range(len(candles)):
+            if i < 1:
+                continue
 
-                # Третья свеча должна быть длинной
-                candle3_ratio = candle3_body / candle3_height
-                candle3_score = min(candle3_ratio / 0.6, 1.0)
-                scores.append(candle3_score)
+            candle = candles[i]
+            body_size = abs(candle.close - candle.open)
+            total_range = candle.high - candle.low
 
-        # 2. Положение звезды
-        if len(self.points) == 3:
-            # Звезда должна быть ниже первой свечи
-            if self.points[1].price < self.points[0].price:
-                scores.append(0.8)
-            else:
-                scores.append(0.4)
+            if total_range == 0:
+                continue
 
-            # Третья свеча должна закрыться выше середины первой
-            candle1_mid = (self._opens[idx1] + self._closes[idx1]) / 2
-            if self.points[2].price > candle1_mid:
-                scores.append(0.9)
-            else:
-                scores.append(0.5)
+            upper_shadow = candle.high - max(candle.open, candle.close)
+            lower_shadow = min(candle.open, candle.close) - candle.low
+            body_middle = (candle.open + candle.close) / 2
 
-        # 3. Объем
-        if self.metadata.volume_confirmation:
-            scores.append(0.8)
-        else:
-            scores.append(0.5)
+            # Критерии Молота:
+            # 1. Длинная нижняя тень (минимум в 2 раза больше тела)
+            # 2. Маленькая или отсутствующая верхняя тень
+            # 3. Тело в верхней трети свечи
+            # 4. Предыдущий тренд нисходящий
 
-        # 4. Тренд
-        if self.metadata.market_context == MarketContext.DOWNTREND:
-            scores.append(0.9)  # Утренняя звезда лучше в нисходящем тренде
-        else:
-            scores.append(0.6)
+            if (lower_shadow >= 2 * body_size and  # Длинная нижняя тень
+                upper_shadow <= body_size * 0.3 and  # Короткая верхняя тень
+                body_middle > candle.low + total_range * 0.6):  # Тело в верхней части
 
-        return np.mean(scores) if scores else 0.0
+                # Проверяем предыдущий тренд
+                if i >= 2:
+                    prev_trend = self._check_downtrend(candles, i, lookback=5)
 
-    def calculate_targets(self, current_price: float):
-        # Для утренней звезды цель - высота паттерна
-        if not self._is_detected or len(self.points) < 3:
-            return super().calculate_targets(current_price)
+                    if prev_trend:
+                        # Создаем точку паттерна
+                        point = PatternPoint(
+                            index=i,
+                            price=candle.close,
+                            type='hammer',
+                            metadata={
+                                'body_size': float(body_size),
+                                'lower_shadow': float(lower_shadow),
+                                'upper_shadow': float(upper_shadow)
+                            }
+                        )
 
-        if hasattr(self, '_highs') and hasattr(self, '_lows'):
-            idx1 = self.points[0].index
-            idx3 = self.points[2].index
+                        # Расчет качества
+                        quality = min(1.0, lower_shadow / (body_size + 0.0001))
 
-            # Высота от максимума первой свечи до минимума звезды (второй свечи)
-            pattern_high = self._highs[idx1]
-            pattern_low = self._lows[self.points[1].index]
-            pattern_height = pattern_high - pattern_low
+                        # Расчет уверенности
+                        confidence = 0.7
 
-            self.targets.entry_price = current_price
-            self.targets.stop_loss = pattern_low * 0.99  # 1% ниже минимума звезды
-            self.targets.take_profit = current_price + pattern_height
+                        # Создаем результат
+                        result = self.create_result(
+                            name='hammer',
+                            points=[point],
+                            quality=quality,
+                            confidence=confidence,
+                            targets={
+                                'entry_price': candle.close,
+                                'stop_loss': candle.low * 0.995,
+                                'take_profit': candle.close + (candle.high - candle.low) * 2
+                            }
+                        )
 
-            self.targets.target1 = current_price + pattern_height * 0.5
-            self.targets.target2 = current_price + pattern_height
-            self.targets.target3 = current_price + pattern_height * 1.5
+                        results.append(result)
 
-            # Риск/прибыль
-            if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-                risk = abs(self.targets.entry_price - self.targets.stop_loss)
-                reward = abs(self.targets.take_profit - self.targets.entry_price)
-                self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
+        return results
 
-        return self.targets
+    def _detect_shooting_star(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Падающей звезды"""
+        results = []
 
+        for i in range(len(candles)):
+            if i < 1:
+                continue
 
-class EveningStarPattern(MorningStarPattern):
-    """Паттерн Вечерняя звезда (обратная Утренней звезде)"""
+            candle = candles[i]
+            body_size = abs(candle.close - candle.open)
+            total_range = candle.high - candle.low
 
-    def __init__(self):
-        super().__init__()
-        self.name = "Evening Star"
-        self.abbreviation = "EST"
+            if total_range == 0:
+                continue
 
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        opens = kwargs.get('opens', np.array([]))
+            upper_shadow = candle.high - max(candle.open, candle.close)
+            lower_shadow = min(candle.open, candle.close) - candle.low
+            body_middle = (candle.open + candle.close) / 2
 
-        if len(opens) < 3:
+            # Критерии Падающей звезды:
+            # 1. Длинная верхняя тень (минимум в 2 раза больше тела)
+            # 2. Маленькая или отсутствующая нижняя тень
+            # 3. Тело в нижней трети свечи
+            # 4. Предыдущий тренд восходящий
+
+            if (upper_shadow >= 2 * body_size and  # Длинная верхняя тень
+                lower_shadow <= body_size * 0.3 and  # Короткая нижняя тень
+                body_middle < candle.low + total_range * 0.4):  # Тело в нижней части
+
+                # Проверяем предыдущий тренд
+                if i >= 2:
+                    prev_trend = self._check_uptrend(candles, i, lookback=5)
+
+                    if prev_trend:
+                        # Создаем точку паттерна
+                        point = PatternPoint(
+                            index=i,
+                            price=candle.close,
+                            type='shooting_star',
+                            metadata={
+                                'body_size': float(body_size),
+                                'lower_shadow': float(lower_shadow),
+                                'upper_shadow': float(upper_shadow)
+                            }
+                        )
+
+                        # Расчет качества
+                        quality = min(1.0, upper_shadow / (body_size + 0.0001))
+
+                        # Расчет уверенности
+                        confidence = 0.7
+
+                        # Создаем результат
+                        result = self.create_result(
+                            name='shooting_star',
+                            points=[point],
+                            quality=quality,
+                            confidence=confidence,
+                            targets={
+                                'entry_price': candle.close,
+                                'stop_loss': candle.high * 1.005,
+                                'take_profit': candle.close - (candle.high - candle.low) * 2
+                            }
+                        )
+
+                        results.append(result)
+
+        return results
+
+    def _detect_engulfing(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование поглощающей свечи"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 1:
+                continue
+
+            current = candles[i]
+            previous = candles[i-1]
+
+            current_body = abs(current.close - current.open)
+            previous_body = abs(previous.close - previous.open)
+
+            # Бычья поглощающая свеча
+            if (current.close > current.open and  # Текущая свеча бычья
+                previous.close < previous.open and  # Предыдущая свеча медвежья
+                current.open < previous.close and  # Открытие текущей ниже закрытия предыдущей
+                current.close > previous.open):    # Закрытие текущей выше открытия предыдущей
+
+                # Создаем точки паттерна
+                point1 = PatternPoint(index=i-1, price=previous.close, type='engulfed')
+                point2 = PatternPoint(index=i, price=current.close, type='engulfing')
+
+                # Расчет качества
+                engulf_ratio = current_body / previous_body
+                quality = min(1.0, engulf_ratio / 2.0)
+
+                # Создаем результат
+                result = self.create_result(
+                    name='bullish_engulfing',
+                    points=[point1, point2],
+                    quality=quality,
+                    confidence=0.7,
+                    targets={
+                        'entry_price': current.close,
+                        'stop_loss': current.low * 0.995,
+                        'take_profit': current.close + current_body * 2
+                    }
+                )
+
+                results.append(result)
+
+            # Медвежья поглощающая свеча
+            elif (current.close < current.open and  # Текущая свеча медвежья
+                  previous.close > previous.open and  # Предыдущая свеча бычья
+                  current.open > previous.close and  # Открытие текущей выше закрытия предыдущей
+                  current.close < previous.open):    # Закрытие текущей ниже открытия предыдущей
+
+                # Создаем точки паттерна
+                point1 = PatternPoint(index=i-1, price=previous.close, type='engulfed')
+                point2 = PatternPoint(index=i, price=current.close, type='engulfing')
+
+                # Расчет качества
+                engulf_ratio = current_body / previous_body
+                quality = min(1.0, engulf_ratio / 2.0)
+
+                # Создаем результат
+                result = self.create_result(
+                    name='bearish_engulfing',
+                    points=[point1, point2],
+                    quality=quality,
+                    confidence=0.7,
+                    targets={
+                        'entry_price': current.close,
+                        'stop_loss': current.high * 1.005,
+                        'take_profit': current.close - current_body * 2
+                    }
+                )
+
+                results.append(result)
+
+        return results
+
+    def _detect_harami(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Харами"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 1:
+                continue
+
+            current = candles[i]
+            previous = candles[i-1]
+
+            current_high = current.high
+            current_low = current.low
+            previous_high = previous.high
+            previous_low = previous.low
+
+            # Бычья Харами
+            if (previous.close < previous.open and  # Предыдущая свеча медвежья
+                current.high < previous.open and    # Максимум текущей ниже открытия предыдущей
+                current.low > previous.close and    # Минимум текущей выше закрытия предыдущей
+                current.close > current.open):      # Текущая свеча бычья
+
+                # Создаем точки паттерна
+                point1 = PatternPoint(index=i-1, price=previous.close, type='parent')
+                point2 = PatternPoint(index=i, price=current.close, type='child')
+
+                # Расчет качества
+                quality = 0.7
+
+                # Создаем результат
+                result = self.create_result(
+                    name='bullish_harami',
+                    points=[point1, point2],
+                    quality=quality,
+                    confidence=0.6,
+                    targets={
+                        'entry_price': current.close,
+                        'stop_loss': current.low * 0.995,
+                        'take_profit': current.close + (previous.open - previous.close)
+                    }
+                )
+
+                results.append(result)
+
+            # Медвежья Харами
+            elif (previous.close > previous.open and  # Предыдущая свеча бычья
+                  current.high < previous.close and   # Максимум текущей ниже закрытия предыдущей
+                  current.low > previous.open and     # Минимум текущей выше открытия предыдущей
+                  current.close < current.open):      # Текущая свеча медвежья
+
+                # Создаем точки паттерна
+                point1 = PatternPoint(index=i-1, price=previous.close, type='parent')
+                point2 = PatternPoint(index=i, price=current.close, type='child')
+
+                # Расчет качества
+                quality = 0.7
+
+                # Создаем результат
+                result = self.create_result(
+                    name='bearish_harami',
+                    points=[point1, point2],
+                    quality=quality,
+                    confidence=0.6,
+                    targets={
+                        'entry_price': current.close,
+                        'stop_loss': current.high * 1.005,
+                        'take_profit': current.close - (previous.close - previous.open)
+                    }
+                )
+
+                results.append(result)
+
+        return results
+
+    def _detect_morning_star(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Утренней звезды"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 2:
+                continue
+
+            first = candles[i-2]   # Медвежья свеча
+            second = candles[i-1]  # Маленькая свеча (дожи или с маленьким телом)
+            third = candles[i]     # Бычья свеча
+
+            # Проверяем условия
+            first_is_bearish = first.close < first.open
+            third_is_bullish = third.close > third.open
+
+            if not (first_is_bearish and third_is_bullish):
+                continue
+
+            # Вторая свеча - маленькое тело
+            second_body = abs(second.close - second.open)
+            second_range = second.high - second.low
+
+            if second_range == 0 or second_body / second_range > 0.3:
+                continue
+
+            # Гэпы
+            gap_down = second.high < first.close
+            gap_up = third.low > second.high
+
+            if gap_down and gap_up:
+                # Создаем точки паттерна
+                point1 = PatternPoint(index=i-2, price=first.close, type='first')
+                point2 = PatternPoint(index=i-1, price=second.close, type='star')
+                point3 = PatternPoint(index=i, price=third.close, type='third')
+
+                # Расчет качества
+                quality = 0.8
+
+                # Создаем результат
+                result = self.create_result(
+                    name='morning_star',
+                    points=[point1, point2, point3],
+                    quality=quality,
+                    confidence=0.7,
+                    targets={
+                        'entry_price': third.close,
+                        'stop_loss': third.low * 0.995,
+                        'take_profit': third.close + abs(first.close - third.close)
+                    }
+                )
+
+                results.append(result)
+
+        return results
+
+    def _detect_evening_star(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Вечерней звезды"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 2:
+                continue
+
+            first = candles[i-2]   # Бычья свеча
+            second = candles[i-1]  # Маленькая свеча (дожи или с маленьким телом)
+            third = candles[i]     # Медвежья свеча
+
+            # Проверяем условия
+            first_is_bullish = first.close > first.open
+            third_is_bearish = third.close < third.open
+
+            if not (first_is_bullish and third_is_bearish):
+                continue
+
+            # Вторая свеча - маленькое тело
+            second_body = abs(second.close - second.open)
+            second_range = second.high - second.low
+
+            if second_range == 0 or second_body / second_range > 0.3:
+                continue
+
+            # Гэпы
+            gap_up = second.low > first.close
+            gap_down = third.high < second.low
+
+            if gap_up and gap_down:
+                # Создаем точки паттерна
+                point1 = PatternPoint(index=i-2, price=first.close, type='first')
+                point2 = PatternPoint(index=i-1, price=second.close, type='star')
+                point3 = PatternPoint(index=i, price=third.close, type='third')
+
+                # Расчет качества
+                quality = 0.8
+
+                # Создаем результат
+                result = self.create_result(
+                    name='evening_star',
+                    points=[point1, point2, point3],
+                    quality=quality,
+                    confidence=0.7,
+                    targets={
+                        'entry_price': third.close,
+                        'stop_loss': third.high * 1.005,
+                        'take_profit': third.close - abs(first.close - third.close)
+                    }
+                )
+
+                results.append(result)
+
+        return results
+
+    def _detect_three_white_soldiers(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Трех белых солдат"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 3:
+                continue
+
+            # Проверяем три последовательные бычьи свечи
+            candles_to_check = candles[i-3:i]
+
+            all_bullish = all(c.close > c.open for c in candles_to_check)
+            if not all_bullish:
+                continue
+
+            # Проверяем, что каждая следующая свеча закрывается выше предыдущей
+            closes = [c.close for c in candles_to_check]
+            if not all(closes[j] > closes[j-1] for j in range(1, len(closes))):
+                continue
+
+            # Проверяем, что тела свечей примерно одинакового размера
+            bodies = [abs(c.close - c.open) for c in candles_to_check]
+            avg_body = np.mean(bodies)
+            if any(abs(b - avg_body) > avg_body * 0.5 for b in bodies):
+                continue
+
+            # Создаем точки паттерна
+            points = [
+                PatternPoint(index=i-3+j, price=c.close, type=f'soldier_{j+1}')
+                for j, c in enumerate(candles_to_check)
+            ]
+
+            # Расчет качества
+            quality = 0.8
+
+            # Создаем результат
+            result = self.create_result(
+                name='three_white_soldiers',
+                points=points,
+                quality=quality,
+                confidence=0.75,
+                targets={
+                    'entry_price': candles_to_check[-1].close,
+                    'stop_loss': candles_to_check[0].low * 0.995,
+                    'take_profit': candles_to_check[-1].close + avg_body * 3
+                }
+            )
+
+            results.append(result)
+
+        return results
+
+    def _detect_three_black_crows(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Трех черных ворон"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 3:
+                continue
+
+            # Проверяем три последовательные медвежьи свечи
+            candles_to_check = candles[i-3:i]
+
+            all_bearish = all(c.close < c.open for c in candles_to_check)
+            if not all_bearish:
+                continue
+
+            # Проверяем, что каждая следующая свеча закрывается ниже предыдущей
+            closes = [c.close for c in candles_to_check]
+            if not all(closes[j] < closes[j-1] for j in range(1, len(closes))):
+                continue
+
+            # Проверяем, что тела свечей примерно одинакового размера
+            bodies = [abs(c.close - c.open) for c in candles_to_check]
+            avg_body = np.mean(bodies)
+            if any(abs(b - avg_body) > avg_body * 0.5 for b in bodies):
+                continue
+
+            # Создаем точки паттерна
+            points = [
+                PatternPoint(index=i-3+j, price=c.close, type=f'crow_{j+1}')
+                for j, c in enumerate(candles_to_check)
+            ]
+
+            # Расчет качества
+            quality = 0.8
+
+            # Создаем результат
+            result = self.create_result(
+                name='three_black_crows',
+                points=points,
+                quality=quality,
+                confidence=0.75,
+                targets={
+                    'entry_price': candles_to_check[-1].close,
+                    'stop_loss': candles_to_check[0].high * 1.005,
+                    'take_profit': candles_to_check[-1].close - avg_body * 3
+                }
+            )
+
+            results.append(result)
+
+        return results
+
+    def _detect_piercing_line(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Пронизывающей линии"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 1:
+                continue
+
+            current = candles[i]
+            previous = candles[i-1]
+
+            # Предыдущая свеча должна быть медвежьей
+            if not (previous.close < previous.open):
+                continue
+
+            # Текущая свеча должна быть бычьей
+            if not (current.close > current.open):
+                continue
+
+            # Текущая свеча должна открыться ниже закрытия предыдущей
+            if current.open >= previous.close:
+                continue
+
+            # Текущая свеча должна закрыться выше середины тела предыдущей свечи
+            previous_mid = (previous.open + previous.close) / 2
+            if current.close <= previous_mid:
+                continue
+
+            # Но ниже открытия предыдущей свечи
+            if current.close >= previous.open:
+                continue
+
+            # Создаем точки паттерна
+            point1 = PatternPoint(index=i-1, price=previous.close, type='bearish')
+            point2 = PatternPoint(index=i, price=current.close, type='piercing')
+
+            # Расчет качества
+            penetration = (current.close - previous_mid) / (previous.open - previous_mid)
+            quality = min(1.0, penetration)
+
+            # Создаем результат
+            result = self.create_result(
+                name='piercing_line',
+                points=[point1, point2],
+                quality=quality,
+                confidence=0.7,
+                targets={
+                    'entry_price': current.close,
+                    'stop_loss': current.low * 0.995,
+                    'take_profit': current.close + abs(previous.close - current.close) * 2
+                }
+            )
+
+            results.append(result)
+
+        return results
+
+    def _detect_dark_cloud_cover(self, candles: List[Candle], data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование Тучки"""
+        results = []
+
+        for i in range(len(candles)):
+            if i < 1:
+                continue
+
+            current = candles[i]
+            previous = candles[i-1]
+
+            # Предыдущая свеча должна быть бычьей
+            if not (previous.close > previous.open):
+                continue
+
+            # Текущая свеча должна быть медвежьей
+            if not (current.close < current.open):
+                continue
+
+            # Текущая свеча должна открыться выше закрытия предыдущей
+            if current.open <= previous.close:
+                continue
+
+            # Текущая свеча должна закрыться ниже середины тела предыдущей свечи
+            previous_mid = (previous.open + previous.close) / 2
+            if current.close >= previous_mid:
+                continue
+
+            # Но выше открытия предыдущей свечи
+            if current.close <= previous.open:
+                continue
+
+            # Создаем точки паттерна
+            point1 = PatternPoint(index=i-1, price=previous.close, type='bullish')
+            point2 = PatternPoint(index=i, price=current.close, type='dark_cloud')
+
+            # Расчет качества
+            penetration = (previous_mid - current.close) / (previous_mid - previous.open)
+            quality = min(1.0, penetration)
+
+            # Создаем результат
+            result = self.create_result(
+                name='dark_cloud_cover',
+                points=[point1, point2],
+                quality=quality,
+                confidence=0.7,
+                targets={
+                    'entry_price': current.close,
+                    'stop_loss': current.high * 1.005,
+                    'take_profit': current.close - abs(previous.close - current.close) * 2
+                }
+            )
+
+            results.append(result)
+
+        return results
+
+    def _check_downtrend(self, candles: List[Candle], current_idx: int, lookback: int = 5) -> bool:
+        """Проверка нисходящего тренда"""
+        if current_idx < lookback:
             return False
 
-        # Берем последние три свечи
-        candle1_open = opens[-3]
-        candle1_close = closes[-3]
+        prices = [c.close for c in candles[current_idx-lookback:current_idx]]
 
-        candle2_open = opens[-2]
-        candle2_close = closes[-2]
-        candle2_high = highs[-2]
-        candle2_low = lows[-2]
+        # Простая проверка тренда
+        x = np.arange(len(prices))
+        slope, _ = np.polyfit(x, prices, 1)
 
-        candle3_open = opens[-1]
-        candle3_close = closes[-1]
+        return slope < 0
 
-        # Условия для Вечерней звезды:
-        # 1. Первая свеча - длинная бычья
-        # 2. Вторая свеча - маленькое тело (доджи или маленькая свеча), может быть гэпом
-        # 3. Третья свеча - длинная медвежья, закрывается ниже середины тела первой свечи
-
-        # Проверяем первую свечу
-        candle1_body = abs(candle1_close - candle1_open)
-        candle1_height = highs[-3] - lows[-3]
-
-        if candle1_height == 0:
+    def _check_uptrend(self, candles: List[Candle], current_idx: int, lookback: int = 5) -> bool:
+        """Проверка восходящего тренда"""
+        if current_idx < lookback:
             return False
 
-        # Первая свеча должна быть бычьей и длинной
-        is_candle1_bullish = candle1_close > candle1_open
-        is_candle1_long = candle1_body / candle1_height > 0.6
+        prices = [c.close for c in candles[current_idx-lookback:current_idx]]
 
-        if not (is_candle1_bullish and is_candle1_long):
-            return False
+        # Простая проверка тренда
+        x = np.arange(len(prices))
+        slope, _ = np.polyfit(x, prices, 1)
 
-        # Проверяем вторую свечу
-        candle2_body = abs(candle2_close - candle2_open)
-        candle2_height = candle2_high - candle2_low
+        return slope > 0
 
-        if candle2_height == 0:
-            return False
+    def _filter_results(self, results: List[PatternResult]) -> List[PatternResult]:
+        """Фильтрация результатов"""
+        if not results:
+            return []
 
-        # Вторая свеча должна иметь маленькое тело (возможно доджи)
-        is_candle2_small = candle2_body / candle2_height < 0.3
+        # Фильтруем по минимальному качеству
+        filtered = [r for r in results if r.quality >= config.DETECTION.MIN_PATTERN_QUALITY]
 
-        # Вторая свеча может открыться с гэпом вверх
-        has_gap_up = candle2_open > candle1_close
+        # Фильтруем по минимальной уверенности
+        filtered = [r for r in filtered if r.confidence >= config.DETECTION.CONFIDENCE_THRESHOLD]
 
-        if not (is_candle2_small or has_gap_up):
-            return False
+        # Убираем дубликаты (паттерны на одних и тех же свечах)
+        seen_indices = set()
+        unique_results = []
 
-        # Проверяем третью свечу
-        candle3_body = abs(candle3_close - candle3_open)
-        candle3_height = highs[-1] - lows[-1]
+        for result in filtered:
+            # Создаем ключ на основе индексов свечей
+            indices = tuple(sorted(p.index for p in result.points))
+            if indices not in seen_indices:
+                seen_indices.add(indices)
+                unique_results.append(result)
 
-        if candle3_height == 0:
-            return False
-
-        # Третья свеча должна быть медвежьей и длинной
-        is_candle3_bearish = candle3_close < candle3_open
-        is_candle3_long = candle3_body / candle3_height > 0.6
-
-        if not (is_candle3_bearish and is_candle3_long):
-            return False
-
-        # Третья свеча должна закрыться ниже середины тела первой свечи
-        candle1_mid = (candle1_open + candle1_close) / 2
-        if candle3_close >= candle1_mid:
-            return False
-
-        # Третья свеча должна закрыться ниже открытия первой свечи (идеально)
-        if candle3_close < candle1_open:
-            quality_boost = True
-
-        # Все условия выполнены
-        self.direction = PatternDirection.BEARISH
-        self._save_points([-3, -2, -1], opens, closes, highs, lows, timestamps)
-        self._is_detected = True
-        return True
-
-    def calculate_targets(self, current_price: float):
-        # Для вечерней звезды цель - высота паттерна вниз
-        if not self._is_detected or len(self.points) < 3:
-            return super().calculate_targets(current_price)
-
-        if hasattr(self, '_highs') and hasattr(self, '_lows'):
-            idx1 = self.points[0].index
-            idx3 = self.points[2].index
-
-            # Высота от минимума первой свечи до максимума звезды (второй свечи)
-            pattern_low = self._lows[idx1]
-            pattern_high = self._highs[self.points[1].index]
-            pattern_height = pattern_high - pattern_low
-
-            self.targets.entry_price = current_price
-            self.targets.stop_loss = pattern_high * 1.01  # 1% выше максимума звезды
-            self.targets.take_profit = current_price - pattern_height
-
-            self.targets.target1 = current_price - pattern_height * 0.5
-            self.targets.target2 = current_price - pattern_height
-            self.targets.target3 = current_price - pattern_height * 1.5
-
-            # Риск/прибыль
-            if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-                risk = abs(self.targets.entry_price - self.targets.stop_loss)
-                reward = abs(self.targets.take_profit - self.targets.entry_price)
-                self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
-
-        return self.targets
+        return unique_results
 

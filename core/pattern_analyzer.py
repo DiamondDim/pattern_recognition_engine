@@ -1,690 +1,795 @@
 """
-Анализатор паттернов для поиска исторических аналогов и статистического анализа
+Модуль анализа паттернов
 """
 
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from scipy.spatial.distance import euclidean
-from sklearn.neighbors import NearestNeighbors
-import pandas as pd
+from datetime import datetime, timedelta
+import asyncio
 
-from patterns import BasePattern, PatternType, PatternDirection
-from config import ANALYSIS_CONFIG
+from config import config
 from utils.logger import logger
 
-
 @dataclass
-class PatternFeatureVector:
-    """Вектор признаков паттерна для сравнения"""
+class AnalysisResult:
+    """Результат анализа паттернов"""
 
-    pattern_id: str
-    pattern_type: str
-    direction: str
-
-    # Геометрические признаки
-    normalized_height: float  # Высота паттерна (нормализованная)
-    normalized_width: float  # Ширина паттерна (нормализованная)
-    symmetry_score: float  # Оценка симметрии
-    complexity_score: float  # Оценка сложности
-
-    # Контекстные признаки
-    trend_strength: float  # Сила тренда перед паттерном
-    volatility: float  # Волатильность
-    volume_ratio: float  # Отношение объема
-
-    # Временные признаки
-    timeframe_multiplier: float  # Множитель таймфрейма
-    hour_of_day: float  # Час дня (нормализованный)
-    day_of_week: float  # День недели (нормализованный)
-
-    # Индикаторы
-    rsi_value: float  # Значение RSI
-    macd_value: float  # Значение MACD
-    adx_value: float  # Значение ADX
-
-    # Результат
-    success: Optional[bool] = None
-    profit_loss_ratio: Optional[float] = None
-    holding_period: Optional[float] = None
-
-    @property
-    def feature_array(self) -> np.ndarray:
-        """Вектор признаков как numpy array"""
-        features = [
-            self.normalized_height,
-            self.normalized_width,
-            self.symmetry_score,
-            self.complexity_score,
-            self.trend_strength,
-            self.volatility,
-            self.volume_ratio,
-            self.timeframe_multiplier,
-            self.hour_of_day,
-            self.day_of_week,
-            self.rsi_value,
-            self.macd_value,
-            self.adx_value,
-        ]
-        return np.array(features)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Конвертация в словарь"""
-        return {
-            'pattern_id': self.pattern_id,
-            'pattern_type': self.pattern_type,
-            'direction': self.direction,
-            'features': self.feature_array.tolist(),
-            'success': self.success,
-            'profit_loss_ratio': self.profit_loss_ratio,
-            'holding_period': self.holding_period
-        }
-
+    patterns: List[Dict[str, Any]] = field(default_factory=list)
+    statistics: Dict[str, Any] = field(default_factory=dict)
+    recommendations: List[Dict[str, Any]] = field(default_factory=list)
+    risk_assessment: Dict[str, Any] = field(default_factory=dict)
+    processing_time: float = 0.0
 
 class PatternAnalyzer:
-    """Анализатор паттернов для поиска аналогов и статистики"""
+    """Класс для анализа паттернов"""
 
-    def __init__(self, config: ANALYSIS_CONFIG = None):
-        self.config = config or ANALYSIS_CONFIG
-        self.logger = logger.bind(name="PatternAnalyzer")
+    def __init__(self):
+        self.logger = logger.bind(module="pattern_analyzer")
 
-        # База векторов признаков
-        self.feature_vectors: List[PatternFeatureVector] = []
-
-        # Модель поиска ближайших соседей
-        self.nn_model: Optional[NearestNeighbors] = None
-
-        # Статистика
+        # Статистика анализа
         self.analysis_stats = {
-            'total_patterns_analyzed': 0,
-            'similar_patterns_found': 0,
-            'avg_similarity_score': 0.0,
-            'prediction_accuracy': 0.0
+            'total_analyses': 0,
+            'patterns_analyzed': 0,
+            'trading_signals_generated': 0,
+            'avg_processing_time': 0.0
         }
 
-    def extract_features(self, pattern: Dict[str, Any]) -> PatternFeatureVector:
+    async def analyze_patterns(self,
+                              patterns: List[Dict[str, Any]],
+                              data: Dict[str, np.ndarray]) -> AnalysisResult:
         """
-        Извлечение признаков из паттерна
+        Анализ найденных паттернов
 
         Args:
-            pattern: Словарь с данными паттерна
+            patterns: Список паттернов для анализа
+            data: Входные данные OHLC
 
         Returns:
-            Вектор признаков
+            Результат анализа
         """
-        try:
-            # Базовые признаки
-            pattern_type = pattern.get('type', 'unknown')
-            direction = pattern.get('direction', 'neutral')
+        import time
+        start_time = time.time()
 
-            # Геометрические признаки
-            points = pattern.get('points', [])
-            prices = [p['price'] for p in points] if points else [0]
+        self.logger.info(f"Анализ {len(patterns)} паттернов")
 
-            # Высота и ширина паттерна
-            pattern_height = max(prices) - min(prices) if len(prices) > 1 else 0
-            pattern_width = len(points)
+        if not patterns:
+            self.logger.warning("Нет паттернов для анализа")
+            return AnalysisResult()
 
-            # Нормализация
-            avg_price = np.mean(prices) if prices else 1
-            normalized_height = pattern_height / avg_price if avg_price > 0 else 0
-            normalized_width = pattern_width / 100  # Нормализуем к 100 свечам
+        # Анализ каждого паттерна
+        analyzed_patterns = []
+        for pattern in patterns:
+            analyzed = await self._analyze_single_pattern(pattern, data)
+            if analyzed:
+                analyzed_patterns.append(analyzed)
 
-            # Симметрия и сложность
-            symmetry_score = pattern.get('strength_analysis', {}).get('geometric_quality', 0.5)
-            complexity_score = pattern.get('complexity_level', 1) / 3  # Нормализуем к 0-1
+        # Генерация рекомендаций
+        recommendations = await self._generate_recommendations(analyzed_patterns, data)
 
-            # Контекстные признаки
-            metadata = pattern.get('metadata', {})
-            trend_strength = metadata.get('adx_value', 0) / 100  # ADX 0-100 -> 0-1
-            volatility = metadata.get('volatility_pct', 0)
-            volume_ratio = metadata.get('average_volume', 1) / 1000000  # Нормализуем
+        # Оценка рисков
+        risk_assessment = await self._assess_risks(analyzed_patterns, data)
 
-            # Временные признаки
-            detected_time = datetime.fromisoformat(pattern.get('detection_time', datetime.now().isoformat()))
-            hour_of_day = detected_time.hour / 24  # Нормализуем к 0-1
-            day_of_week = detected_time.weekday() / 7  # Нормализуем к 0-1
+        # Расчет статистики
+        statistics = self._calculate_analysis_statistics(analyzed_patterns)
 
-            # Множитель таймфрейма
-            timeframe = metadata.get('timeframe', 'H1')
-            timeframe_map = {
-                'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30,
-                'H1': 60, 'H4': 240, 'D1': 1440, 'W1': 10080, 'MN': 43200
-            }
-            timeframe_multiplier = np.log(timeframe_map.get(timeframe, 60)) / np.log(43200)
+        # Время обработки
+        processing_time = time.time() - start_time
 
-            # Индикаторы
-            rsi_value = metadata.get('rsi_value', 50) / 100  # RSI 0-100 -> 0-1
-            macd_value = metadata.get('macd_value', 0) / 100  # Нормализуем
-            adx_value = metadata.get('adx_value', 0) / 100  # ADX 0-100 -> 0-1
+        # Обновление статистики
+        self._update_analysis_stats(len(analyzed_patterns), processing_time)
 
-            # Создаем вектор признаков
-            feature_vector = PatternFeatureVector(
-                pattern_id=pattern.get('id', 'unknown'),
-                pattern_type=pattern_type,
-                direction=direction,
-                normalized_height=normalized_height,
-                normalized_width=normalized_width,
-                symmetry_score=symmetry_score,
-                complexity_score=complexity_score,
-                trend_strength=trend_strength,
-                volatility=volatility,
-                volume_ratio=volume_ratio,
-                timeframe_multiplier=timeframe_multiplier,
-                hour_of_day=hour_of_day,
-                day_of_week=day_of_week,
-                rsi_value=rsi_value,
-                macd_value=macd_value,
-                adx_value=adx_value
-            )
+        self.logger.info(f"Анализ завершен: {len(analyzed_patterns)} паттернов за {processing_time:.2f} сек")
 
-            return feature_vector
+        return AnalysisResult(
+            patterns=analyzed_patterns,
+            statistics=statistics,
+            recommendations=recommendations,
+            risk_assessment=risk_assessment,
+            processing_time=processing_time
+        )
 
-        except Exception as e:
-            self.logger.error(f"Ошибка извлечения признаков: {e}")
-
-            # Возвращаем вектор по умолчанию при ошибке
-            return PatternFeatureVector(
-                pattern_id='error',
-                pattern_type='unknown',
-                direction='neutral',
-                normalized_height=0,
-                normalized_width=0,
-                symmetry_score=0.5,
-                complexity_score=0.5,
-                trend_strength=0.5,
-                volatility=0,
-                volume_ratio=1,
-                timeframe_multiplier=0.5,
-                hour_of_day=0.5,
-                day_of_week=0.5,
-                rsi_value=0.5,
-                macd_value=0,
-                adx_value=0.5
-            )
-
-    def find_similar_patterns(self,
-                              pattern: Dict[str, Any],
-                              historical_patterns: List[Dict[str, Any]],
-                              n_neighbors: int = 10) -> List[Tuple[Dict[str, Any], float]]:
+    async def _analyze_single_pattern(self,
+                                     pattern: Dict[str, Any],
+                                     data: Dict[str, np.ndarray]) -> Optional[Dict[str, Any]]:
         """
-        Поиск исторически похожих паттернов
-
-        Args:
-            pattern: Текущий паттерн для сравнения
-            historical_patterns: Исторические паттерны для поиска
-            n_neighbors: Количество ближайших соседей
-
-        Returns:
-            List кортежей (паттерн, оценка схожести)
-        """
-        if not historical_patterns:
-            return []
-
-        try:
-            # Извлекаем признаки текущего паттерна
-            current_features = self.extract_features(pattern)
-
-            # Извлекаем признаки исторических паттернов
-            historical_features = []
-            historical_patterns_filtered = []
-
-            for hist_pattern in historical_patterns:
-                # Фильтруем по типу и направлению
-                if (hist_pattern.get('type') == pattern.get('type') and
-                        hist_pattern.get('direction') == pattern.get('direction')):
-                    features = self.extract_features(hist_pattern)
-                    historical_features.append(features.feature_array)
-                    historical_patterns_filtered.append(hist_pattern)
-
-            if not historical_features:
-                return []
-
-            # Преобразуем в numpy array
-            X = np.array(historical_features)
-
-            # Используем KNN для поиска ближайших соседей
-            if len(historical_features) >= n_neighbors:
-                nn = NearestNeighbors(n_neighbors=min(n_neighbors, len(historical_features)),
-                                      metric='euclidean')
-                nn.fit(X)
-
-                # Находим ближайшие к текущему паттерну
-                distances, indices = nn.kneighbors([current_features.feature_array])
-
-                # Формируем результат
-                similar_patterns = []
-                for i, idx in enumerate(indices[0]):
-                    hist_pattern = historical_patterns_filtered[idx]
-                    similarity = 1 / (1 + distances[0][i])  # Преобразуем расстояние в схожесть
-                    similar_patterns.append((hist_pattern, similarity))
-
-                return similar_patterns
-
-            else:
-                # Если мало исторических данных, используем прямое сравнение
-                similarities = []
-                for hist_pattern, features in zip(historical_patterns_filtered, historical_features):
-                    # Евклидово расстояние
-                    distance = euclidean(current_features.feature_array, features)
-                    similarity = 1 / (1 + distance)
-                    similarities.append((hist_pattern, similarity))
-
-                # Сортируем по убыванию схожести
-                similarities.sort(key=lambda x: x[1], reverse=True)
-                return similarities[:n_neighbors]
-
-        except Exception as e:
-            self.logger.error(f"Ошибка поиска похожих паттернов: {e}")
-            return []
-
-    def calculate_success_rate(self, similar_patterns: List[Tuple[Dict[str, Any], float]]) -> float:
-        """
-        Расчет успешности на основе похожих паттернов
-
-        Args:
-            similar_patterns: Список похожих паттернов с оценками схожести
-
-        Returns:
-            Процент успешности (0-1)
-        """
-        if not similar_patterns:
-            return 0.5  # Возвращаем 50% при отсутствии данных
-
-        try:
-            successes = []
-            weights = []
-
-            for pattern, similarity in similar_patterns:
-                # Проверяем, есть ли информация об успешности
-                stats = pattern.get('statistics', {})
-                success_rate = stats.get('historical_success_rate', 0)
-
-                # Если есть конкретный результат
-                if 'outcome' in pattern:
-                    outcome = pattern['outcome']
-                    if outcome in ['success', 'profit', 'win']:
-                        successes.append(1.0)
-                    elif outcome in ['failure', 'loss']:
-                        successes.append(0.0)
-                    else:
-                        successes.append(success_rate)
-                else:
-                    successes.append(success_rate)
-
-                # Вес на основе схожести
-                weights.append(similarity)
-
-            if not weights:
-                return 0.5
-
-            # Взвешенное среднее
-            total_weight = sum(weights)
-            if total_weight > 0:
-                weighted_success = sum(s * w for s, w in zip(successes, weights)) / total_weight
-                return float(weighted_success)
-            else:
-                return 0.5
-
-        except Exception as e:
-            self.logger.error(f"Ошибка расчета успешности: {e}")
-            return 0.5
-
-    def calculate_average_profit(self, similar_patterns: List[Tuple[Dict[str, Any], float]]) -> float:
-        """
-        Расчет средней прибыли на основе похожих паттернов
-
-        Args:
-            similar_patterns: Список похожих паттернов
-
-        Returns:
-            Средняя прибыль в пунктах
-        """
-        if not similar_patterns:
-            return 0.0
-
-        try:
-            profits = []
-            weights = []
-
-            for pattern, similarity in similar_patterns:
-                # Получаем цели паттерна
-                targets = pattern.get('targets', {})
-                entry = targets.get('entry_price')
-                take_profit = targets.get('take_profit')
-
-                if entry and take_profit:
-                    # Рассчитываем прибыль в пунктах
-                    if pattern.get('direction') == 'bullish':
-                        profit = take_profit - entry
-                    else:
-                        profit = entry - take_profit
-
-                    profits.append(profit)
-                    weights.append(similarity)
-
-            if not profits:
-                return 0.0
-
-            # Взвешенное среднее
-            total_weight = sum(weights)
-            if total_weight > 0:
-                weighted_profit = sum(p * w for p, w in zip(profits, weights)) / total_weight
-                return float(weighted_profit)
-            else:
-                return np.mean(profits) if profits else 0.0
-
-        except Exception as e:
-            self.logger.error(f"Ошибка расчета средней прибыли: {e}")
-            return 0.0
-
-    def analyze_pattern_quality(self, pattern: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Полный анализ качества паттерна
+        Анализ одного паттерна
 
         Args:
             pattern: Паттерн для анализа
+            data: Входные данные
 
         Returns:
-            Словарь с результатами анализа
+            Проанализированный паттерн или None
         """
-        analysis = {
-            'geometric_quality': pattern.get('metadata', {}).get('quality_score', 0),
-            'context_score': 0.0,
-            'confirmation_score': 0.0,
-            'risk_reward_score': 0.0,
-            'historical_success_score': 0.0,
-            'overall_score': 0.0
-        }
-
         try:
-            # 1. Оценка контекста
-            metadata = pattern.get('metadata', {})
-            market_context = metadata.get('market_context', 'neutral')
-            direction = pattern.get('direction', 'neutral')
+            # Базовый анализ
+            analyzed = pattern.copy()
 
-            context_score = 0.5  # Базовая оценка
-
-            if market_context == 'uptrend' and direction == 'bullish':
-                context_score = 0.9
-            elif market_context == 'downtrend' and direction == 'bearish':
-                context_score = 0.9
-            elif market_context == 'sideways':
-                context_score = 0.7
-            elif market_context == 'volatile':
-                context_score = 0.6
-
-            analysis['context_score'] = context_score
-
-            # 2. Оценка подтверждений
-            confirmation_score = 0.0
-            confirmations = 0
-            total_possible = 3
-
-            if metadata.get('volume_confirmation', False):
-                confirmation_score += 0.3
-                confirmations += 1
-
-            if metadata.get('trend_confirmation', False):
-                confirmation_score += 0.3
-                confirmations += 1
-
-            if metadata.get('indicator_confirmation', False):
-                confirmation_score += 0.4
-                confirmations += 1
-
-            analysis['confirmation_score'] = confirmation_score
-
-            # 3. Оценка риска/прибыли
-            targets = pattern.get('targets', {})
-            risk_reward = targets.get('profit_risk_ratio', 0)
-
-            if risk_reward >= 3:
-                risk_reward_score = 1.0
-            elif risk_reward >= 2:
-                risk_reward_score = 0.8
-            elif risk_reward >= 1.5:
-                risk_reward_score = 0.6
-            elif risk_reward >= 1:
-                risk_reward_score = 0.4
-            else:
-                risk_reward_score = 0.2
-
-            analysis['risk_reward_score'] = risk_reward_score
-
-            # 4. Историческая успешность
-            stats = pattern.get('statistics', {})
-            historical_success = stats.get('historical_success_rate', 0.5)
-            analysis['historical_success_score'] = historical_success
-
-            # 5. Общая оценка (взвешенная)
-            weights = {
-                'geometric_quality': 0.25,
-                'context_score': 0.20,
-                'confirmation_score': 0.15,
-                'risk_reward_score': 0.20,
-                'historical_success_score': 0.20
+            # Добавление метаданных анализа
+            analyzed['analysis'] = {
+                'analyzed_at': self._get_timestamp(),
+                'analyst': self.__class__.__name__
             }
 
-            overall_score = (
-                    analysis['geometric_quality'] * weights['geometric_quality'] +
-                    analysis['context_score'] * weights['context_score'] +
-                    analysis['confirmation_score'] * weights['confirmation_score'] +
-                    analysis['risk_reward_score'] * weights['risk_reward_score'] +
-                    analysis['historical_success_score'] * weights['historical_success_score']
-            )
+            # Анализ качества
+            quality_metrics = await self._analyze_pattern_quality(pattern, data)
+            analyzed['analysis']['quality_metrics'] = quality_metrics
 
-            analysis['overall_score'] = overall_score
+            # Расчет потенциальной прибыли
+            profit_potential = await self._calculate_profit_potential(pattern, data)
+            analyzed['analysis']['profit_potential'] = profit_potential
 
-            # 6. Рекомендация
-            if overall_score >= 0.8:
-                analysis['recommendation'] = 'STRONG_BUY' if direction == 'bullish' else 'STRONG_SELL'
-                analysis['confidence'] = 'HIGH'
-            elif overall_score >= 0.6:
-                analysis['recommendation'] = 'BUY' if direction == 'bullish' else 'SELL'
-                analysis['confidence'] = 'MEDIUM'
-            elif overall_score >= 0.4:
-                analysis['recommendation'] = 'WEAK_BUY' if direction == 'bullish' else 'WEAK_SELL'
-                analysis['confidence'] = 'LOW'
-            else:
-                analysis['recommendation'] = 'HOLD'
-                analysis['confidence'] = 'VERY_LOW'
+            # Оценка риска
+            risk_metrics = await self._calculate_risk_metrics(pattern, data)
+            analyzed['analysis']['risk_metrics'] = risk_metrics
 
-            # Обновляем статистику
-            self.analysis_stats['total_patterns_analyzed'] += 1
+            # Генерация торгового сигнала
+            trading_signal = await self._generate_trading_signal(pattern, data)
+            analyzed['analysis']['trading_signal'] = trading_signal
+
+            # Временной анализ
+            time_analysis = await self._analyze_timing(pattern, data)
+            analyzed['analysis']['time_analysis'] = time_analysis
+
+            # Расчет общего скора
+            overall_score = self._calculate_overall_score(quality_metrics, profit_potential, risk_metrics)
+            analyzed['analysis']['overall_score'] = overall_score
+
+            # Проверка, стоит ли рассматривать паттерн для торговли
+            analyzed['tradable'] = self._is_pattern_tradable(analyzed)
+
+            return analyzed
 
         except Exception as e:
-            self.logger.error(f"Ошибка анализа качества паттерна: {e}")
-            analysis['error'] = str(e)
+            self.logger.error(f"Ошибка анализа паттерна {pattern.get('name')}: {e}")
+            return None
 
-        return analysis
+    async def _analyze_pattern_quality(self,
+                                      pattern: Dict[str, Any],
+                                      data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Анализ качества паттерна"""
+        try:
+            # Базовое качество из детектирования
+            base_quality = pattern.get('quality_score', 0.5)
+            base_confidence = pattern.get('confidence_score', 0.5)
 
-    def predict_pattern_outcome(self,
-                                pattern: Dict[str, Any],
-                                historical_patterns: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Прогнозирование исхода паттерна
+            # Анализ симметрии (для геометрических паттернов)
+            symmetry_score = await self._calculate_symmetry_score(pattern, data)
 
-        Args:
-            pattern: Паттерн для прогнозирования
-            historical_patterns: Исторические данные
+            # Анализ пропорций (для гармонических паттернов)
+            proportion_score = await self._calculate_proportion_score(pattern, data)
 
-        Returns:
-            Словарь с прогнозом
-        """
-        prediction = {
-            'probability_success': 0.5,
-            'expected_profit': 0.0,
-            'expected_risk': 0.0,
-            'expected_holding_period': 0.0,
-            'confidence': 0.0
+            # Анализ свечей (для свечных паттернов)
+            candle_score = await self._calculate_candle_score(pattern, data)
+
+            # Анализ объема
+            volume_score = await self._calculate_volume_score(pattern, data)
+
+            # Итоговый скоринг качества
+            quality_factors = {
+                'base_quality': base_quality,
+                'symmetry': symmetry_score,
+                'proportions': proportion_score,
+                'candles': candle_score,
+                'volume': volume_score
+            }
+
+            # Веса факторов
+            weights = {
+                'base_quality': 0.3,
+                'symmetry': 0.2,
+                'proportions': 0.2,
+                'candles': 0.2,
+                'volume': 0.1
+            }
+
+            # Расчет итогового качества
+            total_quality = 0.0
+            for factor, weight in weights.items():
+                total_quality += quality_factors.get(factor, 0.5) * weight
+
+            return {
+                'scores': quality_factors,
+                'weights': weights,
+                'total_quality': float(total_quality),
+                'adjusted_quality': float((total_quality + base_quality) / 2)
+            }
+
+        except Exception as e:
+            self.logger.error(f"Ошибка анализа качества: {e}")
+            return {'total_quality': pattern.get('quality_score', 0.5)}
+
+    async def _calculate_symmetry_score(self,
+                                       pattern: Dict[str, Any],
+                                       data: Dict[str, np.ndarray]) -> float:
+        """Расчет скора симметрии паттерна"""
+        try:
+            points = pattern.get('points', [])
+            if len(points) < 4:
+                return 0.5
+
+            # Для паттернов с четным количеством точек
+            if pattern.get('type') == 'geometric':
+                # Проверка симметрии ценовых уровней
+                price_points = [p.get('price', 0) for p in points if 'price' in p]
+                if len(price_points) >= 4:
+                    # Расчет коэффициента симметрии
+                    left_side = abs(price_points[1] - price_points[0])
+                    right_side = abs(price_points[3] - price_points[2])
+
+                    if left_side > 0 and right_side > 0:
+                        ratio = min(left_side, right_side) / max(left_side, right_side)
+                        return float(ratio)
+
+            return 0.5
+
+        except Exception as e:
+            self.logger.debug(f"Ошибка расчета симметрии: {e}")
+            return 0.5
+
+    async def _calculate_proportion_score(self,
+                                        pattern: Dict[str, Any],
+                                        data: Dict[str, np.ndarray]) -> float:
+        """Расчет скора пропорций паттерна"""
+        try:
+            if pattern.get('type') != 'harmonic':
+                return 0.5
+
+            fib_levels = pattern.get('metadata', {}).get('original_pattern', {}).get('fibonacci_levels', {})
+            if not fib_levels:
+                return 0.5
+
+            # Идеальные пропорции для гармонических паттернов
+            ideal_proportions = {
+                'gartley': {'AB': 0.618, 'BC': 0.618, 'CD': 1.618},
+                'butterfly': {'AB': 0.786, 'BC': 0.618, 'CD': 2.618},
+                'bat': {'AB': 0.382, 'BC': 0.618, 'CD': 2.618},
+                'crab': {'AB': 0.382, 'BC': 0.618, 'CD': 3.618},
+                'shark': {'AB': 0.382, 'BC': 1.130, 'CD': 1.618}
+            }
+
+            pattern_name = pattern.get('name', '').lower()
+            if pattern_name not in ideal_proportions:
+                return 0.5
+
+            ideal = ideal_proportions[pattern_name]
+            total_error = 0.0
+
+            for level, ideal_value in ideal.items():
+                actual_value = fib_levels.get(level, 0.0)
+                error = abs(actual_value - ideal_value) / ideal_value if ideal_value > 0 else 1.0
+                total_error += error
+
+            avg_error = total_error / len(ideal)
+            score = max(0.0, 1.0 - avg_error)
+
+            return float(score)
+
+        except Exception as e:
+            self.logger.debug(f"Ошибка расчета пропорций: {e}")
+            return 0.5
+
+    async def _calculate_candle_score(self,
+                                     pattern: Dict[str, Any],
+                                     data: Dict[str, np.ndarray]) -> float:
+        """Расчет скора свечей для паттерна"""
+        try:
+            if pattern.get('type') != 'candlestick':
+                return 0.5
+
+            # Анализ свечей вокруг паттерна
+            points = pattern.get('points', [])
+            if not points:
+                return 0.5
+
+            # Находим свечи паттерна
+            pattern_indices = [p.get('index', 0) for p in points]
+            if not pattern_indices:
+                return 0.5
+
+            start_idx = min(pattern_indices)
+            end_idx = max(pattern_indices)
+
+            # Анализируем свечи до и после паттерна
+            window_size = 5
+            pre_pattern_idx = max(0, start_idx - window_size)
+            post_pattern_idx = min(len(data['close']) - 1, end_idx + window_size)
+
+            # Анализ тренда до паттерна
+            pre_close_prices = data['close'][pre_pattern_idx:start_idx]
+            if len(pre_close_prices) > 1:
+                pre_trend = np.polyfit(range(len(pre_close_prices)), pre_close_prices, 1)[0]
+            else:
+                pre_trend = 0
+
+            # Анализ тренда после паттерна
+            post_close_prices = data['close'][end_idx:post_pattern_idx]
+            if len(post_close_prices) > 1:
+                post_trend = np.polyfit(range(len(post_close_prices)), post_close_prices, 1)[0]
+            else:
+                post_trend = 0
+
+            # Оценка эффективности паттерна
+            if pattern.get('direction') == 'bullish':
+                # Для бычьего паттерна хотим видеть рост после него
+                effectiveness = 1.0 if post_trend > 0 else 0.5
+            else:
+                # Для медвежьего паттерна хотим видеть падение после него
+                effectiveness = 1.0 if post_trend < 0 else 0.5
+
+            return float(effectiveness)
+
+        except Exception as e:
+            self.logger.debug(f"Ошибка анализа свечей: {e}")
+            return 0.5
+
+    async def _calculate_volume_score(self,
+                                     pattern: Dict[str, Any],
+                                     data: Dict[str, np.ndarray]) -> float:
+        """Расчет скора объема"""
+        try:
+            if 'volume' not in data:
+                return 0.5
+
+            points = pattern.get('points', [])
+            if not points:
+                return 0.5
+
+            # Индексы паттерна
+            pattern_indices = [p.get('index', 0) for p in points]
+            pattern_volumes = [data['volume'][i] for i in pattern_indices if i < len(data['volume'])]
+
+            if not pattern_volumes:
+                return 0.5
+
+            # Средний объем паттерна
+            avg_pattern_volume = np.mean(pattern_volumes)
+
+            # Средний объем до паттерна
+            start_idx = min(pattern_indices)
+            lookback = min(20, start_idx)
+            pre_volumes = data['volume'][start_idx - lookback:start_idx]
+
+            if len(pre_volumes) > 0:
+                avg_pre_volume = np.mean(pre_volumes)
+                volume_ratio = avg_pattern_volume / avg_pre_volume if avg_pre_volume > 0 else 1.0
+
+                # Высокий объем на паттерне - хороший знак
+                if volume_ratio > 1.5:
+                    return 0.8
+                elif volume_ratio > 1.0:
+                    return 0.6
+                else:
+                    return 0.4
+            else:
+                return 0.5
+
+        except Exception as e:
+            self.logger.debug(f"Ошибка анализа объема: {e}")
+            return 0.5
+
+    async def _calculate_profit_potential(self,
+                                         pattern: Dict[str, Any],
+                                         data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Расчет потенциальной прибыли"""
+        try:
+            targets = pattern.get('targets', {})
+            entry_price = targets.get('entry_price')
+            stop_loss = targets.get('stop_loss')
+            take_profit = targets.get('take_profit')
+
+            if not all([entry_price, stop_loss, take_profit]):
+                return {
+                    'risk_reward_ratio': 0.0,
+                    'potential_profit_pips': 0.0,
+                    'potential_loss_pips': 0.0,
+                    'profit_probability': 0.5
+                }
+
+            # Расчет в пипсах (предполагаем 5 знаков для большинства валютных пар)
+            if pattern.get('direction') == 'bullish':
+                profit_pips = (take_profit - entry_price) * 10000
+                loss_pips = (entry_price - stop_loss) * 10000
+            else:
+                profit_pips = (entry_price - take_profit) * 10000
+                loss_pips = (stop_loss - entry_price) * 10000
+
+            # Соотношение риск/прибыль
+            risk_reward_ratio = profit_pips / loss_pips if loss_pips > 0 else 0.0
+
+            # Вероятность прибыли (на основе качества паттерна)
+            quality = pattern.get('quality_score', 0.5)
+            confidence = pattern.get('confidence_score', 0.5)
+            profit_probability = (quality + confidence) / 2
+
+            return {
+                'risk_reward_ratio': float(risk_reward_ratio),
+                'potential_profit_pips': float(profit_pips),
+                'potential_loss_pips': float(loss_pips),
+                'profit_probability': float(profit_probability),
+                'entry_price': float(entry_price),
+                'stop_loss': float(stop_loss),
+                'take_profit': float(take_profit)
+            }
+
+        except Exception as e:
+            self.logger.error(f"Ошибка расчета прибыли: {e}")
+            return {
+                'risk_reward_ratio': 0.0,
+                'potential_profit_pips': 0.0,
+                'potential_loss_pips': 0.0,
+                'profit_probability': 0.5
+            }
+
+    async def _calculate_risk_metrics(self,
+                                     pattern: Dict[str, Any],
+                                     data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Расчет метрик риска"""
+        try:
+            # Волатильность
+            closes = data.get('close', [])
+            if len(closes) >= 20:
+                returns = np.diff(closes[-20:]) / closes[-21:-1]
+                volatility = np.std(returns) * np.sqrt(252)  # Годовая волатильность
+            else:
+                volatility = 0.1  # По умолчанию
+
+            # Размер позиции (на основе волатильности)
+            if volatility > 0:
+                position_size = min(1.0, 0.1 / volatility)  # Ограничиваем размер позиции
+            else:
+                position_size = 0.1
+
+            # Максимальный допустимый риск
+            max_risk = config.BACKTESTING.RISK_PER_TRADE
+
+            # Оценка drawdown риска
+            quality = pattern.get('quality_score', 0.5)
+            drawdown_risk = (1.0 - quality) * 0.1  # Риск просадки
+
+            return {
+                'volatility': float(volatility),
+                'position_size': float(position_size),
+                'max_risk_per_trade': float(max_risk),
+                'drawdown_risk': float(drawdown_risk),
+                'market_conditions': self._assess_market_conditions(data),
+                'risk_level': 'low' if quality > 0.7 else 'medium' if quality > 0.5 else 'high'
+            }
+
+        except Exception as e:
+            self.logger.error(f"Ошибка расчета рисков: {e}")
+            return {
+                'volatility': 0.1,
+                'position_size': 0.1,
+                'max_risk_per_trade': 0.02,
+                'drawdown_risk': 0.05,
+                'market_conditions': 'unknown',
+                'risk_level': 'medium'
+            }
+
+    def _assess_market_conditions(self, data: Dict[str, np.ndarray]) -> str:
+        """Оценка рыночных условий"""
+        try:
+            closes = data.get('close', [])
+            if len(closes) < 20:
+                return 'neutral'
+
+            # Расчет тренда
+            trend_coef = np.polyfit(range(20), closes[-20:], 1)[0]
+
+            # Расчет волатильности
+            returns = np.diff(closes[-20:]) / closes[-21:-1]
+            volatility = np.std(returns)
+
+            # Классификация
+            if abs(trend_coef) > 0.001 and volatility < 0.005:
+                return 'trending_low_vol'
+            elif abs(trend_coef) > 0.001 and volatility >= 0.005:
+                return 'trending_high_vol'
+            elif abs(trend_coef) <= 0.001 and volatility < 0.005:
+                return 'ranging_low_vol'
+            else:
+                return 'ranging_high_vol'
+
+        except Exception:
+            return 'unknown'
+
+    async def _generate_trading_signal(self,
+                                      pattern: Dict[str, Any],
+                                      data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Генерация торгового сигнала"""
+        try:
+            quality = pattern.get('quality_score', 0.5)
+            profit_potential = pattern.get('analysis', {}).get('profit_potential', {})
+            risk_reward = profit_potential.get('risk_reward_ratio', 0.0)
+
+            # Определение силы сигнала
+            if quality >= 0.8 and risk_reward >= 2.0:
+                signal_strength = 'strong'
+                action = 'enter'
+            elif quality >= 0.6 and risk_reward >= 1.5:
+                signal_strength = 'moderate'
+                action = 'enter'
+            elif quality >= 0.5 and risk_reward >= 1.0:
+                signal_strength = 'weak'
+                action = 'monitor'
+            else:
+                signal_strength = 'very_weak'
+                action = 'avoid'
+
+            # Целевые уровни
+            targets = pattern.get('targets', {})
+
+            return {
+                'action': action,
+                'strength': signal_strength,
+                'direction': pattern.get('direction', 'neutral'),
+                'entry_price': targets.get('entry_price'),
+                'stop_loss': targets.get('stop_loss'),
+                'take_profit': targets.get('take_profit'),
+                'confidence': pattern.get('confidence_score', 0.5),
+                'valid_until': self._calculate_signal_expiry(pattern),
+                'reasoning': f"Pattern quality: {quality:.2f}, Risk/Reward: {risk_reward:.2f}"
+            }
+
+        except Exception as e:
+            self.logger.error(f"Ошибка генерации сигнала: {e}")
+            return {
+                'action': 'avoid',
+                'strength': 'very_weak',
+                'direction': 'neutral',
+                'confidence': 0.0
+            }
+
+    async def _analyze_timing(self,
+                             pattern: Dict[str, Any],
+                             data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Анализ временных аспектов паттерна"""
+        try:
+            points = pattern.get('points', [])
+            if not points:
+                return {'age': 0, 'time_score': 0.5}
+
+            # Возраст паттерна
+            last_point = max(points, key=lambda x: x.get('index', 0))
+            current_index = len(data.get('close', [])) - 1
+            age = current_index - last_point.get('index', current_index)
+
+            # Оптимальный возраст для входа (0-5 свечей после паттерна)
+            if age <= 5:
+                time_score = 0.8
+            elif age <= 10:
+                time_score = 0.6
+            elif age <= 20:
+                time_score = 0.4
+            else:
+                time_score = 0.2
+
+            return {
+                'age': age,
+                'time_score': time_score,
+                'optimal_entry_window': age <= 5,
+                'expired': age > 20
+            }
+
+        except Exception as e:
+            self.logger.debug(f"Ошибка временного анализа: {e}")
+            return {'age': 0, 'time_score': 0.5}
+
+    def _calculate_overall_score(self,
+                                quality_metrics: Dict[str, Any],
+                                profit_potential: Dict[str, Any],
+                                risk_metrics: Dict[str, Any]) -> float:
+        """Расчет общего скора паттерна"""
+        try:
+            weights = {
+                'quality': 0.4,
+                'profit': 0.3,
+                'risk': 0.3
+            }
+
+            quality_score = quality_metrics.get('adjusted_quality', 0.5)
+            profit_score = min(1.0, profit_potential.get('risk_reward_ratio', 0.0) / 3.0)
+            risk_score = 1.0 - risk_metrics.get('drawdown_risk', 0.1) * 10
+
+            overall = (
+                quality_score * weights['quality'] +
+                profit_score * weights['profit'] +
+                risk_score * weights['risk']
+            )
+
+            return float(max(0.0, min(1.0, overall)))
+
+        except Exception:
+            return 0.5
+
+    def _is_pattern_tradable(self, pattern: Dict[str, Any]) -> bool:
+        """Проверка, пригоден ли паттерн для торговли"""
+        try:
+            analysis = pattern.get('analysis', {})
+
+            # Минимальные требования
+            if analysis.get('overall_score', 0) < 0.6:
+                return False
+
+            signal = analysis.get('trading_signal', {})
+            if signal.get('action') != 'enter':
+                return False
+
+            if signal.get('strength') == 'very_weak':
+                return False
+
+            # Проверка временных параметров
+            time_analysis = analysis.get('time_analysis', {})
+            if time_analysis.get('expired', False):
+                return False
+
+            return True
+
+        except Exception:
+            return False
+
+    async def _generate_recommendations(self,
+                                      patterns: List[Dict[str, Any]],
+                                      data: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+        """Генерация торговых рекомендаций"""
+        recommendations = []
+
+        # Сортируем паттерны по общему скору
+        tradable_patterns = [p for p in patterns if p.get('tradable', False)]
+        sorted_patterns = sorted(
+            tradable_patterns,
+            key=lambda x: x.get('analysis', {}).get('overall_score', 0),
+            reverse=True
+        )
+
+        # Берем топ-3 паттерна
+        for pattern in sorted_patterns[:3]:
+            analysis = pattern.get('analysis', {})
+            signal = analysis.get('trading_signal', {})
+
+            recommendation = {
+                'pattern_id': pattern.get('id'),
+                'pattern_name': pattern.get('name'),
+                'symbol': pattern.get('symbol'),
+                'timeframe': pattern.get('timeframe'),
+                'action': signal.get('action', 'avoid'),
+                'direction': pattern.get('direction', 'neutral'),
+                'strength': signal.get('strength', 'very_weak'),
+                'overall_score': analysis.get('overall_score', 0),
+                'risk_reward_ratio': analysis.get('profit_potential', {}).get('risk_reward_ratio', 0),
+                'entry_price': signal.get('entry_price'),
+                'stop_loss': signal.get('stop_loss'),
+                'take_profit': signal.get('take_profit'),
+                'confidence': pattern.get('confidence_score', 0.5),
+                'valid_until': signal.get('valid_until'),
+                'reasoning': signal.get('reasoning', ''),
+                'timestamp': self._get_timestamp()
+            }
+
+            recommendations.append(recommendation)
+
+        return recommendations
+
+    async def _assess_risks(self,
+                           patterns: List[Dict[str, Any]],
+                           data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Оценка общих рисков"""
+        try:
+            if not patterns:
+                return {'overall_risk': 'low', 'market_risk': 'unknown'}
+
+            # Оценка рыночного риска
+            market_conditions = self._assess_market_conditions(data)
+
+            # Количество сильных сигналов
+            strong_signals = sum(
+                1 for p in patterns
+                if p.get('analysis', {}).get('trading_signal', {}).get('strength') == 'strong'
+            )
+
+            # Среднее качество паттернов
+            avg_quality = np.mean([p.get('quality_score', 0) for p in patterns])
+
+            # Оценка общего риска
+            if market_conditions in ['trending_high_vol', 'ranging_high_vol']:
+                market_risk = 'high'
+            elif market_conditions in ['trending_low_vol', 'ranging_low_vol']:
+                market_risk = 'medium'
+            else:
+                market_risk = 'unknown'
+
+            # Определение общего уровня риска
+            if avg_quality > 0.7 and strong_signals >= 2:
+                overall_risk = 'low'
+            elif avg_quality > 0.5:
+                overall_risk = 'medium'
+            else:
+                overall_risk = 'high'
+
+            return {
+                'overall_risk': overall_risk,
+                'market_risk': market_risk,
+                'market_conditions': market_conditions,
+                'avg_pattern_quality': float(avg_quality),
+                'strong_signals_count': strong_signals,
+                'total_patterns': len(patterns),
+                'recommendation': 'trade' if overall_risk == 'low' else 'caution' if overall_risk == 'medium' else 'avoid'
+            }
+
+        except Exception as e:
+            self.logger.error(f"Ошибка оценки рисков: {e}")
+            return {'overall_risk': 'unknown', 'market_risk': 'unknown'}
+
+    def _calculate_analysis_statistics(self, patterns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Расчет статистики анализа"""
+        if not patterns:
+            return {
+                'total_analyzed': 0,
+                'tradable_patterns': 0,
+                'avg_overall_score': 0.0,
+                'signal_distribution': {}
+            }
+
+        tradable_count = sum(1 for p in patterns if p.get('tradable', False))
+        overall_scores = [p.get('analysis', {}).get('overall_score', 0) for p in patterns]
+
+        # Распределение сигналов
+        signal_distribution = {}
+        for p in patterns:
+            signal = p.get('analysis', {}).get('trading_signal', {}).get('action', 'avoid')
+            signal_distribution[signal] = signal_distribution.get(signal, 0) + 1
+
+        return {
+            'total_analyzed': len(patterns),
+            'tradable_patterns': tradable_count,
+            'tradable_percentage': tradable_count / len(patterns) if patterns else 0,
+            'avg_overall_score': float(np.mean(overall_scores)) if overall_scores else 0.0,
+            'max_overall_score': float(np.max(overall_scores)) if overall_scores else 0.0,
+            'min_overall_score': float(np.min(overall_scores)) if overall_scores else 0.0,
+            'signal_distribution': signal_distribution,
+            'timestamp': self._get_timestamp()
         }
 
-        try:
-            # Находим похожие паттерны
-            similar_patterns = self.find_similar_patterns(
-                pattern, historical_patterns, n_neighbors=20
-            )
+    def _update_analysis_stats(self, patterns_count: int, processing_time: float):
+        """Обновление статистики анализа"""
+        self.analysis_stats['total_analyses'] += 1
+        self.analysis_stats['patterns_analyzed'] += patterns_count
 
-            if not similar_patterns:
-                return prediction
+        # Обновление среднего времени обработки
+        current_avg = self.analysis_stats['avg_processing_time']
+        total_analyses = self.analysis_stats['total_analyses']
 
-            # Рассчитываем вероятность успеха
-            success_rate = self.calculate_success_rate(similar_patterns)
+        new_avg = (current_avg * (total_analyses - 1) + processing_time) / total_analyses
+        self.analysis_stats['avg_processing_time'] = new_avg
 
-            # Рассчитываем среднюю прибыль
-            avg_profit = self.calculate_average_profit(similar_patterns)
+        # Обновление счетчика сигналов
+        self.analysis_stats['trading_signals_generated'] += patterns_count
 
-            # Рассчитываем риск (на основе стоп-лосса похожих паттернов)
-            avg_risk = self._calculate_average_risk(similar_patterns)
-
-            # Рассчитываем средний период удержания
-            avg_holding = self._calculate_average_holding_period(similar_patterns)
-
-            # Уверенность прогноза (на основе схожести и количества)
-            avg_similarity = np.mean([s for _, s in similar_patterns])
-            count = len(similar_patterns)
-
-            confidence = min(avg_similarity * (count / 20), 1.0)  # Нормализуем
-
-            # Заполняем результат
-            prediction['probability_success'] = success_rate
-            prediction['expected_profit'] = avg_profit
-            prediction['expected_risk'] = avg_risk
-            prediction['expected_holding_period'] = avg_holding
-            prediction['confidence'] = confidence
-
-            # Дополнительная информация
-            prediction['similar_patterns_count'] = count
-            prediction['average_similarity'] = avg_similarity
-
-            # Обновляем статистику
-            self.analysis_stats['similar_patterns_found'] += count
-            self.analysis_stats['avg_similarity_score'] = (
-                    (self.analysis_stats['avg_similarity_score'] *
-                     (self.analysis_stats['total_patterns_analyzed'] - 1) +
-                     avg_similarity) / self.analysis_stats['total_patterns_analyzed']
-            )
-
-        except Exception as e:
-            self.logger.error(f"Ошибка прогнозирования исхода: {e}")
-            prediction['error'] = str(e)
-
-        return prediction
-
-    def _calculate_average_risk(self, similar_patterns: List[Tuple[Dict[str, Any], float]]) -> float:
-        """Расчет среднего риска"""
-        risks = []
-        weights = []
-
-        for pattern, similarity in similar_patterns:
-            targets = pattern.get('targets', {})
-            entry = targets.get('entry_price')
-            stop_loss = targets.get('stop_loss')
-
-            if entry and stop_loss:
-                if pattern.get('direction') == 'bullish':
-                    risk = entry - stop_loss
-                else:
-                    risk = stop_loss - entry
-
-                risks.append(risk)
-                weights.append(similarity)
-
-        if not risks:
-            return 0.0
-
-        total_weight = sum(weights)
-        if total_weight > 0:
-            return sum(r * w for r, w in zip(risks, weights)) / total_weight
-        else:
-            return np.mean(risks) if risks else 0.0
-
-    def _calculate_average_holding_period(self, similar_patterns: List[Tuple[Dict[str, Any], float]]) -> float:
-        """Расчет среднего периода удержания"""
-        periods = []
-        weights = []
-
-        for pattern, similarity in similar_patterns:
-            stats = pattern.get('statistics', {})
-            holding_period = stats.get('avg_holding_period', 0)
-
-            if holding_period > 0:
-                periods.append(holding_period)
-                weights.append(similarity)
-
-        if not periods:
-            return 0.0
-
-        total_weight = sum(weights)
-        if total_weight > 0:
-            return sum(p * w for p, w in zip(periods, weights)) / total_weight
-        else:
-            return np.mean(periods) if periods else 0.0
-
-    def build_prediction_model(self, historical_patterns: List[Dict[str, Any]]):
-        """
-        Построение модели для прогнозирования
-
-        Args:
-            historical_patterns: Исторические паттерны для обучения
-        """
-        try:
-            if not historical_patterns:
-                self.logger.warning("Нет данных для построения модели")
-                return
-
-            # Извлекаем признаки и результаты
-            X = []
-            y = []
-
-            for pattern in historical_patterns:
-                # Извлекаем признаки
-                features = self.extract_features(pattern)
-
-                # Извлекаем результат (если есть)
-                if 'outcome' in pattern:
-                    outcome = pattern['outcome']
-                    if outcome in ['success', 'profit', 'win']:
-                        y.append(1)
-                    elif outcome in ['failure', 'loss']:
-                        y.append(0)
-                    else:
-                        continue  # Пропускаем если результат неясен
-                else:
-                    continue  # Пропускаем если нет результата
-
-                X.append(features.feature_array)
-
-            if len(X) < 10:
-                self.logger.warning(f"Недостаточно данных для обучения: {len(X)} образцов")
-                return
-
-            # Строим модель KNN
-            self.nn_model = NearestNeighbors(n_neighbors=min(10, len(X)), metric='euclidean')
-            self.nn_model.fit(np.array(X))
-
-            # Сохраняем данные для предсказаний
-            self.training_patterns = historical_patterns
-            self.training_features = X
-            self.training_outcomes = y
-
-            self.logger.info(f"Модель построена на {len(X)} образцах")
-
-        except Exception as e:
-            self.logger.error(f"Ошибка построения модели: {e}")
-
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_analysis_statistics(self) -> Dict[str, Any]:
         """Получение статистики анализа"""
         return self.analysis_stats.copy()
 
-    def reset_statistics(self):
-        """Сброс статистики"""
-        self.analysis_stats = {
-            'total_patterns_analyzed': 0,
-            'similar_patterns_found': 0,
-            'avg_similarity_score': 0.0,
-            'prediction_accuracy': 0.0
+    def _get_timestamp(self) -> str:
+        """Получение текущей временной метки"""
+        return datetime.now().isoformat()
+
+    def _calculate_signal_expiry(self, pattern: Dict[str, Any]) -> str:
+        """Расчет срока действия сигнала"""
+        expiry_hours = {
+            'strong': 24,
+            'moderate': 12,
+            'weak': 6,
+            'very_weak': 0
         }
+
+        signal_strength = pattern.get('analysis', {}).get('trading_signal', {}).get('strength', 'very_weak')
+        hours = expiry_hours.get(signal_strength, 0)
+
+        if hours > 0:
+            expiry = datetime.now() + timedelta(hours=hours)
+            return expiry.isoformat()
+        else:
+            return datetime.now().isoformat()
 

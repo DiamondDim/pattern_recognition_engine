@@ -3,384 +3,404 @@
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
-from enum import Enum
 import numpy as np
-from pydantic import BaseModel, Field
-from uuid import uuid4
+from dataclasses import dataclass, field
 
-class PatternType(str, Enum):
-    """Типы паттернов"""
-    GEOMETRIC = "geometric"
-    CANDLESTICK = "candlestick"
-    HARMONIC = "harmonic"
-    CUSTOM = "custom"
-
-class PatternDirection(str, Enum):
-    """Направление паттерна"""
-    BULLISH = "bullish"
-    BEARISH = "bearish"
-    NEUTRAL = "neutral"
-
-class MarketContext(str, Enum):
-    """Контекст рынка"""
-    UPTREND = "uptrend"
-    DOWNTREND = "downtrend"
-    SIDEWAYS = "sideways"
-    VOLATILE = "volatile"
-
-class PatternPoint(BaseModel):
+@dataclass
+class PatternPoint:
     """Точка паттерна"""
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    index: int
-    timestamp: datetime
-    price: float
-    point_type: str  # high, low, neckline, shoulder, head, etc.
-    significance: float = 1.0  # Важность точки (0-1)
+    index: int  # Индекс свечи
+    price: float  # Цена точки
+    time: Optional[str] = None  # Временная метка
+    type: Optional[str] = None  # Тип точки (high, low, pivot и т.д.)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    class Config:
-        arbitrary_types_allowed = True
-
-class PatternMetadata(BaseModel):
-    """Метаданные паттерна"""
-    pattern_id: str = Field(default_factory=lambda: str(uuid4()))
-    symbol: str
-    timeframe: str
-    detected_time: datetime = Field(default_factory=datetime.now)
-    market_context: MarketContext = MarketContext.SIDEWAYS
-
-    # Оценки
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
-    reliability_score: float = Field(default=0.0, ge=0.0, le=1.0)
-
-    # Подтверждения
-    volume_confirmation: bool = False
-    trend_confirmation: bool = False
-    indicator_confirmation: bool = False
-    multi_timeframe_confirmation: bool = False
-
-    # Индикаторы в момент обнаружения
-    rsi_value: Optional[float] = None
-    macd_value: Optional[float] = None
-    adx_value: Optional[float] = None
-    atr_value: Optional[float] = None
-
-    # Волатильность
-    volatility_pct: float = 0.0
-    average_volume: float = 0.0
-
-    class Config:
-        arbitrary_types_allowed = True
-
-class PatternTargets(BaseModel):
-    """Целевые уровни паттерна"""
-    entry_price: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    profit_risk_ratio: Optional[float] = None
-
-    # Дополнительные уровни
-    breakout_level: Optional[float] = None  # Уровень пробоя
-    target1: Optional[float] = None  # Первая цель
-    target2: Optional[float] = None  # Вторая цель
-    target3: Optional[float] = None  # Третья цель
-
-    # Расстояния
-    pattern_height: Optional[float] = None
-    risk_amount: Optional[float] = None
-    reward_amount: Optional[float] = None
-
-    class Config:
-        arbitrary_types_allowed = True
-
-class PatternStatistics(BaseModel):
-    """Статистика паттерна"""
-    historical_matches: int = 0
-    historical_success_rate: float = 0.0
-    avg_holding_period: float = 0.0  # Средний период удержания
-    max_consecutive_wins: int = 0
-    max_consecutive_losses: int = 0
-    sharpe_ratio: Optional[float] = None
-    win_loss_ratio: Optional[float] = None
-    avg_profit: float = 0.0
-    avg_loss: float = 0.0
-    profit_factor: Optional[float] = None
-
-    # Распределение результатов
-    outcomes_distribution: Dict[str, float] = Field(default_factory=dict)
-
-    class Config:
-        arbitrary_types_allowed = True
+@dataclass
+class PatternResult:
+    """Результат обнаружения паттерна"""
+    name: str
+    direction: str  # bullish, bearish, neutral
+    points: List[PatternPoint]
+    quality: float  # 0.0 - 1.0
+    confidence: float  # 0.0 - 1.0
+    targets: Dict[str, float] = field(default_factory=dict)  # Целевые уровни
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class BasePattern(ABC):
-    """Абстрактный базовый класс для паттернов"""
+    """Абстрактный базовый класс для всех паттернов"""
 
-    def __init__(self,
-                 pattern_type: PatternType,
-                 name: str,
-                 abbreviation: str = ""):
-
-        self.pattern_type = pattern_type
+    def __init__(self, name: str, min_points: int = 3):
         self.name = name
-        self.abbreviation = abbreviation or name[:3].upper()
-        self.direction = PatternDirection.NEUTRAL
-
-        # Структура паттерна
-        self.points: List[PatternPoint] = []
-        self.metadata = PatternMetadata(symbol="", timeframe="")
-        self.targets = PatternTargets()
-        self.statistics = PatternStatistics()
-
-        # Временные данные
-        self._data: Optional[np.ndarray] = None
-        self._highs: Optional[np.ndarray] = None
-        self._lows: Optional[np.ndarray] = None
-        self._closes: Optional[np.ndarray] = None
-        self._volumes: Optional[np.ndarray] = None
-
-        # Флаги состояния
-        self._is_detected = False
-        self._is_confirmed = False
-        self._is_completed = False
-
-        # Характеристики паттерна
-        self.complexity_level = 1  # Сложность (1-3)
-        self.frequency_score = 0.0  # Частота появления
-        self.success_rate = 0.0  # Историческая успешность
+        self.min_points = min_points
+        self.pattern_type = self.__class__.__module__.split('.')[-1]
 
     @abstractmethod
-    def detect(self,
-               data: np.ndarray,
-               highs: np.ndarray,
-               lows: np.ndarray,
-               closes: np.ndarray,
-               volumes: np.ndarray,
-               timestamps: np.ndarray,
-               **kwargs) -> bool:
+    def detect(self, data: Dict[str, np.ndarray]) -> List[PatternResult]:
         """
         Детектирование паттерна
 
+        Args:
+            data: Входные данные OHLC
+
         Returns:
-            bool: True если паттерн обнаружен
+            Список обнаруженных паттернов
         """
         pass
 
-    @abstractmethod
-    def calculate_quality(self) -> float:
-        """
-        Расчет качества паттерна (0-1)
+    def validate_points(self, points: List[PatternPoint]) -> bool:
+        """Валидация точек паттерна"""
+        if len(points) < self.min_points:
+            return False
 
-        Returns:
-            float: Оценка качества
-        """
-        pass
+        # Проверка уникальности индексов
+        indices = [p.index for p in points]
+        if len(set(indices)) != len(indices):
+            return False
 
-    def calculate_targets(self, current_price: float) -> PatternTargets:
+        # Проверка порядка индексов
+        if sorted(indices) != indices:
+            return False
+
+        return True
+
+    def calculate_quality(self, points: List[PatternPoint],
+                         ideal_pattern: List[Tuple[float, float]]) -> float:
         """
-        Расчет целевых уровней
+        Расчет качества паттерна на основе отклонения от идеальной формы
 
         Args:
-            current_price: Текущая цена
+            points: Фактические точки паттерна
+            ideal_pattern: Идеальные относительные координаты [(x_rel, y_rel), ...]
 
         Returns:
-            PatternTargets: Объект с целевыми уровнями
+            Оценка качества 0.0-1.0
         """
-        if not self.points or len(self.points) < 2:
-            return self.targets
+        if len(points) != len(ideal_pattern):
+            return 0.0
 
-        try:
-            # Базовая реализация расчета целей
-            prices = [p.price for p in self.points]
-            pattern_high = max(prices)
-            pattern_low = min(prices)
-            pattern_height = pattern_high - pattern_low
+        # Нормализация координат
+        indices = [p.index for p in points]
+        prices = [p.price for p in points]
 
-            self.targets.pattern_height = pattern_height
+        min_idx = min(indices)
+        max_idx = max(indices)
+        min_price = min(prices)
+        max_price = max(prices)
 
-            if self.direction == PatternDirection.BULLISH:
-                self._calculate_bullish_targets(current_price, pattern_height)
-            elif self.direction == PatternDirection.BEARISH:
-                self._calculate_bearish_targets(current_price, pattern_height)
+        if max_idx == min_idx or max_price == min_price:
+            return 0.5
 
-            # Расчет риска и прибыли
-            if (self.targets.entry_price and self.targets.stop_loss and
-                self.targets.take_profit):
+        # Преобразование в относительные координаты
+        actual_points = []
+        for i, point in enumerate(points):
+            x_rel = (point.index - min_idx) / (max_idx - min_idx)
+            y_rel = (point.price - min_price) / (max_price - min_price)
+            actual_points.append((x_rel, y_rel))
 
-                risk = abs(self.targets.entry_price - self.targets.stop_loss)
-                reward = abs(self.targets.take_profit - self.targets.entry_price)
+        # Расчет среднеквадратичной ошибки
+        mse = 0.0
+        for actual, ideal in zip(actual_points, ideal_pattern):
+            dx = actual[0] - ideal[0]
+            dy = actual[1] - ideal[1]
+            mse += dx*dx + dy*dy
 
-                self.targets.risk_amount = risk
-                self.targets.reward_amount = reward
-                self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
+        mse /= len(actual_points)
 
-            return self.targets
+        # Преобразование MSE в качество (чем меньше ошибка, тем выше качество)
+        quality = 1.0 / (1.0 + 10.0 * mse)
+        return min(max(quality, 0.0), 1.0)
 
-        except Exception as e:
-            print(f"Ошибка расчета целей: {e}")
-            return self.targets
-
-    def _calculate_bullish_targets(self, current_price: float, pattern_height: float):
-        """Расчет целей для бычьего паттерна"""
-        # Базовая логика - переопределить в дочерних классах
-        self.targets.entry_price = current_price
-        self.targets.stop_loss = current_price - pattern_height * 0.5
-        self.targets.take_profit = current_price + pattern_height
-
-        # Дополнительные цели
-        self.targets.target1 = current_price + pattern_height * 0.5
-        self.targets.target2 = current_price + pattern_height
-        self.targets.target3 = current_price + pattern_height * 1.5
-
-    def _calculate_bearish_targets(self, current_price: float, pattern_height: float):
-        """Расчет целей для медвежьего паттерна"""
-        # Базовая логика - переопределить в дочерних классах
-        self.targets.entry_price = current_price
-        self.targets.stop_loss = current_price + pattern_height * 0.5
-        self.targets.take_profit = current_price - pattern_height
-
-        # Дополнительные цели
-        self.targets.target1 = current_price - pattern_height * 0.5
-        self.targets.target2 = current_price - pattern_height
-        self.targets.target3 = current_price - pattern_height * 1.5
-
-    def analyze_strength(self) -> Dict[str, float]:
+    def calculate_confidence(self, points: List[PatternPoint],
+                           data: Dict[str, np.ndarray]) -> float:
         """
-        Анализ силы паттерна
+        Расчет уверенности в паттерне
+
+        Args:
+            points: Точки паттерна
+            data: Входные данные
 
         Returns:
-            Dict с оценками силы по различным параметрам
+            Оценка уверенности 0.0-1.0
         """
-        strength_scores = {
-            'geometric_quality': self.calculate_quality(),
-            'volume_confirmation': 1.0 if self.metadata.volume_confirmation else 0.0,
-            'trend_alignment': self._calculate_trend_alignment(),
-            'indicator_support': self._calculate_indicator_support(),
-            'timeframe_confirmation': self._calculate_timeframe_confirmation(),
-            'risk_reward_ratio': min(self.targets.profit_risk_ratio or 0, 3.0) / 3.0
-        }
+        if not points:
+            return 0.0
 
-        # Итоговый балл
-        weights = {
-            'geometric_quality': 0.3,
-            'volume_confirmation': 0.15,
-            'trend_alignment': 0.2,
-            'indicator_support': 0.15,
-            'timeframe_confirmation': 0.1,
-            'risk_reward_ratio': 0.1
-        }
+        # 1. Проверка свечей вокруг паттерна
+        candle_score = self._evaluate_candles_around_pattern(points, data)
 
-        total_score = sum(score * weights.get(param, 0)
-                         for param, score in strength_scores.items())
+        # 2. Проверка объема
+        volume_score = self._evaluate_volume(points, data)
 
-        strength_scores['total_score'] = total_score
-        self.metadata.reliability_score = total_score
+        # 3. Проверка тренда
+        trend_score = self._evaluate_trend(points, data)
 
-        return strength_scores
+        # Итоговая уверенность
+        confidence = (candle_score + volume_score + trend_score) / 3.0
+        return min(max(confidence, 0.0), 1.0)
 
-    def _calculate_trend_alignment(self) -> float:
-        """Расчет соответствия тренду"""
-        # Базовая реализация
-        if self.metadata.market_context == MarketContext.UPTREND:
-            return 1.0 if self.direction == PatternDirection.BULLISH else 0.3
-        elif self.metadata.market_context == MarketContext.DOWNTREND:
-            return 1.0 if self.direction == PatternDirection.BEARISH else 0.3
+    def _evaluate_candles_around_pattern(self, points: List[PatternPoint],
+                                       data: Dict[str, np.ndarray]) -> float:
+        """Оценка свечей вокруг паттерна"""
+        if len(points) < 2:
+            return 0.5
+
+        closes = data.get('close', [])
+        if len(closes) == 0:
+            return 0.5
+
+        start_idx = points[0].index
+        end_idx = points[-1].index
+
+        # Анализируем свечи внутри паттерна
+        pattern_candles = closes[start_idx:end_idx+1]
+
+        if len(pattern_candles) < 2:
+            return 0.5
+
+        # Проверяем, есть ли длинные тени (признак борьбы)
+        if 'high' in data and 'low' in data:
+            highs = data['high'][start_idx:end_idx+1]
+            lows = data['low'][start_idx:end_idx+1]
+
+            avg_wick_size = np.mean((highs - closes[start_idx:end_idx+1]) +
+                                   (closes[start_idx:end_idx+1] - lows))
+            if avg_wick_size > 0:
+                # Большие тени - снижаем уверенность
+                wick_ratio = avg_wick_size / (np.max(highs) - np.min(lows))
+                return max(0.0, 1.0 - wick_ratio * 2)
+
+        return 0.7
+
+    def _evaluate_volume(self, points: List[PatternPoint],
+                        data: Dict[str, np.ndarray]) -> float:
+        """Оценка объема"""
+        if 'volume' not in data:
+            return 0.5
+
+        volumes = data['volume']
+        if len(volumes) == 0:
+            return 0.5
+
+        start_idx = points[0].index
+        end_idx = points[-1].index
+
+        pattern_volumes = volumes[start_idx:end_idx+1]
+
+        if len(pattern_volumes) == 0:
+            return 0.5
+
+        # Проверяем, выше ли объем на паттерне, чем средний
+        if start_idx > 20:
+            avg_volume_before = np.mean(volumes[start_idx-20:start_idx])
         else:
-            return 0.7  # Боковик
+            avg_volume_before = np.mean(volumes[:start_idx]) if start_idx > 0 else 0
 
-    def _calculate_indicator_support(self) -> float:
-        """Расчет поддержки индикаторов"""
-        score = 0.0
-
-        # RSI
-        if self.metadata.rsi_value is not None:
-            if self.direction == PatternDirection.BULLISH:
-                score += 0.5 if self.metadata.rsi_value < 40 else 0.2
+        if avg_volume_before > 0:
+            volume_ratio = np.mean(pattern_volumes) / avg_volume_before
+            # Высокий объем на паттерне - хороший знак
+            if volume_ratio > 1.5:
+                return 0.9
+            elif volume_ratio > 1.0:
+                return 0.7
             else:
-                score += 0.5 if self.metadata.rsi_value > 60 else 0.2
+                return 0.4
 
-        # MACD
-        if self.metadata.macd_value is not None:
-            if self.direction == PatternDirection.BULLISH:
-                score += 0.5 if self.metadata.macd_value > 0 else 0.2
-            else:
-                score += 0.5 if self.metadata.macd_value < 0 else 0.2
+        return 0.5
 
-        return min(score, 1.0)
+    def _evaluate_trend(self, points: List[PatternPoint],
+                       data: Dict[str, np.ndarray]) -> float:
+        """Оценка тренда"""
+        if 'close' not in data:
+            return 0.5
 
-    def _calculate_timeframe_confirmation(self) -> float:
-        """Расчет подтверждения на других таймфреймах"""
-        return 1.0 if self.metadata.multi_timeframe_confirmation else 0.5
+        closes = data['close']
+        if len(closes) < 10:
+            return 0.5
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Конвертация паттерна в словарь"""
-        return {
-            'id': self.metadata.pattern_id,
-            'name': self.name,
-            'type': self.pattern_type.value,
-            'direction': self.direction.value,
-            'abbreviation': self.abbreviation,
-            'points': [point.dict() for point in self.points],
-            'metadata': self.metadata.dict(),
-            'targets': self.targets.dict(),
-            'statistics': self.statistics.dict(),
-            'strength_analysis': self.analyze_strength(),
-            'is_detected': self._is_detected,
-            'is_confirmed': self._is_confirmed,
-            'is_completed': self._is_completed,
-            'complexity_level': self.complexity_level,
-            'frequency_score': self.frequency_score,
-            'success_rate': self.success_rate
-        }
+        start_idx = points[0].index
 
-    def to_json(self) -> str:
-        """Конвертация паттерна в JSON"""
-        import json
-        return json.dumps(self.to_dict(), indent=2, default=str)
+        # Анализируем тренд до паттерна
+        lookback = min(20, start_idx)
+        if lookback > 5:
+            prices_before = closes[start_idx-lookback:start_idx]
+            if len(prices_before) > 1:
+                # Линейная регрессия
+                x = np.arange(len(prices_before))
+                slope, _ = np.polyfit(x, prices_before, 1)
 
-    def validate_pattern(self) -> Tuple[bool, List[str]]:
+                # Для разворотных паттернов хотим видеть сильный предыдущий тренд
+                # Для продолжения - слабый тренд или консолидацию
+                trend_strength = abs(slope)
+
+                if self.name.lower() in ['head_shoulders', 'double_top', 'double_bottom']:
+                    # Разворотные паттерны
+                    return min(1.0, trend_strength * 100)
+                else:
+                    # Паттерны продолжения
+                    return max(0.0, 1.0 - trend_strength * 100)
+
+        return 0.5
+
+    def calculate_targets(self, points: List[PatternPoint],
+                         pattern_type: str) -> Dict[str, float]:
         """
-        Валидация паттерна
+        Расчет целевых уровней для паттерна
+
+        Args:
+            points: Точки паттерна
+            pattern_type: Тип паттерна
 
         Returns:
-            Tuple[bool, List[str]]: (валиден, список ошибок)
+            Словарь с целевыми уровнями
         """
-        errors = []
+        if len(points) < 2:
+            return {}
 
-        # Проверка минимального количества точек
-        min_points = self._get_min_points_required()
-        if len(self.points) < min_points:
-            errors.append(f"Недостаточно точек: {len(self.points)} < {min_points}")
+        prices = [p.price for p in points]
+        indices = [p.index for p in points]
 
-        # Проверка качества
-        quality = self.calculate_quality()
-        if quality < 0.6:
-            errors.append(f"Низкое качество: {quality:.2f}")
+        # Базовая реализация - высота паттерна
+        pattern_height = max(prices) - min(prices)
 
-        # Проверка целевых уровней
-        if not self.targets.entry_price:
-            errors.append("Не рассчитана цена входа")
+        # Точка входа (последняя точка паттерна)
+        entry_price = points[-1].price
 
-        if not self.targets.stop_loss:
-            errors.append("Не рассчитан стоп-лосс")
+        # Определение направления
+        direction = self._determine_direction(points)
 
-        if not self.targets.take_profit:
-            errors.append("Не рассчитан тейк-профит")
+        targets = {
+            'entry_price': entry_price,
+            'pattern_height': pattern_height
+        }
 
-        return len(errors) == 0, errors
+        # Добавление конкретных целей в зависимости от типа паттерна
+        if pattern_type == 'head_shoulders':
+            neckline = self._calculate_neckline(points)
+            if neckline is not None:
+                targets['neckline'] = neckline
+                if direction == 'bearish':
+                    targets['stop_loss'] = max(prices) * 1.01
+                    targets['take_profit'] = entry_price - pattern_height
+                else:
+                    targets['stop_loss'] = min(prices) * 0.99
+                    targets['take_profit'] = entry_price + pattern_height
 
-    def _get_min_points_required(self) -> int:
-        """Минимальное необходимое количество точек для паттерна"""
-        return 2
+        elif pattern_type == 'double_top':
+            resistance = max(prices)
+            targets['resistance'] = resistance
+            if direction == 'bearish':
+                targets['stop_loss'] = resistance * 1.01
+                targets['take_profit'] = entry_price - pattern_height
 
-    def __str__(self) -> str:
-        return (f"{self.name} ({self.direction.value}) | "
-                f"Качество: {self.calculate_quality():.2f} | "
-                f"Надежность: {self.metadata.reliability_score:.2f} | "
-                f"Риск/Прибыль: {self.targets.profit_risk_ratio or 0:.2f}")
+        elif pattern_type == 'double_bottom':
+            support = min(prices)
+            targets['support'] = support
+            if direction == 'bullish':
+                targets['stop_loss'] = support * 0.99
+                targets['take_profit'] = entry_price + pattern_height
 
-    def __repr__(self) -> str:
-        return f"<{self.__class__.__name__}: {self.name}>"
+        elif pattern_type in ['triangle', 'wedge', 'flag']:
+            # Для паттернов продолжения
+            if direction == 'bullish':
+                targets['stop_loss'] = min(prices) * 0.99
+                targets['take_profit'] = entry_price + pattern_height
+            else:
+                targets['stop_loss'] = max(prices) * 1.01
+                targets['take_profit'] = entry_price - pattern_height
+
+        return targets
+
+    def _determine_direction(self, points: List[PatternPoint]) -> str:
+        """Определение направления паттерна"""
+        if len(points) < 2:
+            return 'neutral'
+
+        prices = [p.price for p in points]
+
+        # Простой алгоритм определения направления
+        first_half = prices[:len(prices)//2]
+        second_half = prices[len(prices)//2:]
+
+        avg_first = np.mean(first_half)
+        avg_second = np.mean(second_half)
+
+        if avg_second > avg_first * 1.01:
+            return 'bullish'
+        elif avg_second < avg_first * 0.99:
+            return 'bearish'
+        else:
+            return 'neutral'
+
+    def _calculate_neckline(self, points: List[PatternPoint]) -> Optional[float]:
+        """Расчет линии шеи для паттерна Голова и Плечи"""
+        if len(points) < 4:
+            return None
+
+        # Ищем две точки для линии шеи (обычно точки 1 и 3 в 5-точечном паттерне)
+        if len(points) >= 5:
+            # Для Head and Shoulders: точки 1 и 4 (0-indexed: 0 и 3)
+            neckline_points = [points[0], points[3]]
+        elif len(points) >= 4:
+            # Для Inverse Head and Shoulders: точки 1 и 3 (0-indexed: 0 и 2)
+            neckline_points = [points[0], points[2]]
+        else:
+            return None
+
+        # Линейная интерполяция
+        x1, y1 = neckline_points[0].index, neckline_points[0].price
+        x2, y2 = neckline_points[1].index, neckline_points[1].price
+
+        if x2 == x1:
+            return None
+
+        # Уравнение линии: y = slope * x + intercept
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+
+        # Возвращаем цену на последнем баре паттерна
+        last_idx = points[-1].index
+        return slope * last_idx + intercept
+
+    def create_result(self,
+                     name: str,
+                     points: List[PatternPoint],
+                     quality: float,
+                     confidence: float,
+                     targets: Optional[Dict[str, float]] = None) -> PatternResult:
+        """
+        Создание результата паттерна
+
+        Args:
+            name: Название паттерна
+            points: Точки паттерна
+            quality: Качество паттерна
+            confidence: Уверенность
+            targets: Целевые уровни
+
+        Returns:
+            PatternResult
+        """
+        if targets is None:
+            targets = {}
+
+        direction = self._determine_direction(points)
+
+        # Автогенерация стоп-лосса и тейк-профита если не заданы
+        if 'stop_loss' not in targets or 'take_profit' not in targets:
+            auto_targets = self.calculate_targets(points, name)
+            targets.update(auto_targets)
+
+        return PatternResult(
+            name=name,
+            direction=direction,
+            points=points,
+            quality=quality,
+            confidence=confidence,
+            targets=targets,
+            metadata={
+                'pattern_type': self.pattern_type,
+                'detector': self.__class__.__name__
+            }
+        )
 

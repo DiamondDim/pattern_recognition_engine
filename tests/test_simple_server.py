@@ -1,118 +1,299 @@
-# test_simple_server.py
-import socket
+"""
+Тесты для простого сервера
+"""
+
+import unittest
+import asyncio
 import json
-import threading
-from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+from pathlib import Path
+import sys
+
+# Добавляем путь к корневой директории проекта
+sys.path.insert(0, str(Path(__file__).parent.parent.absolute()))
+
+from server.ws_server import WebSocketServer, ClientInfo
 
 
-class SimpleTestServer:
-    def __init__(self, host='127.0.0.1', port=5555):
-        self.host = host
-        self.port = port
-        self.server = None
-        self.running = False
+class TestWebSocketServer(unittest.TestCase):
+    """Тесты для WebSocket сервера"""
 
-    def start(self):
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((self.host, self.port))
-        self.server.listen(5)
-        self.running = True
+    def setUp(self):
+        """Подготовка тестов"""
+        self.server = WebSocketServer(host="127.0.0.1", port=8765)
 
-        print(f"Тестовый сервер запущен на {self.host}:{self.port}")
-        print("Ожидание подключений от MT5...")
+        # Мокаем зависимости
+        self.server.detector = MagicMock()
+        self.server.analyzer = MagicMock()
 
-        try:
-            while self.running:
-                client, address = self.server.accept()
-                print(f"\nНовое подключение от {address}")
+        # Создаем mock клиента
+        self.mock_websocket = AsyncMock()
+        self.mock_websocket.closed = False
+        self.mock_websocket.send = AsyncMock()
+        self.mock_websocket.close = AsyncMock()
 
-                # Запускаем обработку в отдельном потоке
-                thread = threading.Thread(target=self.handle_client, args=(client, address))
-                thread.daemon = True
-                thread.start()
+    def test_client_info_creation(self):
+        """Тест создания информации о клиенте"""
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id="test_client",
+            subscribed_symbols=set(["EURUSD", "GBPUSD"]),
+            connected_at=None,
+            last_activity=None
+        )
 
-        except KeyboardInterrupt:
-            print("\nСервер остановлен")
-        finally:
-            self.stop()
+        self.assertEqual(client_info.client_id, "test_client")
+        self.assertEqual(len(client_info.subscribed_symbols), 2)
+        self.assertIn("EURUSD", client_info.subscribed_symbols)
 
-    def handle_client(self, client, address):
-        try:
-            # Получаем данные
-            data = b""
-            client.settimeout(5.0)
+    def test_add_client(self):
+        """Тест добавления клиента"""
+        client_id = "test_client_1"
 
-            while True:
-                chunk = client.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id=client_id,
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None
+        )
 
-                # Проверяем конец JSON (ищем закрывающую скобку)
-                if b'}' in data:
-                    break
+        self.server.clients[client_id] = client_info
 
-            if data:
-                try:
-                    # Декодируем UTF-8
-                    json_str = data.decode('utf-8', errors='ignore')
-                    print(f"Получено {len(json_str)} символов")
+        self.assertIn(client_id, self.server.clients)
+        self.assertEqual(self.server.clients[client_id].client_id, client_id)
 
-                    # Пытаемся распарсить JSON
-                    try:
-                        parsed = json.loads(json_str)
-                        print("✅ JSON успешно распарсен")
-                        print(f"   Символ: {parsed.get('symbol')}")
-                        print(f"   Таймфрейм: {parsed.get('timeframe')}")
-                        print(f"   Баров: {parsed.get('count')}")
+    def test_remove_client(self):
+        """Тест удаления клиента"""
+        client_id = "test_client_2"
 
-                        if 'data' in parsed and len(parsed['data']) > 0:
-                            print(f"   Первый бар: {parsed['data'][0]}")
-                            print(f"   Последний бар: {parsed['data'][-1]}")
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id=client_id,
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None
+        )
 
-                    except json.JSONDecodeError as e:
-                        print(f"❌ Ошибка парсинга JSON: {e}")
-                        print(f"Первые 500 символов данных:")
-                        print(json_str[:500])
+        self.server.clients[client_id] = client_info
+        self.assertIn(client_id, self.server.clients)
 
-                    # Отправляем ответ
-                    response = {
-                        "status": "success",
-                        "message": "Данные успешно получены",
-                        "patterns_count": 3,
-                        "patterns": [
-                            {"type": "head_shoulders", "direction": "bearish", "quality": 0.85},
-                            {"type": "double_top", "direction": "bearish", "quality": 0.72},
-                            {"type": "abcd", "direction": "bullish", "quality": 0.68}
-                        ],
-                        "timestamp": datetime.now().isoformat(),
-                        "received_bytes": len(data),
-                        "symbol": parsed.get('symbol', 'unknown')
-                    }
+        del self.server.clients[client_id]
+        self.assertNotIn(client_id, self.server.clients)
 
-                    response_json = json.dumps(response, indent=2)
-                    client.send(response_json.encode('utf-8'))
-                    print(f"Отправлен ответ: {len(response_json)} символов")
+    async def test_process_subscribe_message(self):
+        """Тест обработки сообщения подписки"""
+        client_id = "test_client_3"
 
-                except Exception as e:
-                    print(f"Ошибка обработки данных: {e}")
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id=client_id,
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None
+        )
 
-        except socket.timeout:
-            print("Таймаут ожидания данных")
-        except Exception as e:
-            print(f"Ошибка обработки клиента: {e}")
-        finally:
-            client.close()
-            print(f"Соединение с {address} закрыто")
+        self.server.clients[client_id] = client_info
 
-    def stop(self):
-        self.running = False
-        if self.server:
-            self.server.close()
+        # Создаем сообщение подписки
+        message = json.dumps({
+            'type': 'subscribe',
+            'symbols': ['EURUSD', 'GBPUSD']
+        })
+
+        # Мокаем отправку сообщения
+        self.mock_websocket.send = AsyncMock()
+
+        # Обрабатываем сообщение
+        await self.server._process_client_message(client_id, message)
+
+        # Проверяем что символы добавлены
+        self.assertEqual(len(client_info.subscribed_symbols), 2)
+        self.assertIn('EURUSD', client_info.subscribed_symbols)
+        self.assertIn('GBPUSD', client_info.subscribed_symbols)
+
+        # Проверяем что отправлено подтверждение
+        self.mock_websocket.send.assert_called()
+
+    async def test_process_unsubscribe_message(self):
+        """Тест обработки сообщения отписки"""
+        client_id = "test_client_4"
+
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id=client_id,
+            subscribed_symbols=set(['EURUSD', 'GBPUSD', 'USDJPY']),
+            connected_at=None,
+            last_activity=None
+        )
+
+        self.server.clients[client_id] = client_info
+
+        # Создаем сообщение отписки
+        message = json.dumps({
+            'type': 'unsubscribe',
+            'symbols': ['EURUSD', 'GBPUSD']
+        })
+
+        # Мокаем отправку сообщения
+        self.mock_websocket.send = AsyncMock()
+
+        # Обрабатываем сообщение
+        await self.server._process_client_message(client_id, message)
+
+        # Проверяем что символы удалены
+        self.assertEqual(len(client_info.subscribed_symbols), 1)
+        self.assertNotIn('EURUSD', client_info.subscribed_symbols)
+        self.assertNotIn('GBPUSD', client_info.subscribed_symbols)
+        self.assertIn('USDJPY', client_info.subscribed_symbols)
+
+        # Проверяем что отправлено подтверждение
+        self.mock_websocket.send.assert_called()
+
+    async def test_process_ping_message(self):
+        """Тест обработки ping сообщения"""
+        client_id = "test_client_5"
+
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id=client_id,
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None
+        )
+
+        self.server.clients[client_id] = client_info
+
+        # Создаем ping сообщение
+        message = json.dumps({
+            'type': 'ping'
+        })
+
+        # Мокаем отправку сообщения
+        self.mock_websocket.send = AsyncMock()
+
+        # Обрабатываем сообщение
+        await self.server._process_client_message(client_id, message)
+
+        # Проверяем что отправлен pong
+        self.mock_websocket.send.assert_called_once()
+
+        # Проверяем что отправлен правильный ответ
+        call_args = self.mock_websocket.send.call_args[0][0]
+        response = json.loads(call_args)
+        self.assertEqual(response['type'], 'pong')
+
+    def test_get_stats(self):
+        """Тест получения статистики"""
+        stats = self.server.get_stats()
+
+        self.assertIn('connections_total', stats)
+        self.assertIn('messages_sent', stats)
+        self.assertIn('messages_received', stats)
+        self.assertIn('errors', stats)
+        self.assertIn('connected_clients', stats)
+        self.assertIn('timestamp', stats)
+
+        # Проверяем начальные значения
+        self.assertEqual(stats['connections_total'], 0)
+        self.assertEqual(stats['connected_clients'], 0)
+
+    async def test_send_to_client(self):
+        """Тест отправки сообщения клиенту"""
+        client_id = "test_client_6"
+
+        client_info = ClientInfo(
+            websocket=self.mock_websocket,
+            client_id=client_id,
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None
+        )
+
+        self.server.clients[client_id] = client_info
+
+        # Тестовое сообщение
+        test_message = {'type': 'test', 'data': 'test_data'}
+
+        # Мокаем отправку
+        self.mock_websocket.send = AsyncMock()
+
+        # Отправляем сообщение
+        await self.server._send_to_client(client_id, test_message)
+
+        # Проверяем что сообщение отправлено
+        self.mock_websocket.send.assert_called_once_with(json.dumps(test_message))
+
+        # Увеличился счетчик сообщений
+        self.assertEqual(self.server.stats['messages_sent'], 1)
+
+    async def test_send_to_nonexistent_client(self):
+        """Тест отправки сообщения несуществующему клиенту"""
+        # Пытаемся отправить сообщение несуществующему клиенту
+        await self.server._send_to_client('nonexistent', {'type': 'test'})
+
+        # Не должно быть ошибок
+        # Счетчик сообщений не должен увеличиться
+        self.assertEqual(self.server.stats['messages_sent'], 0)
 
 
-if __name__ == "__main__":
-    server = SimpleTestServer()
-    server.start()
+class TestServerCleanup(unittest.TestCase):
+    """Тесты очистки сервера"""
+
+    def setUp(self):
+        """Подготовка тестов"""
+        self.server = WebSocketServer()
+
+    async def test_cleanup_inactive_clients(self):
+        """Тест очистки неактивных клиентов"""
+        # Создаем mock клиентов
+        active_client = AsyncMock()
+        active_client.closed = False
+        active_client.close = AsyncMock()
+
+        inactive_client = AsyncMock()
+        inactive_client.closed = False
+        inactive_client.close = AsyncMock()
+
+        # Добавляем клиентов
+        self.server.clients['active'] = ClientInfo(
+            websocket=active_client,
+            client_id='active',
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None  # Будет обновлено
+        )
+
+        self.server.clients['inactive'] = ClientInfo(
+            websocket=inactive_client,
+            client_id='inactive',
+            subscribed_symbols=set(),
+            connected_at=None,
+            last_activity=None  # Остается None (очень старое)
+        )
+
+        # Обновляем время активности активного клиента
+        import datetime
+        self.server.clients['active'].last_activity = datetime.datetime.now()
+
+        # Запускаем очистку
+        await self.server._cleanup_inactive_clients()
+
+        # Проверяем что неактивный клиент был закрыт
+        inactive_client.close.assert_called_once()
+
+        # Проверяем что активный клиент не был закрыт
+        active_client.close.assert_not_called()
+
+
+if __name__ == '__main__':
+    # Запуск асинхронных тестов
+    import asyncio
+
+    # Создаем event loop для асинхронных тестов
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Запускаем тесты
+    unittest.main()
 

@@ -1,480 +1,340 @@
 """
-Основной файл Pattern Recognition Engine
+Основной модуль Pattern Recognition Engine
 """
 
-import asyncio
 import sys
-import signal
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-import json
+import asyncio
 from pathlib import Path
 
-from config import CONFIG, MT5_CONFIG, DATA_DIR, OUTPUT_DIR
+# Добавляем корневую директорию в путь Python
+sys.path.insert(0, str(Path(__file__).parent.absolute()))
+
+from config import config
+from utils.logger import setup_logger, logger
 from core.pattern_detector import PatternDetector
 from core.pattern_analyzer import PatternAnalyzer
 from core.pattern_database import PatternDatabase
-from utils.logger import logger, pattern_logger
-from utils.mt5_connector import FileConnector, MT5DataExporter
-from utils.visualization import PatternVisualizer, create_pattern_report
-
+from core.data_feeder import DataFeeder
+from core.ml_models import PatternMLModel
+from utils.mt5_connector import MT5Connector
+from gui.main_window import MainWindow
 
 class PatternRecognitionEngine:
-    """Основной класс движка распознавания паттернов"""
+    """Основной класс Pattern Recognition Engine"""
 
-    def __init__(self):
-        self.logger = logger.bind(name="PREngine")
-        self.is_running = False
+    def __init__(self, mode: str = None):
+        """
+        Инициализация движка
+
+        Args:
+            mode: Режим работы (file, socket, websocket, api)
+        """
+        self.mode = mode or config.MODE
+        self.logger = logger.bind(engine="main")
 
         # Инициализация компонентов
-        self.detector = PatternDetector()
-        self.analyzer = PatternAnalyzer()
-        self.database = PatternDatabase()
-        self.visualizer = PatternVisualizer()
-        self.exporter = MT5DataExporter(connector_type=MT5_CONFIG.CONNECTION_MODE)
+        self.detector = None
+        self.analyzer = None
+        self.database = None
+        self.data_feeder = None
+        self.ml_model = None
+        self.mt5_connector = None
 
-        # Файловый коннектор для режима файлового обмена
-        self.file_connector = FileConnector()
-
-        # Состояние движка
-        self.current_symbol = "EURUSD"
-        self.current_timeframe = "H1"
-        self.last_processed_time = None
-
-        # Статистика
-        self.engine_stats = {
-            'start_time': None,
-            'total_cycles': 0,
-            'patterns_found_total': 0,
-            'signals_generated': 0,
-            'errors': 0
-        }
+        # Состояние
+        self.is_running = False
+        self.components_initialized = False
 
     async def initialize(self):
-        """Инициализация движка"""
-        self.logger.info("=" * 60)
-        self.logger.info("PATTERN RECOGNITION ENGINE")
-        self.logger.info(f"Version: {CONFIG.VERSION}")
-        self.logger.info(f"Mode: {MT5_CONFIG.CONNECTION_MODE}")
-        self.logger.info("=" * 60)
-
-        # Загружаем исторические данные для анализа
-        await self._load_historical_data()
-
-        # Проверяем подключение к MT5
-        if MT5_CONFIG.CONNECTION_MODE in ['socket', 'websocket']:
-            connected = await self.exporter.connector.connect()
-            if not connected:
-                self.logger.warning("Не удалось подключиться к MT5, переходим в автономный режим")
-
-        self.engine_stats['start_time'] = datetime.now()
-        self.is_running = True
-
-        self.logger.info("Движок инициализирован и готов к работе")
-
-    async def _load_historical_data(self):
-        """Загрузка исторических данных для анализа"""
+        """Асинхронная инициализация компонентов"""
         try:
-            self.logger.info("Загрузка исторических данных...")
+            self.logger.info(f"Инициализация Pattern Recognition Engine в режиме {self.mode}")
 
-            # Получаем исторические паттерны из базы данных
-            historical_patterns = self.database.get_historical_patterns_for_analysis(
-                days_back=30, min_quality=0.6
-            )
+            # Валидация конфигурации
+            errors = config.validate()
+            if errors:
+                self.logger.error(f"Ошибки конфигурации: {errors}")
+                return False
 
-            if historical_patterns:
-                # Строим модель для анализа
-                self.analyzer.build_prediction_model(historical_patterns)
-                self.logger.info(f"Загружено {len(historical_patterns)} исторических паттернов")
-            else:
-                self.logger.warning("Исторические данные не найдены, анализ будет ограничен")
+            # Инициализация базы данных
+            self.database = PatternDatabase()
+            await self.database.initialize()
+
+            # Инициализация DataFeeder
+            self.data_feeder = DataFeeder()
+
+            # Инициализация ML модели
+            if config.ML.ENABLED:
+                self.ml_model = PatternMLModel(model_type=config.ML.MODEL_TYPE)
+                # Загрузка обученной модели если существует
+                model_files = list(Path(config.PATHS["models_dir"]).glob("*.pkl"))
+                if model_files:
+                    latest_model = max(model_files, key=lambda x: x.stat().st_mtime)
+                    self.ml_model.load_model(str(latest_model))
+                    self.logger.info(f"Загружена ML модель: {latest_model}")
+
+            # Инициализация PatternDetector
+            self.detector = PatternDetector()
+
+            # Инициализация PatternAnalyzer
+            self.analyzer = PatternAnalyzer()
+
+            # Подключение к MT5 если настроено
+            if config.MT5.ENABLED and config.MT5.AUTO_CONNECT:
+                self.mt5_connector = MT5Connector()
+                if await self.mt5_connector.connect():
+                    self.logger.info("Успешное подключение к MT5")
+                else:
+                    self.logger.warning("Не удалось подключиться к MT5")
+
+            self.components_initialized = True
+            self.logger.info("Инициализация компонентов завершена")
+            return True
 
         except Exception as e:
-            self.logger.error(f"Ошибка загрузки исторических данных: {e}")
+            self.logger.error(f"Ошибка инициализации: {e}", exc_info=True)
+            return False
 
-    async def run_cycle(self):
-        """Выполнение одного цикла анализа"""
+    async def run_file_mode(self):
+        """Запуск в файловом режиме"""
+        self.logger.info("Запуск в файловом режиме")
+
+        # Проверка наличия входного файла
+        input_file = Path(config.MT5.INPUT_FILE_PATH)
+        if not input_file.exists():
+            self.logger.error(f"Входной файл не найден: {input_file}")
+            return
+
         try:
-            self.engine_stats['total_cycles'] += 1
-            cycle_start = datetime.now()
-
-            self.logger.debug(f"Начало цикла анализа #{self.engine_stats['total_cycles']}")
-
-            # 1. Получение данных
-            data = await self._get_data_from_source()
-            if data is None or data.empty:
-                self.logger.warning("Нет данных для анализа, пропускаем цикл")
-                await asyncio.sleep(MT5_CONFIG.UPDATE_INTERVAL_SEC)
+            # Чтение данных из файла
+            data = await self.data_feeder.read_from_file(str(input_file))
+            if not data:
+                self.logger.error("Не удалось прочитать данные из файла")
                 return
 
-            # 2. Конвертация данных в numpy arrays
-            ohlc_data = self._convert_to_ohlc(data)
-
-            # 3. Детектирование паттернов
-            detection_result = self.detector.detect_all_patterns(
-                symbol=self.current_symbol,
-                timeframe=self.current_timeframe,
-                data=ohlc_data
+            # Детектирование паттернов
+            detection_result = await self.detector.detect_all_patterns(
+                symbol="EURUSD",  # Извлекаем из файла или конфига
+                timeframe="H1",
+                data=data
             )
 
-            # 4. Анализ найденных паттернов
-            analyzed_patterns = []
-            for pattern in detection_result.patterns:
-                # Поиск исторических аналогов
-                historical_patterns = self.database.get_patterns(
-                    symbol=self.current_symbol,
-                    timeframe=self.current_timeframe,
-                    pattern_type=pattern.get('type'),
-                    direction=pattern.get('direction'),
-                    limit=100
-                )
-
-                historical_dicts = [p.to_dict() for p in historical_patterns]
-
-                # Анализ качества
-                quality_analysis = self.analyzer.analyze_pattern_quality(pattern)
-                pattern['quality_analysis'] = quality_analysis
-
-                # Прогнозирование исхода
-                prediction = self.analyzer.predict_pattern_outcome(
-                    pattern, historical_dicts
-                )
-                pattern['prediction'] = prediction
-
-                # Статистика из исторических аналогов
-                if historical_dicts:
-                    similar_patterns = self.analyzer.find_similar_patterns(
-                        pattern, historical_dicts, n_neighbors=10
-                    )
-
-                    if similar_patterns:
-                        success_rate = self.analyzer.calculate_success_rate(similar_patterns)
-                        avg_profit = self.analyzer.calculate_average_profit(similar_patterns)
-
-                        pattern['historical_statistics'] = {
-                            'similar_patterns_count': len(similar_patterns),
-                            'historical_success_rate': success_rate,
-                            'average_profit': avg_profit,
-                            'most_similar_patterns': [
-                                {'id': p['id'], 'similarity': s}
-                                for p, s in similar_patterns[:3]
-                            ]
-                        }
-
-                analyzed_patterns.append(pattern)
-
-                # Логирование обнаруженного паттерна
-                pattern_logger.pattern_detected(
-                    pattern_name=pattern['name'],
-                    symbol=pattern['metadata']['symbol'],
-                    timeframe=pattern['metadata']['timeframe'],
-                    confidence=pattern['metadata']['confidence']
-                )
-
-            # 5. Сохранение паттернов в базу данных
-            for pattern in analyzed_patterns:
-                self.database.save_pattern(pattern)
-
-            # 6. Генерация торговых сигналов
-            signals = await self._generate_trading_signals(analyzed_patterns)
-
-            # 7. Визуализация
-            await self._visualize_results(analyzed_patterns, ohlc_data)
-
-            # 8. Экспорт результатов в MT5
-            await self._export_results_to_mt5(analyzed_patterns, signals)
-
-            # 9. Обновление статистики
-            self.engine_stats['patterns_found_total'] += len(analyzed_patterns)
-            self.engine_stats['signals_generated'] += len(signals)
-
-            cycle_duration = (datetime.now() - cycle_start).total_seconds()
-            self.logger.info(
-                f"Цикл #{self.engine_stats['total_cycles']} завершен: "
-                f"{len(analyzed_patterns)} паттернов, "
-                f"{len(signals)} сигналов, "
-                f"время: {cycle_duration:.2f}с"
+            # Анализ паттернов
+            analyzed_patterns = await self.analyzer.analyze_patterns(
+                detection_result.patterns,
+                data
             )
 
-            # Ждем перед следующим циклом
-            await asyncio.sleep(MT5_CONFIG.UPDATE_INTERVAL_SEC)
+            # Сохранение результатов
+            output_file = Path(config.MT5.OUTPUT_FILE_PATH)
+            await self.data_feeder.save_to_file(
+                analyzed_patterns,
+                str(output_file)
+            )
+
+            # Визуализация
+            if config.VISUALIZATION.ENABLE_PLOTTING:
+                from utils.visualization import PatternVisualizer
+                visualizer = PatternVisualizer()
+                plot_file = output_file.with_suffix('.png')
+                visualizer.plot_patterns(data, analyzed_patterns, str(plot_file))
+
+            self.logger.info(f"Анализ завершен. Результаты сохранены в {output_file}")
 
         except Exception as e:
-            self.logger.error(f"Ошибка в цикле анализа: {e}", exc_info=True)
-            self.engine_stats['errors'] += 1
-            await asyncio.sleep(MT5_CONFIG.UPDATE_INTERVAL_SEC * 2)  # Удваиваем задержку при ошибке
+            self.logger.error(f"Ошибка в файловом режиме: {e}", exc_info=True)
 
-    async def _get_data_from_source(self):
-        """Получение данных из источника (MT5 или файла)"""
-        if MT5_CONFIG.CONNECTION_MODE == 'file':
-            # Чтение из файла
-            data = self.file_connector.read_data()
-            return data
-
-        else:
-            # Запрос данных через сокет/WebSocket
-            # TODO: Реализовать получение данных через сокет
-            self.logger.warning("Режим сокета/WebSocket пока не реализован полностью")
-            return None
-
-    def _convert_to_ohlc(self, data):
-        """Конвертация DataFrame в формат OHLC"""
-        ohlc_data = {
-            'timestamp': data['timestamp'].values if 'timestamp' in data.columns else None,
-            'open': data['open'].values.astype(float),
-            'high': data['high'].values.astype(float),
-            'low': data['low'].values.astype(float),
-            'close': data['close'].values.astype(float)
-        }
-
-        if 'volume' in data.columns:
-            ohlc_data['volume'] = data['volume'].values.astype(float)
-
-        return ohlc_data
-
-    async def _generate_trading_signals(self, patterns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Генерация торговых сигналов на основе паттернов"""
-        signals = []
-
-        for pattern in patterns:
-            # Фильтруем паттерны по качеству
-            quality_analysis = pattern.get('quality_analysis', {})
-            overall_score = quality_analysis.get('overall_score', 0)
-
-            if overall_score >= 0.6:  # Минимальный порог качества
-                # Создаем сигнал
-                signal = {
-                    'id': f"signal_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(signals)}",
-                    'pattern_id': pattern.get('id'),
-                    'symbol': pattern.get('metadata', {}).get('symbol'),
-                    'timeframe': pattern.get('metadata', {}).get('timeframe'),
-                    'signal_type': 'pattern_based',
-                    'direction': pattern.get('direction'),
-                    'pattern_name': pattern.get('name'),
-                    'quality_score': overall_score,
-                    'entry_price': pattern.get('targets', {}).get('entry_price'),
-                    'stop_loss': pattern.get('targets', {}).get('stop_loss'),
-                    'take_profit': pattern.get('targets', {}).get('take_profit'),
-                    'risk_amount': pattern.get('targets', {}).get('risk_amount'),
-                    'reward_amount': pattern.get('targets', {}).get('reward_amount'),
-                    'profit_risk_ratio': pattern.get('targets', {}).get('profit_risk_ratio'),
-                    'confidence': pattern.get('metadata', {}).get('confidence', 0),
-                    'generated_time': datetime.now().isoformat()
-                }
-
-                signals.append(signal)
-
-                # Логирование сигнала
-                pattern_logger.trading_signal(
-                    symbol=signal['symbol'],
-                    pattern=signal['pattern_name'],
-                    direction=signal['direction'],
-                    entry=signal['entry_price'],
-                    stop_loss=signal['stop_loss'],
-                    take_profit=signal['take_profit']
-                )
-
-        # Сохраняем сигналы в базу данных
-        for signal in signals:
-            self.database.save_trading_signal(signal['pattern_id'], signal)
-
-        # Сохраняем сигналы в файл
-        if MT5_CONFIG.CONNECTION_MODE == 'file':
-            self.file_connector.write_signals(signals)
-
-        return signals
-
-    async def _visualize_results(self, patterns: List[Dict[str, Any]], ohlc_data: Dict[str, Any]):
-        """Визуализация результатов анализа"""
-        if not patterns or not self.config.ENABLE_PLOTTING:
-            return
+    async def run_socket_mode(self):
+        """Запуск в режиме сокетов"""
+        self.logger.info("Запуск в режиме сокетов")
 
         try:
-            # Создаем график для каждого паттерна
-            for i, pattern in enumerate(patterns):
-                # Сохраняем график
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                filename = f"pattern_{pattern['name']}_{timestamp}_{i}.png"
-                save_path = OUTPUT_DIR / filename
+            from server.socket_server import SocketServer
+            server = SocketServer(
+                host="127.0.0.1",
+                port=5555,
+                detector=self.detector,
+                analyzer=self.analyzer,
+                data_feeder=self.data_feeder
+            )
 
-                fig = self.visualizer.plot_pattern(pattern, ohlc_data, save_path=str(save_path))
-
-                if fig:
-                    plt.close(fig)  # Закрываем фигуру чтобы освободить память
-
-            # Создаем сводный график для всех паттернов
-            if len(patterns) > 1:
-                summary_filename = f"patterns_summary_{timestamp}.png"
-                summary_path = OUTPUT_DIR / summary_filename
-
-                fig = self.visualizer.plot_multiple_patterns(
-                    patterns, ohlc_data, save_path=str(summary_path)
-                )
-
-                if fig:
-                    plt.close(fig)
+            await server.start()
 
         except Exception as e:
-            self.logger.error(f"Ошибка визуализации: {e}")
+            self.logger.error(f"Ошибка в режиме сокетов: {e}", exc_info=True)
 
-    async def _export_results_to_mt5(self, patterns: List[Dict[str, Any]], signals: List[Dict[str, Any]]):
-        """Экспорт результатов в MT5"""
-        if not patterns:
-            return
+    async def run_websocket_mode(self):
+        """Запуск в режиме WebSocket"""
+        self.logger.info("Запуск в режиме WebSocket")
 
         try:
-            # Подготавливаем данные для экспорта
-            export_data = {
-                'patterns': patterns,
-                'signals': signals,
-                'timestamp': datetime.now().isoformat(),
-                'symbol': self.current_symbol,
-                'timeframe': self.current_timeframe
-            }
+            from server.ws_server import WebSocketServer
+            server = WebSocketServer(
+                host="127.0.0.1",
+                port=8765,
+                detector=self.detector,
+                analyzer=self.analyzer,
+                ml_model=self.ml_model
+            )
 
-            # Экспортируем через соответствующий коннектор
-            if MT5_CONFIG.CONNECTION_MODE == 'file':
-                # Сохраняем в JSON файл
-                filename = f"patterns_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                filepath = OUTPUT_DIR / filename
-
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(export_data, f, indent=2, default=str)
-
-                self.logger.debug(f"Результаты экспортированы в файл: {filepath}")
-
-            else:
-                # Отправляем через сокет/WebSocket
-                await self.exporter.import_patterns_to_mt5(patterns)
+            await server.start()
 
         except Exception as e:
-            self.logger.error(f"Ошибка экспорта результатов в MT5: {e}")
+            self.logger.error(f"Ошибка в режиме WebSocket: {e}", exc_info=True)
+
+    async def run_api_mode(self):
+        """Запуск в режиме API"""
+        self.logger.info("Запуск в режиме API")
+
+        try:
+            from server.api_server import APIServer
+            server = APIServer(
+                detector=self.detector,
+                analyzer=self.analyzer,
+                database=self.database,
+                ml_model=self.ml_model
+            )
+
+            await server.start()
+
+        except Exception as e:
+            self.logger.error(f"Ошибка в режиме API: {e}", exc_info=True)
+
+    async def run_gui_mode(self):
+        """Запуск в GUI режиме"""
+        self.logger.info("Запуск в GUI режиме")
+
+        try:
+            app = MainWindow(self)
+            app.run()
+
+        except Exception as e:
+            self.logger.error(f"Ошибка в GUI режиме: {e}", exc_info=True)
 
     async def run(self):
-        """Основной цикл работы движка"""
-        await self.initialize()
+        """Основной цикл работы"""
+        if not self.components_initialized:
+            initialized = await self.initialize()
+            if not initialized:
+                self.logger.error("Не удалось инициализировать компоненты")
+                return
 
-        self.logger.info("Запуск основного цикла анализа...")
+        self.is_running = True
 
-        # Регистрием обработчик сигналов для корректного завершения
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        try:
+            # Выбор режима работы
+            if self.mode == "file":
+                await self.run_file_mode()
 
-        # Основной цикл
-        while self.is_running:
-            try:
-                await self.run_cycle()
-            except KeyboardInterrupt:
-                self.logger.info("Получен сигнал прерывания")
-                break
-            except Exception as e:
-                self.logger.error(f"Критическая ошибка в основном цикле: {e}")
-                self.engine_stats['errors'] += 1
+            elif self.mode == "socket":
+                await self.run_socket_mode()
 
-                # Ждем перед повторной попыткой
-                await asyncio.sleep(30)
+            elif self.mode == "websocket":
+                await self.run_websocket_mode()
 
-        await self.shutdown()
+            elif self.mode == "api":
+                await self.run_api_mode()
 
-    def _signal_handler(self, signum, frame):
-        """Обработчик сигналов для корректного завершения"""
-        self.logger.info(f"Получен сигнал {signum}, завершение работы...")
-        self.is_running = False
+            elif self.mode == "gui":
+                await self.run_gui_mode()
+
+            else:
+                self.logger.error(f"Неизвестный режим работы: {self.mode}")
+                return
+
+        except KeyboardInterrupt:
+            self.logger.info("Получен сигнал прерывания")
+        except Exception as e:
+            self.logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        finally:
+            await self.shutdown()
 
     async def shutdown(self):
-        """Корректное завершение работы движка"""
-        self.logger.info("Завершение работы Pattern Recognition Engine...")
+        """Корректное завершение работы"""
+        self.logger.info("Завершение работы Pattern Recognition Engine")
+        self.is_running = False
 
-        # Закрываем соединения
-        await self.exporter.close()
+        # Закрытие соединений
+        if self.mt5_connector:
+            await self.mt5_connector.disconnect()
 
-        # Сохраняем статистику
-        await self._save_statistics()
+        if self.database:
+            await self.database.close()
 
-        # Закрываем базу данных
-        self.database.close()
+        self.logger.info("Работа завершена")
 
-        self.logger.info("Работа движка завершена")
-        self._print_summary()
+def main():
+    """Точка входа в приложение"""
+    import argparse
 
-    async def _save_statistics(self):
-        """Сохранение статистики работы"""
-        try:
-            stats = {
-                'engine': self.engine_stats,
-                'detector': self.detector.get_statistics(),
-                'analyzer': self.analyzer.get_statistics(),
-                'database': self.database.get_database_stats(),
-                'file_connector': self.file_connector.get_stats() if hasattr(self, 'file_connector') else {},
-                'exporter': self.exporter.get_stats() if hasattr(self, 'exporter') else {},
-                'end_time': datetime.now().isoformat()
-            }
+    parser = argparse.ArgumentParser(
+        description="Pattern Recognition Engine - профессиональная система распознавания паттернов"
+    )
 
-            # Конвертируем datetime в строки
-            for key in ['start_time', 'end_time', 'last_processed_time']:
-                if key in stats['engine'] and stats['engine'][key]:
-                    stats['engine'][key] = stats['engine'][key].isoformat()
+    parser.add_argument(
+        "--mode",
+        choices=["file", "socket", "websocket", "api", "gui"],
+        default=None,
+        help="Режим работы"
+    )
 
-            # Сохраняем в файл
-            filename = f"stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            filepath = OUTPUT_DIR / filename
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Путь к конфигурационному файлу"
+    )
 
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(stats, f, indent=2, default=str)
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        help="Торговый символ для анализа"
+    )
 
-            self.logger.info(f"Статистика сохранена в {filepath}")
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default="H1",
+        help="Таймфрейм для анализа"
+    )
 
-        except Exception as e:
-            self.logger.error(f"Ошибка сохранения статистики: {e}")
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="Уровень логирования"
+    )
 
-    def _print_summary(self):
-        """Вывод сводки работы"""
-        duration = None
-        if self.engine_stats['start_time']:
-            end_time = datetime.now()
-            duration = end_time - self.engine_stats['start_time']
+    args = parser.parse_args()
 
-        summary = f"""
-{'=' * 60}
-Итог работы Pattern Recognition Engine:
-{'=' * 60}
-Общее время работы: {duration}
-Всего циклов анализа: {self.engine_stats['total_cycles']}
-Всего найдено паттернов: {self.engine_stats['patterns_found_total']}
-Сгенерировано сигналов: {self.engine_stats['signals_generated']}
-Ошибок: {self.engine_stats['errors']}
+    # Настройка логгера
+    setup_logger(level=args.log_level)
+    logger.info(f"Запуск Pattern Recognition Engine с аргументами: {args}")
 
-Детектор:
-  Всего обработано: {self.detector.detection_stats['total_processed']}
-  Найдено паттернов: {self.detector.detection_stats['patterns_found']}
-  Среднее качество: {self.detector.detection_stats['avg_quality']:.2f}
+    # Загрузка конфигурации если указана
+    if args.config:
+        from config import CONFIG
+        global config
+        config = CONFIG.load(args.config)
+        logger.info(f"Загружена конфигурация из {args.config}")
 
-Анализатор:
-  Проанализировано паттернов: {self.analyzer.analysis_stats['total_patterns_analyzed']}
-  Найдено аналогов: {self.analyzer.analysis_stats['similar_patterns_found']}
+    # Обновление конфигурации аргументами
+    if args.mode:
+        config.MODE = args.mode
 
-База данных:
-  Всего паттернов: {self.database.get_database_stats().get('total_patterns', 0)}
-{'=' * 60}
-        """
+    if args.symbol:
+        config.MT5.SYMBOLS = [args.symbol]
 
-        self.logger.info(summary)
+    # Создание и запуск движка
+    engine = PatternRecognitionEngine(mode=args.mode)
 
-
-async def main():
-    """Основная функция"""
-    # Создаем и запускаем движок
-    engine = PatternRecognitionEngine()
-
+    # Запуск асинхронного цикла
     try:
-        await engine.run()
+        asyncio.run(engine.run())
+    except KeyboardInterrupt:
+        logger.info("Приложение остановлено пользователем")
     except Exception as e:
-        logger.critical(f"Критическая ошибка в main: {e}")
-        await engine.shutdown()
-        raise
-
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
-    # Запуск асинхронного event loop
-    asyncio.run(main())
+    main()
 

@@ -1,1400 +1,561 @@
 """
-Гармонические паттерны
+Модуль гармонических паттернов
 """
 
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
-from scipy.optimize import minimize
+from dataclasses import dataclass
+from scipy.spatial import KDTree
+from scipy.signal import find_peaks
 
-from .base_pattern import (
-    BasePattern, PatternType, PatternDirection,
-    PatternPoint, MarketContext
-)
-from config import DETECTION_CONFIG
-
+from .base_pattern import BasePattern, PatternPoint, PatternResult
+from config import config
 
 @dataclass
-class HarmonicPattern(BasePattern):
-    """Базовый класс для гармонических паттернов"""
+class ExtremePoint:
+    """Экстремальная точка для гармонических паттернов"""
+    index: int
+    price: float
+    type: str  # 'X', 'A', 'B', 'C', 'D'
+    is_high: bool
 
-    def __init__(self, name: str, abbreviation: str = ""):
-        super().__init__(PatternType.HARMONIC, name, abbreviation)
-
-        # Фибо уровни для гармонических паттернов
-        self.fibonacci_levels = {
-            '0.0': 0.0,
-            '0.236': 0.236,
-            '0.382': 0.382,
-            '0.5': 0.5,
-            '0.618': 0.618,
-            '0.786': 0.786,
-            '0.886': 0.886,
-            '1.0': 1.0,
-            '1.13': 1.13,
-            '1.27': 1.27,
-            '1.414': 1.414,
-            '1.618': 1.618,
-            '2.0': 2.0,
-            '2.24': 2.24,
-            '2.618': 2.618,
-            '3.14': 3.14
-        }
-
-        # Допуски для фибо уровней
-        self.fib_tolerance = 0.05  # 5%
-
-        # Точки гармонического паттерна (X, A, B, C, D)
-        self.point_x: Optional[PatternPoint] = None
-        self.point_a: Optional[PatternPoint] = None
-        self.point_b: Optional[PatternPoint] = None
-        self.point_c: Optional[PatternPoint] = None
-        self.point_d: Optional[PatternPoint] = None
-
-        # Измерения паттерна
-        self.xa_price_diff: Optional[float] = None  # Разница цен XA
-        self.ab_retracement: Optional[float] = None  # Откат AB
-        self.bc_retracement: Optional[float] = None  # Откат BC
-        self.cd_extension: Optional[float] = None  # Расширение CD
-        self.xd_extension: Optional[float] = None  # Расширение XD
-
-    def _calculate_fib_retracement(self, start: float, end: float,
-                                   level: float) -> float:
-        """Расчет уровня Фибоначчи для отката"""
-        diff = end - start
-        return start + diff * level
-
-    def _calculate_fib_extension(self, start: float, end: float,
-                                 level: float) -> float:
-        """Расчет уровня Фибоначчи для расширения"""
-        diff = end - start
-        return end + diff * level
-
-    def _is_fib_level_match(self, actual: float, expected: float,
-                            tolerance: float = None) -> bool:
-        """Проверка соответствия фибо уровню"""
-        if tolerance is None:
-            tolerance = self.fib_tolerance
-
-        if expected == 0:
-            return False
-
-        deviation = abs((actual - expected) / expected)
-        return deviation <= tolerance
-
-    def _find_swing_points(self, highs: np.ndarray, lows: np.ndarray,
-                           min_distance: int = 5) -> Tuple[np.ndarray, np.ndarray]:
-        """Нахождение точек разворота (swing points)"""
-        from scipy.signal import argrelextrema
-
-        # Находим локальные максимумы и минимумы
-        max_indices = argrelextrema(highs, np.greater, order=min_distance)[0]
-        min_indices = argrelextrema(lows, np.less, order=min_distance)[0]
-
-        # Объединяем и сортируем все точки
-        all_points = []
-
-        for idx in max_indices:
-            all_points.append({
-                'index': idx,
-                'price': highs[idx],
-                'type': 'high'
-            })
-
-        for idx in min_indices:
-            all_points.append({
-                'index': idx,
-                'price': lows[idx],
-                'type': 'low'
-            })
-
-        # Сортируем по индексу
-        all_points.sort(key=lambda x: x['index'])
-
-        # Отфильтровываем слабые точки
-        filtered_points = []
-        for i in range(1, len(all_points) - 1):
-            prev = all_points[i - 1]
-            curr = all_points[i]
-            next_ = all_points[i + 1]
-
-            # Для максимума: текущая цена должна быть выше соседних
-            if curr['type'] == 'high':
-                if curr['price'] > prev['price'] and curr['price'] > next_['price']:
-                    filtered_points.append(curr)
-            # Для минимума: текущая цена должна быть ниже соседних
-            else:
-                if curr['price'] < prev['price'] and curr['price'] < next_['price']:
-                    filtered_points.append(curr)
-
-        # Разделяем обратно на максимумы и минимумы
-        filtered_highs = [p for p in filtered_points if p['type'] == 'high']
-        filtered_lows = [p for p in filtered_points if p['type'] == 'low']
-
-        return filtered_highs, filtered_lows
-
-    def _validate_pattern_structure(self, points: List[Dict]) -> bool:
-        """Валидация структуры гармонического паттерна"""
-        if len(points) < 5:
-            return False
-
-        # Проверяем чередование максимумов и минимумов
-        for i in range(len(points) - 1):
-            if points[i]['type'] == points[i + 1]['type']:
-                return False
-
-        return True
-
-
-@dataclass
-class ABCDPattern(HarmonicPattern):
-    """Паттерн ABCD"""
+class HarmonicPatterns(BasePattern):
+    """Класс для детектирования гармонических паттернов"""
 
     def __init__(self):
-        super().__init__("ABCD Pattern", "ABCD")
-        self.pattern_variants = ['bullish', 'bearish']
-        self.required_points = 4  # A, B, C, D
+        super().__init__(name="harmonic_patterns", min_points=4)
 
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        # Находим точки разворота
-        swing_highs, swing_lows = self._find_swing_points(highs, lows, min_distance=3)
+        # Определения гармонических паттернов (идеальные соотношения Фибоначчи)
+        self.pattern_definitions = {
+            'gartley': {
+                'AB': 0.618,    # XA * 0.618
+                'BC': 0.618,    # AB * 0.618
+                'CD': 1.618,    # BC * 1.618
+                'AD': 0.786     # XA * 0.786
+            },
+            'butterfly': {
+                'AB': 0.786,    # XA * 0.786
+                'BC': 0.618,    # AB * 0.618
+                'CD': 2.618,    # BC * 2.618
+                'AD': 1.272     # XA * 1.272
+            },
+            'bat': {
+                'AB': 0.382,    # XA * 0.382
+                'BC': 0.618,    # AB * 0.618
+                'CD': 2.618,    # BC * 2.618
+                'AD': 0.886     # XA * 0.886
+            },
+            'crab': {
+                'AB': 0.382,    # XA * 0.382
+                'BC': 0.618,    # AB * 0.618
+                'CD': 3.618,    # BC * 3.618
+                'AD': 1.618     # XA * 1.618
+            },
+            'shark': {
+                'AB': 0.382,    # XA * 0.382
+                'BC': 1.130,    # AB * 1.130
+                'CD': 1.618,    # BC * 1.618
+                'AD': 0.886     # XA * 0.886
+            },
+            'cypher': {
+                'AB': 0.382,    # XA * 0.382
+                'BC': 1.130,    # AB * 1.130
+                'CD': 1.414,    # BC * 1.414
+                'AD': 0.786     # XA * 0.786
+            },
+            'five_o': {
+                'AB': 0.618,    # XA * 0.618
+                'BC': 1.618,    # AB * 1.618
+                'CD': 1.618,    # BC * 1.618
+                'AD': 0.618     # XA * 0.618
+            }
+        }
 
-        if len(swing_highs) < 2 or len(swing_lows) < 2:
-            return False
+        # Допустимое отклонение от идеальных соотношений
+        self.fib_tolerance = config.DETECTION.FIBONACCI_TOLERANCE
 
-        # Объединяем все точки и сортируем
-        all_points = swing_highs + swing_lows
-        all_points.sort(key=lambda x: x['index'])
+    def detect(self, data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """
+        Детектирование гармонических паттернов
 
-        # Ищем структуру ABCD
-        for i in range(len(all_points) - 3):
-            point_a = all_points[i]
-            point_b = all_points[i + 1]
-            point_c = all_points[i + 2]
-            point_d = all_points[i + 3]
+        Args:
+            data: Входные данные OHLC
 
-            # Проверяем чередование
-            if not (point_a['type'] != point_b['type'] and
-                    point_b['type'] != point_c['type'] and
-                    point_c['type'] != point_d['type']):
+        Returns:
+            Список обнаруженных паттернов
+        """
+        results = []
+
+        # Проверка входных данных
+        required = ['high', 'low']
+        if not all(key in data for key in required):
+            return results
+
+        # Находим экстремумы
+        extremes = self._find_all_extremes(data)
+
+        if len(extremes) < config.DETECTION.MIN_HARMONIC_POINTS:
+            return results
+
+        # Ищем гармонические паттерны
+        for pattern_name, fib_ratios in self.pattern_definitions.items():
+            if config.DETECTION.ENABLE_HARMONIC:
+                pattern_results = self._detect_specific_pattern(
+                    extremes, pattern_name, fib_ratios, data
+                )
+                results.extend(pattern_results)
+
+        # Фильтрация результатов
+        filtered_results = self._filter_results(results)
+
+        return filtered_results
+
+    def _find_all_extremes(self, data: Dict[str, np.ndarray]) -> List[ExtremePoint]:
+        """Поиск всех экстремумов (пиков и впадин)"""
+        extremes = []
+
+        try:
+            # Используем scipy для поиска пиков
+            high_prices = data['high']
+            low_prices = data['low']
+
+            # Находим локальные максимумы
+            high_indices, _ = find_peaks(
+                high_prices,
+                prominence=self.peak_prominence * np.mean(high_prices),
+                distance=config.DETECTION.MIN_CANDLES_FOR_PATTERN // 2
+            )
+
+            # Находим локальные минимумы
+            low_indices, _ = find_peaks(
+                -low_prices,
+                prominence=self.peak_prominence * np.mean(low_prices),
+                distance=config.DETECTION.MIN_CANDLES_FOR_PATTERN // 2
+            )
+
+            # Создаем точки максимумов
+            for idx in high_indices:
+                if idx < len(high_prices):
+                    point = ExtremePoint(
+                        index=idx,
+                        price=float(high_prices[idx]),
+                        type='',
+                        is_high=True
+                    )
+                    extremes.append(point)
+
+            # Создаем точки минимумов
+            for idx in low_indices:
+                if idx < len(low_prices):
+                    point = ExtremePoint(
+                        index=idx,
+                        price=float(low_prices[idx]),
+                        type='',
+                        is_high=False
+                    )
+                    extremes.append(point)
+
+            # Сортируем по индексу
+            extremes.sort(key=lambda x: x.index)
+
+            # Чередование максимумов и минимумов
+            filtered_extremes = []
+            for i, point in enumerate(extremes):
+                if i == 0:
+                    filtered_extremes.append(point)
+                else:
+                    # Проверяем что тип чередуется
+                    if point.is_high != filtered_extremes[-1].is_high:
+                        filtered_extremes.append(point)
+
+            extremes = filtered_extremes
+
+        except Exception as e:
+            # Резервный метод
+            extremes = self._find_extremes_simple(data)
+
+        return extremes
+
+    def _find_extremes_simple(self, data: Dict[str, np.ndarray]) -> List[ExtremePoint]:
+        """Простой поиск экстремумов (резервный метод)"""
+        extremes = []
+
+        high_prices = data['high']
+        low_prices = data['low']
+
+        window = config.DETECTION.MIN_CANDLES_FOR_PATTERN // 2
+
+        for i in range(window, len(high_prices) - window):
+            # Проверяем максимум
+            if high_prices[i] == np.max(high_prices[i-window:i+window+1]):
+                point = ExtremePoint(
+                    index=i,
+                    price=float(high_prices[i]),
+                    type='',
+                    is_high=True
+                )
+                extremes.append(point)
+
+            # Проверяем минимум
+            if low_prices[i] == np.min(low_prices[i-window:i+window+1]):
+                point = ExtremePoint(
+                    index=i,
+                    price=float(low_prices[i]),
+                    type='',
+                    is_high=False
+                )
+                extremes.append(point)
+
+        # Сортируем и чередуем
+        extremes.sort(key=lambda x: x.index)
+
+        filtered = []
+        for point in extremes:
+            if not filtered or point.is_high != filtered[-1].is_high:
+                filtered.append(point)
+
+        return filtered
+
+    def _detect_specific_pattern(self,
+                                extremes: List[ExtremePoint],
+                                pattern_name: str,
+                                fib_ratios: Dict[str, float],
+                                data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        """Детектирование конкретного гармонического паттерна"""
+        results = []
+
+        # Нужно минимум 5 точек для гармонического паттерна (X, A, B, C, D)
+        if len(extremes) < 5:
+            return results
+
+        # Проверяем все возможные комбинации из 5 точек
+        for i in range(len(extremes) - 4):
+            points = extremes[i:i+5]
+
+            # Проверяем чередование максимумов и минимумов
+            if not self._check_alternation(points):
+                continue
+
+            # Присваиваем типа точкам (X, A, B, C, D)
+            typed_points = self._assign_point_types(points)
+
+            # Проверяем гармонические соотношения
+            is_valid, actual_ratios = self._check_fibonacci_ratios(typed_points, fib_ratios)
+
+            if not is_valid:
+                continue
+
+            # Рассчитываем качество паттерна
+            quality = self._calculate_harmonic_quality(actual_ratios, fib_ratios)
+
+            if quality < config.DETECTION.MIN_PATTERN_QUALITY:
                 continue
 
             # Определяем направление
-            if point_a['type'] == 'low':  # Бычий ABCD
-                is_bullish = (point_b['price'] > point_a['price'] and
-                              point_c['price'] < point_b['price'] and
-                              point_d['price'] > point_c['price'])
+            direction = self._determine_harmonic_direction(typed_points)
 
-                if is_bullish:
-                    # Проверяем фибо соотношения
-                    ab_diff = point_b['price'] - point_a['price']
-                    bc_diff = point_b['price'] - point_c['price']
-                    cd_diff = point_d['price'] - point_c['price']
+            # Создаем точки паттерна в формате PatternPoint
+            pattern_points = []
+            for j, point in enumerate(typed_points):
+                pattern_point = PatternPoint(
+                    index=point.index,
+                    price=point.price,
+                    type=point.type,
+                    metadata={'is_high': point.is_high}
+                )
+                pattern_points.append(pattern_point)
 
-                    # AB и CD должны быть примерно равны
-                    if ab_diff > 0 and cd_diff > 0:
-                        cd_ab_ratio = cd_diff / ab_diff
+            # Рассчитываем цели
+            targets = self._calculate_harmonic_targets(typed_points, pattern_name, direction)
 
-                        if self._is_fib_level_match(cd_ab_ratio, 1.0, 0.1):  # CD ≈ AB
-                            self._save_abcd_points(point_a, point_b, point_c,
-                                                   point_d, timestamps, True)
-                            self.direction = PatternDirection.BULLISH
-                            self._is_detected = True
-                            return True
-
-            else:  # Медвежий ABCD
-                is_bearish = (point_b['price'] < point_a['price'] and
-                              point_c['price'] > point_b['price'] and
-                              point_d['price'] < point_c['price'])
-
-                if is_bearish:
-                    ab_diff = point_a['price'] - point_b['price']
-                    bc_diff = point_c['price'] - point_b['price']
-                    cd_diff = point_c['price'] - point_d['price']
-
-                    if ab_diff > 0 and cd_diff > 0:
-                        cd_ab_ratio = cd_diff / ab_diff
-
-                        if self._is_fib_level_match(cd_ab_ratio, 1.0, 0.1):
-                            self._save_abcd_points(point_a, point_b, point_c,
-                                                   point_d, timestamps, False)
-                            self.direction = PatternDirection.BEARISH
-                            self._is_detected = True
-                            return True
-
-        return False
-
-    def _save_abcd_points(self, point_a, point_b, point_c, point_d,
-                          timestamps, is_bullish: bool):
-        """Сохранение точек паттерна ABCD"""
-        self.points = []
-
-        # Точка A
-        self.points.append(
-            PatternPoint(
-                index=point_a['index'],
-                timestamp=timestamps[point_a['index']],
-                price=point_a['price'],
-                point_type='A'
+            # Создаем результат
+            result = PatternResult(
+                name=pattern_name,
+                direction=direction,
+                points=pattern_points,
+                quality=quality,
+                confidence=self.calculate_confidence(pattern_points, data),
+                targets=targets,
+                metadata={
+                    'pattern_type': 'harmonic',
+                    'fibonacci_ratios': actual_ratios,
+                    'ideal_ratios': fib_ratios
+                }
             )
-        )
 
-        # Точка B
-        self.points.append(
-            PatternPoint(
-                index=point_b['index'],
-                timestamp=timestamps[point_b['index']],
-                price=point_b['price'],
-                point_type='B'
-            )
-        )
+            results.append(result)
 
-        # Точка C
-        self.points.append(
-            PatternPoint(
-                index=point_c['index'],
-                timestamp=timestamps[point_c['index']],
-                price=point_c['price'],
-                point_type='C'
-            )
-        )
+        return results
 
-        # Точка D
-        self.points.append(
-            PatternPoint(
-                index=point_d['index'],
-                timestamp=timestamps[point_d['index']],
-                price=point_d['price'],
-                point_type='D'
-            )
-        )
+    def _check_alternation(self, points: List[ExtremePoint]) -> bool:
+        """Проверка чередования максимумов и минимумов"""
+        for i in range(1, len(points)):
+            if points[i].is_high == points[i-1].is_high:
+                return False
+        return True
 
-        # Сохраняем ссылки
-        self.point_a = self.points[0]
-        self.point_b = self.points[1]
-        self.point_c = self.points[2]
-        self.point_d = self.points[3]
+    def _assign_point_types(self, points: List[ExtremePoint]) -> List[ExtremePoint]:
+        """Присвоение типа точкам (X, A, B, C, D)"""
+        typed_points = points.copy()
 
-        # Рассчитываем измерения
-        if is_bullish:
-            self.xa_price_diff = self.point_b.price - self.point_a.price
-            self.ab_retracement = (self.point_b.price - self.point_c.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_c.price - self.point_a.price) / (self.point_b.price - self.point_a.price)
-            self.cd_extension = (self.point_d.price - self.point_c.price) / (self.point_b.price - self.point_c.price)
+        # Первая точка всегда X
+        typed_points[0].type = 'X'
+
+        # Определяем направление движения от X к A
+        if typed_points[1].price > typed_points[0].price:
+            # Движение вверх: X - низ, A - высоко
+            typed_points[1].type = 'A'
         else:
-            self.xa_price_diff = self.point_a.price - self.point_b.price
-            self.ab_retracement = (self.point_c.price - self.point_b.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_a.price - self.point_c.price) / (self.point_a.price - self.point_b.price)
-            self.cd_extension = (self.point_c.price - self.point_d.price) / (self.point_c.price - self.point_b.price)
+            # Движение вниз: X - высоко, A - низко
+            typed_points[1].type = 'A'
 
-    def calculate_quality(self) -> float:
-        if not self._is_detected:
-            return 0.0
+        # Остальные точки
+        typed_points[2].type = 'B'
+        typed_points[3].type = 'C'
+        typed_points[4].type = 'D'
 
-        scores = []
+        return typed_points
 
-        # 1. Соотношение AB = CD
-        if self.cd_extension is not None:
-            cd_score = 1 - min(abs(self.cd_extension - 1.0) / 0.2, 1.0)
-            scores.append(cd_score)
+    def _check_fibonacci_ratios(self,
+                               points: List[ExtremePoint],
+                               ideal_ratios: Dict[str, float]) -> Tuple[bool, Dict[str, float]]:
+        """Проверка соотношений Фибоначчи"""
+        # Извлекаем цены
+        X = points[0].price
+        A = points[1].price
+        B = points[2].price
+        C = points[3].price
+        D = points[4].price
 
-        # 2. Откат BC (должен быть 0.618)
-        if self.bc_retracement is not None:
-            bc_score = 1 - min(abs(self.bc_retracement - 0.618) / 0.2, 1.0)
-            scores.append(bc_score)
+        # Вычисляем длины волн
+        XA = abs(A - X)
+        AB = abs(B - A)
+        BC = abs(C - B)
+        # CD рассчитывается ниже
 
-        # 3. Общая симметрия
-        if len(self.points) == 4:
-            # Время между AB и CD должно быть примерно одинаковым
-            time_ab = (self.point_b.timestamp - self.point_a.timestamp).total_seconds()
-            time_cd = (self.point_d.timestamp - self.point_c.timestamp).total_seconds()
+        if XA == 0:
+            return False, {}
 
-            if time_ab > 0 and time_cd > 0:
-                time_ratio = min(time_ab, time_cd) / max(time_ab, time_cd)
-                scores.append(time_ratio)
+        # Вычисляем фактические соотношения
+        actual_ratios = {}
 
-        return np.mean(scores) if scores else 0.0
+        # AB как процент от XA
+        actual_ratios['AB'] = AB / XA if XA != 0 else 0
 
-    def calculate_targets(self, current_price: float):
-        if not self._is_detected or len(self.points) < 4:
-            return super().calculate_targets(current_price)
+        # BC как процент от AB
+        actual_ratios['BC'] = BC / AB if AB != 0 else 0
 
-        # Для ABCD паттерна
-        if self.direction == PatternDirection.BULLISH:
-            # Бычий ABCD: цель - расширение от D
-            entry_price = current_price
-            stop_loss = self.point_d.price * 0.99  # 1% ниже точки D
-            take_profit = entry_price + (self.point_d.price - self.point_c.price) * 1.618
+        # CD как процент от BC (пока неизвестно D, используем проекцию)
+        # Сначала вычисляем идеальное D на основе паттерна
+        if 'AD' in ideal_ratios:
+            # AD как процент от XA
+            ideal_AD = ideal_ratios['AD']
 
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = take_profit
+            # Определяем направление
+            if A > X:  # Бычье движение XA
+                D_projected = X + ideal_AD * XA if ideal_AD > 0 else X - abs(ideal_AD) * XA
+            else:  # Медвежье движение XA
+                D_projected = X - ideal_AD * XA if ideal_AD > 0 else X + abs(ideal_AD) * XA
 
-            # Дополнительные цели
-            self.targets.target1 = entry_price + (self.point_d.price - self.point_c.price)
-            self.targets.target2 = take_profit
-            self.targets.target3 = entry_price + (self.point_d.price - self.point_c.price) * 2.618
+            CD = abs(D_projected - C)
+            actual_ratios['CD'] = CD / BC if BC != 0 else 0
 
-        else:  # BEARISH
-            # Медвежий ABCD: цель - расширение от D вниз
-            entry_price = current_price
-            stop_loss = self.point_d.price * 1.01  # 1% выше точки D
-            take_profit = entry_price - (self.point_c.price - self.point_d.price) * 1.618
-
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = take_profit
-
-            self.targets.target1 = entry_price - (self.point_c.price - self.point_d.price)
-            self.targets.target2 = take_profit
-            self.targets.target3 = entry_price - (self.point_c.price - self.point_d.price) * 2.618
-
-        # Риск/прибыль
-        if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-            risk = abs(self.targets.entry_price - self.targets.stop_loss)
-            reward = abs(self.targets.take_profit - self.targets.entry_price)
-            self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
-
-        return self.targets
-
-
-@dataclass
-class GartleyPattern(HarmonicPattern):
-    """Паттерн Гартли"""
-
-    def __init__(self):
-        super().__init__("Gartley Pattern", "GART")
-        self.pattern_variants = ['bullish', 'bearish']
-        self.required_points = 5  # X, A, B, C, D
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        # Находим точки разворота
-        swing_highs, swing_lows = self._find_swing_points(highs, lows, min_distance=5)
-
-        if len(swing_highs) < 3 or len(swing_lows) < 2:
-            return False
-
-        # Объединяем все точки
-        all_points = swing_highs + swing_lows
-        all_points.sort(key=lambda x: x['index'])
-
-        # Ищем структуру XABCD
-        for i in range(len(all_points) - 4):
-            point_x = all_points[i]
-            point_a = all_points[i + 1]
-            point_b = all_points[i + 2]
-            point_c = all_points[i + 3]
-            point_d = all_points[i + 4]
-
-            # Проверяем чередование
-            types = [p['type'] for p in [point_x, point_a, point_b, point_c, point_d]]
-            for j in range(len(types) - 1):
-                if types[j] == types[j + 1]:
+        # Проверяем соответствие идеальным соотношениям
+        is_valid = True
+        for ratio_key, ideal_value in ideal_ratios.items():
+            if ratio_key in actual_ratios:
+                actual_value = actual_ratios[ratio_key]
+                if actual_value == 0:
+                    is_valid = False
                     break
-            else:
-                # Все типы чередуются
-                if self._check_gartley_ratios(point_x, point_a, point_b, point_c, point_d):
-                    self._save_gartley_points(point_x, point_a, point_b,
-                                              point_c, point_d, timestamps)
-                    self._is_detected = True
 
-                    # Определяем направление
-                    if point_x['type'] == 'low':  # Бычий Гартли
-                        self.direction = PatternDirection.BULLISH
-                    else:  # Медвежий Гартли
-                        self.direction = PatternDirection.BEARISH
-
-                    return True
-
-        return False
-
-    def _check_gartley_ratios(self, x, a, b, c, d) -> bool:
-        """Проверка фибо соотношений для паттерна Гартли"""
-        # Для бычьего Гартли: X - низ, A - высоко, B - низко, C - высоко, D - низко
-        # Для медвежьего Гартли: X - высоко, A - низко, B - высоко, C - низко, D - высоко
-
-        is_bullish = x['type'] == 'low'
-
-        if is_bullish:
-            # AB откат: должен быть 0.618 от XA
-            xa_diff = a['price'] - x['price']
-            ab_diff = a['price'] - b['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            # BC откат: должен быть 0.382-0.886 от AB
-            bc_diff = c['price'] - b['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            # CD расширение: должно быть 1.27 от BC
-            cd_diff = d['price'] - c['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            # Проверяем соотношения
-            ab_ok = self._is_fib_level_match(ab_retracement, 0.618, 0.1)
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = self._is_fib_level_match(cd_extension, 1.27, 0.1)
-
-            return ab_ok and bc_ok and cd_ok
-
-        else:  # Медвежий Гартли
-            xa_diff = x['price'] - a['price']
-            ab_diff = b['price'] - a['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            bc_diff = b['price'] - c['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            cd_diff = c['price'] - d['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            ab_ok = self._is_fib_level_match(ab_retracement, 0.618, 0.1)
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = self._is_fib_level_match(cd_extension, 1.27, 0.1)
-
-            return ab_ok and bc_ok and cd_ok
-
-    def _save_gartley_points(self, x, a, b, c, d, timestamps):
-        """Сохранение точек паттерна Гартли"""
-        self.points = []
-
-        # Точка X
-        self.points.append(
-            PatternPoint(
-                index=x['index'],
-                timestamp=timestamps[x['index']],
-                price=x['price'],
-                point_type='X'
-            )
-        )
-
-        # Точка A
-        self.points.append(
-            PatternPoint(
-                index=a['index'],
-                timestamp=timestamps[a['index']],
-                price=a['price'],
-                point_type='A'
-            )
-        )
-
-        # Точка B
-        self.points.append(
-            PatternPoint(
-                index=b['index'],
-                timestamp=timestamps[b['index']],
-                price=b['price'],
-                point_type='B'
-            )
-        )
-
-        # Точка C
-        self.points.append(
-            PatternPoint(
-                index=c['index'],
-                timestamp=timestamps[c['index']],
-                price=c['price'],
-                point_type='C'
-            )
-        )
-
-        # Точка D
-        self.points.append(
-            PatternPoint(
-                index=d['index'],
-                timestamp=timestamps[d['index']],
-                price=d['price'],
-                point_type='D'
-            )
-        )
-
-        # Сохраняем ссылки
-        self.point_x = self.points[0]
-        self.point_a = self.points[1]
-        self.point_b = self.points[2]
-        self.point_c = self.points[3]
-        self.point_d = self.points[4]
-
-        # Рассчитываем измерения
-        if self.direction == PatternDirection.BULLISH:
-            self.xa_price_diff = self.point_a.price - self.point_x.price
-            self.ab_retracement = (self.point_a.price - self.point_b.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_c.price - self.point_b.price) / (self.point_a.price - self.point_b.price)
-            self.cd_extension = (self.point_d.price - self.point_c.price) / (self.point_c.price - self.point_b.price)
-        else:
-            self.xa_price_diff = self.point_x.price - self.point_a.price
-            self.ab_retracement = (self.point_b.price - self.point_a.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_b.price - self.point_c.price) / (self.point_b.price - self.point_a.price)
-            self.cd_extension = (self.point_c.price - self.point_d.price) / (self.point_b.price - self.point_c.price)
-
-    def calculate_quality(self) -> float:
-        if not self._is_detected:
-            return 0.0
-
-        scores = []
-
-        # 1. Соотношение AB (0.618)
-        if self.ab_retracement is not None:
-            ab_score = 1 - min(abs(self.ab_retracement - 0.618) / 0.1, 1.0)
-            scores.append(ab_score)
-
-        # 2. Соотношение BC (0.382 или 0.886)
-        if self.bc_retracement is not None:
-            bc_score_382 = 1 - min(abs(self.bc_retracement - 0.382) / 0.1, 1.0)
-            bc_score_886 = 1 - min(abs(self.bc_retracement - 0.886) / 0.1, 1.0)
-            bc_score = max(bc_score_382, bc_score_886)
-            scores.append(bc_score)
-
-        # 3. Соотношение CD (1.27)
-        if self.cd_extension is not None:
-            cd_score = 1 - min(abs(self.cd_extension - 1.27) / 0.1, 1.0)
-            scores.append(cd_score)
-
-        # 4. Общая симметрия
-        if len(self.points) == 5:
-            # Проверяем временные соотношения
-            time_xa = (self.point_a.timestamp - self.point_x.timestamp).total_seconds()
-            time_ac = (self.point_c.timestamp - self.point_a.timestamp).total_seconds()
-            time_cd = (self.point_d.timestamp - self.point_c.timestamp).total_seconds()
-
-            if time_xa > 0 and time_cd > 0:
-                # XA и CD должны быть примерно равны
-                time_ratio = min(time_xa, time_cd) / max(time_xa, time_cd)
-                scores.append(time_ratio)
-
-        return np.mean(scores) if scores else 0.0
-
-    def calculate_targets(self, current_price: float):
-        if not self._is_detected or len(self.points) < 5:
-            return super().calculate_targets(current_price)
-
-        # Для паттерна Гартли
-        if self.direction == PatternDirection.BULLISH:
-            # Бычий Гартли: точка D - зона покупки
-            entry_price = current_price
-            stop_loss = self.point_d.price * 0.99  # 1% ниже точки D
-
-            # Цели: 0.618 и 1.0 от XA
-            target1 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.618
-            target2 = self.point_d.price + (self.point_a.price - self.point_x.price)
-
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
-
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = self.point_d.price + (self.point_a.price - self.point_x.price) * 1.618
-
-        else:  # BEARISH
-            # Медвежий Гартли: точка D - зона продажи
-            entry_price = current_price
-            stop_loss = self.point_d.price * 1.01  # 1% выше точки D
-
-            target1 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.618
-            target2 = self.point_d.price - (self.point_x.price - self.point_a.price)
-
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
-
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = self.point_d.price - (self.point_x.price - self.point_a.price) * 1.618
-
-        # Риск/прибыль
-        if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-            risk = abs(self.targets.entry_price - self.targets.stop_loss)
-            reward = abs(self.targets.take_profit - self.targets.entry_price)
-            self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
-
-        return self.targets
-
-
-@dataclass
-class ButterflyPattern(HarmonicPattern):
-    """Паттерн Бабочка"""
-
-    def __init__(self):
-        super().__init__("Butterfly Pattern", "BUTT")
-        self.pattern_variants = ['bullish', 'bearish']
-        self.required_points = 5  # X, A, B, C, D
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        # Находим точки разворота
-        swing_highs, swing_lows = self._find_swing_points(highs, lows, min_distance=7)
-
-        if len(swing_highs) < 3 or len(swing_lows) < 2:
-            return False
-
-        all_points = swing_highs + swing_lows
-        all_points.sort(key=lambda x: x['index'])
-
-        # Ищем структуру XABCD
-        for i in range(len(all_points) - 4):
-            point_x = all_points[i]
-            point_a = all_points[i + 1]
-            point_b = all_points[i + 2]
-            point_c = all_points[i + 3]
-            point_d = all_points[i + 4]
-
-            # Проверяем чередование
-            types = [p['type'] for p in [point_x, point_a, point_b, point_c, point_d]]
-            for j in range(len(types) - 1):
-                if types[j] == types[j + 1]:
+                # Проверяем отклонение
+                deviation = abs(actual_value - ideal_value) / ideal_value
+                if deviation > self.fib_tolerance:
+                    is_valid = False
                     break
-            else:
-                if self._check_butterfly_ratios(point_x, point_a, point_b, point_c, point_d):
-                    self._save_butterfly_points(point_x, point_a, point_b,
-                                                point_c, point_d, timestamps)
-                    self._is_detected = True
 
-                    if point_x['type'] == 'low':
-                        self.direction = PatternDirection.BULLISH
-                    else:
-                        self.direction = PatternDirection.BEARISH
+        return is_valid, actual_ratios
 
-                    return True
-
-        return False
-
-    def _check_butterfly_ratios(self, x, a, b, c, d) -> bool:
-        """Проверка фибо соотношений для паттерна Бабочка"""
-        is_bullish = x['type'] == 'low'
-
-        if is_bullish:
-            # AB откат: должен быть 0.786 от XA
-            xa_diff = a['price'] - x['price']
-            ab_diff = a['price'] - b['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            # BC откат: должен быть 0.382-0.886 от AB
-            bc_diff = c['price'] - b['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            # CD расширение: должно быть 1.618-2.24 от BC
-            cd_diff = d['price'] - c['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            # Проверяем соотношения
-            ab_ok = self._is_fib_level_match(ab_retracement, 0.786, 0.1)
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = (self._is_fib_level_match(cd_extension, 1.618, 0.15) or
-                     self._is_fib_level_match(cd_extension, 2.24, 0.15))
-
-            return ab_ok and bc_ok and cd_ok
-
-        else:  # Медвежий
-            xa_diff = x['price'] - a['price']
-            ab_diff = b['price'] - a['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            bc_diff = b['price'] - c['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            cd_diff = c['price'] - d['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            ab_ok = self._is_fib_level_match(ab_retracement, 0.786, 0.1)
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = (self._is_fib_level_match(cd_extension, 1.618, 0.15) or
-                     self._is_fib_level_match(cd_extension, 2.24, 0.15))
-
-            return ab_ok and bc_ok and cd_ok
-
-    def _save_butterfly_points(self, x, a, b, c, d, timestamps):
-        """Сохранение точек паттерна Бабочка"""
-        self.points = []
-
-        self.points.append(
-            PatternPoint(
-                index=x['index'],
-                timestamp=timestamps[x['index']],
-                price=x['price'],
-                point_type='X'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=a['index'],
-                timestamp=timestamps[a['index']],
-                price=a['price'],
-                point_type='A'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=b['index'],
-                timestamp=timestamps[b['index']],
-                price=b['price'],
-                point_type='B'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=c['index'],
-                timestamp=timestamps[c['index']],
-                price=c['price'],
-                point_type='C'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=d['index'],
-                timestamp=timestamps[d['index']],
-                price=d['price'],
-                point_type='D'
-            )
-        )
-
-        self.point_x = self.points[0]
-        self.point_a = self.points[1]
-        self.point_b = self.points[2]
-        self.point_c = self.points[3]
-        self.point_d = self.points[4]
-
-        if self.direction == PatternDirection.BULLISH:
-            self.xa_price_diff = self.point_a.price - self.point_x.price
-            self.ab_retracement = (self.point_a.price - self.point_b.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_c.price - self.point_b.price) / (self.point_a.price - self.point_b.price)
-            self.cd_extension = (self.point_d.price - self.point_c.price) / (self.point_c.price - self.point_b.price)
-        else:
-            self.xa_price_diff = self.point_x.price - self.point_a.price
-            self.ab_retracement = (self.point_b.price - self.point_a.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_b.price - self.point_c.price) / (self.point_b.price - self.point_a.price)
-            self.cd_extension = (self.point_c.price - self.point_d.price) / (self.point_b.price - self.point_c.price)
-
-    def calculate_quality(self) -> float:
-        if not self._is_detected:
+    def _calculate_harmonic_quality(self,
+                                   actual_ratios: Dict[str, float],
+                                   ideal_ratios: Dict[str, float]) -> float:
+        """Расчет качества гармонического паттерна"""
+        if not actual_ratios:
             return 0.0
 
-        scores = []
+        total_error = 0.0
+        count = 0
 
-        # 1. Соотношение AB (0.786)
-        if self.ab_retracement is not None:
-            ab_score = 1 - min(abs(self.ab_retracement - 0.786) / 0.1, 1.0)
-            scores.append(ab_score)
+        for ratio_key, ideal_value in ideal_ratios.items():
+            if ratio_key in actual_ratios:
+                actual_value = actual_ratios[ratio_key]
+                if actual_value > 0:
+                    error = abs(actual_value - ideal_value) / ideal_value
+                    total_error += error
+                    count += 1
 
-        # 2. Соотношение CD (1.618 или 2.24)
-        if self.cd_extension is not None:
-            cd_score_1618 = 1 - min(abs(self.cd_extension - 1.618) / 0.15, 1.0)
-            cd_score_224 = 1 - min(abs(self.cd_extension - 2.24) / 0.15, 1.0)
-            cd_score = max(cd_score_1618, cd_score_224)
-            scores.append(cd_score)
-
-        # 3. Расширение XD (1.27)
-        if self.point_x and self.point_d:
-            xd_diff = abs(self.point_d.price - self.point_x.price)
-            xa_diff = abs(self.point_a.price - self.point_x.price)
-
-            if xa_diff > 0:
-                xd_extension = xd_diff / xa_diff
-                xd_score = 1 - min(abs(xd_extension - 1.27) / 0.1, 1.0)
-                scores.append(xd_score)
-
-        return np.mean(scores) if scores else 0.0
-
-    def calculate_targets(self, current_price: float):
-        if not self._is_detected or len(self.points) < 5:
-            return super().calculate_targets(current_price)
-
-        # Для паттерна Бабочка
-        if self.direction == PatternDirection.BULLISH:
-            # Бычья Бабочка: точка D - зона покупки
-            entry_price = current_price
-            stop_loss = self.point_d.price * 0.99
-
-            # Цели: 0.382 и 0.618 от XA
-            target1 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.382
-            target2 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.618
-
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
-
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = self.point_d.price + (self.point_a.price - self.point_x.price)
-
-        else:  # BEARISH
-            # Медвежья Бабочка: точка D - зона продажи
-            entry_price = current_price
-            stop_loss = self.point_d.price * 1.01
-
-            target1 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.382
-            target2 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.618
-
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
-
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = self.point_d.price - (self.point_x.price - self.point_a.price)
-
-        # Риск/прибыль
-        if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-            risk = abs(self.targets.entry_price - self.targets.stop_loss)
-            reward = abs(self.targets.take_profit - self.targets.entry_price)
-            self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
-
-        return self.targets
-
-
-@dataclass
-class BatPattern(HarmonicPattern):
-    """Паттерн Bat (Летучая мышь)"""
-
-    def __init__(self):
-        super().__init__("Bat Pattern", "BAT")
-        self.pattern_variants = ['bullish', 'bearish']
-        self.required_points = 5  # X, A, B, C, D
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        swing_highs, swing_lows = self._find_swing_points(highs, lows, min_distance=6)
-
-        if len(swing_highs) < 3 or len(swing_lows) < 2:
-            return False
-
-        all_points = swing_highs + swing_lows
-        all_points.sort(key=lambda x: x['index'])
-
-        for i in range(len(all_points) - 4):
-            point_x = all_points[i]
-            point_a = all_points[i + 1]
-            point_b = all_points[i + 2]
-            point_c = all_points[i + 3]
-            point_d = all_points[i + 4]
-
-            types = [p['type'] for p in [point_x, point_a, point_b, point_c, point_d]]
-            for j in range(len(types) - 1):
-                if types[j] == types[j + 1]:
-                    break
-            else:
-                if self._check_bat_ratios(point_x, point_a, point_b, point_c, point_d):
-                    self._save_bat_points(point_x, point_a, point_b,
-                                          point_c, point_d, timestamps)
-                    self._is_detected = True
-
-                    if point_x['type'] == 'low':
-                        self.direction = PatternDirection.BULLISH
-                    else:
-                        self.direction = PatternDirection.BEARISH
-
-                    return True
-
-        return False
-
-    def _check_bat_ratios(self, x, a, b, c, d) -> bool:
-        """Проверка фибо соотношений для паттерна Bat"""
-        is_bullish = x['type'] == 'low'
-
-        if is_bullish:
-            # AB откат: должен быть 0.382-0.5 от XA
-            xa_diff = a['price'] - x['price']
-            ab_diff = a['price'] - b['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            # BC откат: должен быть 0.382-0.886 от AB
-            bc_diff = c['price'] - b['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            # CD расширение: должно быть 1.618-2.618 от BC
-            cd_diff = d['price'] - c['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            # XD расширение: должно быть 0.886 от XA
-            xd_diff = d['price'] - x['price']
-            xd_extension = xd_diff / xa_diff
-
-            ab_ok = (self._is_fib_level_match(ab_retracement, 0.382, 0.05) or
-                     self._is_fib_level_match(ab_retracement, 0.5, 0.05))
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = (self._is_fib_level_match(cd_extension, 1.618, 0.15) or
-                     self._is_fib_level_match(cd_extension, 2.618, 0.15))
-            xd_ok = self._is_fib_level_match(xd_extension, 0.886, 0.05)
-
-            return ab_ok and bc_ok and cd_ok and xd_ok
-
-        else:  # Медвежий
-            xa_diff = x['price'] - a['price']
-            ab_diff = b['price'] - a['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            bc_diff = b['price'] - c['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            cd_diff = c['price'] - d['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            xd_diff = x['price'] - d['price']
-            xd_extension = xd_diff / xa_diff
-
-            ab_ok = (self._is_fib_level_match(ab_retracement, 0.382, 0.05) or
-                     self._is_fib_level_match(ab_retracement, 0.5, 0.05))
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = (self._is_fib_level_match(cd_extension, 1.618, 0.15) or
-                     self._is_fib_level_match(cd_extension, 2.618, 0.15))
-            xd_ok = self._is_fib_level_match(xd_extension, 0.886, 0.05)
-
-            return ab_ok and bc_ok and cd_ok and xd_ok
-
-    def _save_bat_points(self, x, a, b, c, d, timestamps):
-        """Сохранение точек паттерна Bat"""
-        self.points = []
-
-        self.points.append(
-            PatternPoint(
-                index=x['index'],
-                timestamp=timestamps[x['index']],
-                price=x['price'],
-                point_type='X'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=a['index'],
-                timestamp=timestamps[a['index']],
-                price=a['price'],
-                point_type='A'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=b['index'],
-                timestamp=timestamps[b['index']],
-                price=b['price'],
-                point_type='B'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=c['index'],
-                timestamp=timestamps[c['index']],
-                price=c['price'],
-                point_type='C'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=d['index'],
-                timestamp=timestamps[d['index']],
-                price=d['price'],
-                point_type='D'
-            )
-        )
-
-        self.point_x = self.points[0]
-        self.point_a = self.points[1]
-        self.point_b = self.points[2]
-        self.point_c = self.points[3]
-        self.point_d = self.points[4]
-
-        if self.direction == PatternDirection.BULLISH:
-            self.xa_price_diff = self.point_a.price - self.point_x.price
-            self.ab_retracement = (self.point_a.price - self.point_b.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_c.price - self.point_b.price) / (self.point_a.price - self.point_b.price)
-            self.cd_extension = (self.point_d.price - self.point_c.price) / (self.point_c.price - self.point_b.price)
-            self.xd_extension = (self.point_d.price - self.point_x.price) / self.xa_price_diff
-        else:
-            self.xa_price_diff = self.point_x.price - self.point_a.price
-            self.ab_retracement = (self.point_b.price - self.point_a.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_b.price - self.point_c.price) / (self.point_b.price - self.point_a.price)
-            self.cd_extension = (self.point_c.price - self.point_d.price) / (self.point_b.price - self.point_c.price)
-            self.xd_extension = (self.point_x.price - self.point_d.price) / self.xa_price_diff
-
-    def calculate_quality(self) -> float:
-        if not self._is_detected:
+        if count == 0:
             return 0.0
 
-        scores = []
+        avg_error = total_error / count
+        quality = 1.0 - min(1.0, avg_error / self.fib_tolerance)
 
-        # 1. Соотношение XD (0.886)
-        if self.xd_extension is not None:
-            xd_score = 1 - min(abs(self.xd_extension - 0.886) / 0.05, 1.0)
-            scores.append(xd_score)
+        return quality
 
-        # 2. Соотношение AB (0.382 или 0.5)
-        if self.ab_retracement is not None:
-            ab_score_382 = 1 - min(abs(self.ab_retracement - 0.382) / 0.05, 1.0)
-            ab_score_5 = 1 - min(abs(self.ab_retracement - 0.5) / 0.05, 1.0)
-            ab_score = max(ab_score_382, ab_score_5)
-            scores.append(ab_score)
+    def _determine_harmonic_direction(self, points: List[ExtremePoint]) -> str:
+        """Определение направления гармонического паттерна"""
+        # Паттерн считается бычьим, если D ниже C для покупки
+        # или медвежьим, если D выше C для продажи
 
-        # 3. Соотношение CD (1.618 или 2.618)
-        if self.cd_extension is not None:
-            cd_score_1618 = 1 - min(abs(self.cd_extension - 1.618) / 0.15, 1.0)
-            cd_score_2618 = 1 - min(abs(self.cd_extension - 2.618) / 0.15, 1.0)
-            cd_score = max(cd_score_1618, cd_score_2618)
-            scores.append(cd_score)
+        # Но в гармонических паттернах направление определяется по XA движению
+        X = points[0].price
+        A = points[1].price
+        D = points[4].price
 
-        return np.mean(scores) if scores else 0.0
+        if A > X:  # Бычье движение XA
+            # Для бычьих паттернов (Gartley, Butterfly, Crab)
+            # D должна быть ниже C для покупки
+            return 'bullish'
+        else:  # Медвежье движение XA
+            # Для медвежьих паттернов
+            # D должна быть выше C для продажи
+            return 'bearish'
 
-    def calculate_targets(self, current_price: float):
-        if not self._is_detected or len(self.points) < 5:
-            return super().calculate_targets(current_price)
+    def _calculate_harmonic_targets(self,
+                                   points: List[ExtremePoint],
+                                   pattern_name: str,
+                                   direction: str) -> Dict[str, float]:
+        """Расчет целевых уровней для гармонического паттерна"""
+        X = points[0].price
+        A = points[1].price
+        B = points[2].price
+        C = points[3].price
+        D = points[4].price
 
-        # Для паттерна Bat
-        if self.direction == PatternDirection.BULLISH:
-            entry_price = current_price
-            stop_loss = self.point_d.price * 0.99
+        # Вычисляем соотношения
+        XA = abs(A - X)
+        AB = abs(B - A)
+        BC = abs(C - B)
 
-            # Цели: 0.382, 0.618, 0.786 от XA
-            target1 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.382
-            target2 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.618
-            target3 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.786
+        # Определяем точку входа (D)
+        entry_price = D
 
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
-
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = target3
-
-        else:  # BEARISH
-            entry_price = current_price
-            stop_loss = self.point_d.price * 1.01
-
-            target1 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.382
-            target2 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.618
-            target3 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.786
-
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
-
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = target3
-
-        # Риск/прибыль
-        if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-            risk = abs(self.targets.entry_price - self.targets.stop_loss)
-            reward = abs(self.targets.take_profit - self.targets.entry_price)
-            self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
-
-        return self.targets
-
-
-@dataclass
-class CrabPattern(HarmonicPattern):
-    """Паттерн Crab (Краб)"""
-
-    def __init__(self):
-        super().__init__("Crab Pattern", "CRAB")
-        self.pattern_variants = ['bullish', 'bearish']
-        self.required_points = 5  # X, A, B, C, D
-
-    def detect(self, data, highs, lows, closes, volumes, timestamps, **kwargs) -> bool:
-        swing_highs, swing_lows = self._find_swing_points(highs, lows, min_distance=8)
-
-        if len(swing_highs) < 3 or len(swing_lows) < 2:
-            return False
-
-        all_points = swing_highs + swing_lows
-        all_points.sort(key=lambda x: x['index'])
-
-        for i in range(len(all_points) - 4):
-            point_x = all_points[i]
-            point_a = all_points[i + 1]
-            point_b = all_points[i + 2]
-            point_c = all_points[i + 3]
-            point_d = all_points[i + 4]
-
-            types = [p['type'] for p in [point_x, point_a, point_b, point_c, point_d]]
-            for j in range(len(types) - 1):
-                if types[j] == types[j + 1]:
-                    break
-            else:
-                if self._check_crab_ratios(point_x, point_a, point_b, point_c, point_d):
-                    self._save_crab_points(point_x, point_a, point_b,
-                                           point_c, point_d, timestamps)
-                    self._is_detected = True
-
-                    if point_x['type'] == 'low':
-                        self.direction = PatternDirection.BULLISH
-                    else:
-                        self.direction = PatternDirection.BEARISH
-
-                    return True
-
-        return False
-
-    def _check_crab_ratios(self, x, a, b, c, d) -> bool:
-        """Проверка фибо соотношений для паттерна Crab"""
-        is_bullish = x['type'] == 'low'
-
-        if is_bullish:
-            # AB откат: должен быть 0.382-0.618 от XA
-            xa_diff = a['price'] - x['price']
-            ab_diff = a['price'] - b['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            # BC откат: должен быть 0.382-0.886 от AB
-            bc_diff = c['price'] - b['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            # CD расширение: должно быть 2.618-3.618 от BC
-            cd_diff = d['price'] - c['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            # XD расширение: должно быть 1.618 от XA
-            xd_diff = d['price'] - x['price']
-            xd_extension = xd_diff / xa_diff
-
-            ab_ok = (self._is_fib_level_match(ab_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(ab_retracement, 0.618, 0.1))
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = (self._is_fib_level_match(cd_extension, 2.618, 0.2) or
-                     self._is_fib_level_match(cd_extension, 3.618, 0.2))
-            xd_ok = self._is_fib_level_match(xd_extension, 1.618, 0.1)
-
-            return ab_ok and bc_ok and cd_ok and xd_ok
-
-        else:  # Медвежий
-            xa_diff = x['price'] - a['price']
-            ab_diff = b['price'] - a['price']
-
-            if xa_diff == 0:
-                return False
-
-            ab_retracement = ab_diff / xa_diff
-
-            bc_diff = b['price'] - c['price']
-            if ab_diff == 0:
-                return False
-            bc_retracement = bc_diff / ab_diff
-
-            cd_diff = c['price'] - d['price']
-            if bc_diff == 0:
-                return False
-            cd_extension = cd_diff / bc_diff
-
-            xd_diff = x['price'] - d['price']
-            xd_extension = xd_diff / xa_diff
-
-            ab_ok = (self._is_fib_level_match(ab_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(ab_retracement, 0.618, 0.1))
-            bc_ok = (self._is_fib_level_match(bc_retracement, 0.382, 0.1) or
-                     self._is_fib_level_match(bc_retracement, 0.886, 0.1))
-            cd_ok = (self._is_fib_level_match(cd_extension, 2.618, 0.2) or
-                     self._is_fib_level_match(cd_extension, 3.618, 0.2))
-            xd_ok = self._is_fib_level_match(xd_extension, 1.618, 0.1)
-
-            return ab_ok and bc_ok and cd_ok and xd_ok
-
-    def _save_crab_points(self, x, a, b, c, d, timestamps):
-        """Сохранение точек паттерна Crab"""
-        self.points = []
-
-        self.points.append(
-            PatternPoint(
-                index=x['index'],
-                timestamp=timestamps[x['index']],
-                price=x['price'],
-                point_type='X'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=a['index'],
-                timestamp=timestamps[a['index']],
-                price=a['price'],
-                point_type='A'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=b['index'],
-                timestamp=timestamps[b['index']],
-                price=b['price'],
-                point_type='B'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=c['index'],
-                timestamp=timestamps[c['index']],
-                price=c['price'],
-                point_type='C'
-            )
-        )
-
-        self.points.append(
-            PatternPoint(
-                index=d['index'],
-                timestamp=timestamps[d['index']],
-                price=d['price'],
-                point_type='D'
-            )
-        )
-
-        self.point_x = self.points[0]
-        self.point_a = self.points[1]
-        self.point_b = self.points[2]
-        self.point_c = self.points[3]
-        self.point_d = self.points[4]
-
-        if self.direction == PatternDirection.BULLISH:
-            self.xa_price_diff = self.point_a.price - self.point_x.price
-            self.ab_retracement = (self.point_a.price - self.point_b.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_c.price - self.point_b.price) / (self.point_a.price - self.point_b.price)
-            self.cd_extension = (self.point_d.price - self.point_c.price) / (self.point_c.price - self.point_b.price)
-            self.xd_extension = (self.point_d.price - self.point_x.price) / self.xa_price_diff
+        # Стоп-лосс зависит от паттерна
+        if pattern_name in ['gartley', 'bat']:
+            stop_loss = X * 1.01 if direction == 'bearish' else X * 0.99
+        elif pattern_name == 'butterfly':
+            stop_loss = A * 1.01 if direction == 'bearish' else A * 0.99
+        elif pattern_name == 'crab':
+            stop_loss = (X + (A - X) * 1.618) * 1.01 if direction == 'bearish' else (X - (X - A) * 1.618) * 0.99
         else:
-            self.xa_price_diff = self.point_x.price - self.point_a.price
-            self.ab_retracement = (self.point_b.price - self.point_a.price) / self.xa_price_diff
-            self.bc_retracement = (self.point_b.price - self.point_c.price) / (self.point_b.price - self.point_a.price)
-            self.cd_extension = (self.point_c.price - self.point_d.price) / (self.point_b.price - self.point_c.price)
-            self.xd_extension = (self.point_x.price - self.point_d.price) / self.xa_price_diff
+            stop_loss = C * 1.01 if direction == 'bearish' else C * 0.99
 
-    def calculate_quality(self) -> float:
-        if not self._is_detected:
-            return 0.0
+        # Тейк-профит (обычно 61.8% от CD)
+        if direction == 'bullish':
+            take_profit = entry_price + abs(D - C) * 0.618
+        else:
+            take_profit = entry_price - abs(D - C) * 0.618
 
-        scores = []
+        return {
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'XA_length': XA,
+            'AB_length': AB,
+            'BC_length': BC,
+            'pattern_type': pattern_name
+        }
 
-        # 1. Соотношение XD (1.618)
-        if self.xd_extension is not None:
-            xd_score = 1 - min(abs(self.xd_extension - 1.618) / 0.1, 1.0)
-            scores.append(xd_score)
+    def _filter_results(self, results: List[PatternResult]) -> List[PatternResult]:
+        """Фильтрация результатов"""
+        if not results:
+            return []
 
-        # 2. Соотношение CD (2.618 или 3.618)
-        if self.cd_extension is not None:
-            cd_score_2618 = 1 - min(abs(self.cd_extension - 2.618) / 0.2, 1.0)
-            cd_score_3618 = 1 - min(abs(self.cd_extension - 3.618) / 0.2, 1.0)
-            cd_score = max(cd_score_2618, cd_score_3618)
-            scores.append(cd_score)
+        # 1. Фильтрация по качеству
+        filtered = [r for r in results if r.quality >= config.DETECTION.MIN_PATTERN_QUALITY]
 
-        # 3. Общая симметрия
-        if len(self.points) == 5:
-            # Время между XA и CD должно быть примерно равным
-            time_xa = (self.point_a.timestamp - self.point_x.timestamp).total_seconds()
-            time_cd = (self.point_d.timestamp - self.point_c.timestamp).total_seconds()
+        # 2. Фильтрация по уверенности
+        filtered = [r for r in filtered if r.confidence >= config.DETECTION.CONFIDENCE_THRESHOLD]
 
-            if time_xa > 0 and time_cd > 0:
-                time_ratio = min(time_xa, time_cd) / max(time_xa, time_cd)
-                scores.append(time_ratio)
+        # 3. Удаление дубликатов (похожие паттерны на одних и тех же точках)
+        filtered.sort(key=lambda x: x.quality * x.confidence, reverse=True)
 
-        return np.mean(scores) if scores else 0.0
+        used_points = set()
+        unique_results = []
 
-    def calculate_targets(self, current_price: float):
-        if not self._is_detected or len(self.points) < 5:
-            return super().calculate_targets(current_price)
+        for result in filtered:
+            # Создаем ключ на основе индексов точек
+            point_key = tuple(sorted(p.index for p in result.points))
 
-        # Для паттерна Crab
-        if self.direction == PatternDirection.BULLISH:
-            entry_price = current_price
-            stop_loss = self.point_d.price * 0.99
+            if point_key not in used_points:
+                unique_results.append(result)
+                used_points.add(point_key)
 
-            # Цели: 0.382, 0.618, 1.0 от XA
-            target1 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.382
-            target2 = self.point_d.price + (self.point_a.price - self.point_x.price) * 0.618
-            target3 = self.point_d.price + (self.point_a.price - self.point_x.price)
+        return unique_results
 
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
+    def _calculate_fibonacci_levels(self,
+                                   X: float,
+                                   A: float,
+                                   B: float,
+                                   C: float,
+                                   pattern_type: str) -> Tuple[float, Dict[str, float]]:
+        """
+        Расчет уровней Фибоначчи для гармонического паттерна
 
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = target3
+        Args:
+            X, A, B, C: Цены точек
+            pattern_type: Тип паттерна
 
-        else:  # BEARISH
-            entry_price = current_price
-            stop_loss = self.point_d.price * 1.01
+        Returns:
+            (D, fibonacci_levels)
+        """
+        # Вычисляем длины волн
+        XA = abs(A - X)
+        AB = abs(B - A)
+        BC = abs(C - B)
 
-            target1 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.382
-            target2 = self.point_d.price - (self.point_x.price - self.point_a.price) * 0.618
-            target3 = self.point_d.price - (self.point_x.price - self.point_a.price)
+        # Определяем идеальные соотношения для паттерна
+        if pattern_type in self.pattern_definitions:
+            ratios = self.pattern_definitions[pattern_type]
+        else:
+            ratios = self.pattern_definitions['gartley']  # По умолчанию
 
-            self.targets.entry_price = entry_price
-            self.targets.stop_loss = stop_loss
-            self.targets.take_profit = target2
+        # Вычисляем проекцию D
+        AB_ratio = AB / XA if XA != 0 else 0
+        BC_ratio = BC / AB if AB != 0 else 0
 
-            self.targets.target1 = target1
-            self.targets.target2 = target2
-            self.targets.target3 = target3
+        # Определяем направление
+        if A > X:  # Бычье движение XA
+            direction = 1
+        else:  # Медвежье движение XA
+            direction = -1
 
-        # Риск/прибыль
-        if self.targets.entry_price and self.targets.stop_loss and self.targets.take_profit:
-            risk = abs(self.targets.entry_price - self.targets.stop_loss)
-            reward = abs(self.targets.take_profit - self.targets.entry_price)
-            self.targets.profit_risk_ratio = reward / risk if risk > 0 else 0
+        # Рассчитываем D на основе паттерна
+        if 'AD' in ratios:
+            AD_ratio = ratios['AD']
 
-        return self.targets
+            if direction == 1:  # Бычий
+                D = X + AD_ratio * XA
+            else:  # Медвежий
+                D = X - AD_ratio * XA
+        else:
+            # Альтернативный расчет
+            CD_ratio = ratios.get('CD', 1.618)
+            D = C + direction * BC * CD_ratio
+
+        # Вычисляем все соотношения
+        fibonacci_levels = {
+            'AB': AB_ratio,
+            'BC': BC_ratio,
+            'CD': abs(D - C) / BC if BC != 0 else 0,
+            'AD': abs(D - X) / XA if XA != 0 else 0
+        }
+
+        return D, fibonacci_levels
+
+    @property
+    def peak_prominence(self) -> float:
+        """Минимальная значимость экстремума"""
+        return 0.003  # 0.3%
 
