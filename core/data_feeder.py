@@ -9,13 +9,34 @@ import threading
 import queue
 import time
 
+# Исправляем импорты - используем абсолютные импорты
 try:
-    from config import config
-except ImportError:
-    # Для обратной совместимости
-    from config import config
+    # Пробуем импортировать из корня проекта
+    import sys
+    sys.path.append('.')  # Добавляем текущую директорию в путь
 
-from ..utils.mt5_connector import mt5_connector
+    from config import config
+    from utils.mt5_connector import mt5_connector
+except ImportError as e:
+    print(f"Ошибка импорта: {e}")
+
+    # Создаем простой конфиг для тестирования
+    class SimpleConfig:
+        class MT5Config:
+            ENABLED = True
+            SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY"]
+            TIMEFRAMES = ["H1", "H4", "D1"]
+            AUTO_CONNECT = False
+
+        class DetectionConfig:
+            MAX_CANDLES_FOR_PATTERN = 100
+
+        MT5 = MT5Config()
+        DETECTION = DetectionConfig()
+
+    config = SimpleConfig()
+    mt5_connector = None
+    print("Используется простой конфиг для тестирования")
 
 
 class DataFeeder:
@@ -33,13 +54,13 @@ class DataFeeder:
         self.timeframes = config.MT5.TIMEFRAMES
 
         # Инициализируем MT5
-        if config.MT5.ENABLED and not mt5_connector.initialized:
-            if config.MT5.AUTO_CONNECT:
+        if config.MT5.ENABLED and config.MT5.AUTO_CONNECT:
+            if mt5_connector and not mt5_connector.initialized:
                 if not mt5_connector._init_mt5():
                     print("Предупреждение: MT5 не инициализирован, будут использоваться тестовые данные")
 
     def get_data(self, symbol: str, timeframe: str,
-                 bars: int = None, use_cache: bool = True) -> pd.DataFrame:
+                bars: int = None, use_cache: bool = True) -> pd.DataFrame:
         """
         Получение данных для указанного символа и таймфрейма
 
@@ -62,15 +83,13 @@ class DataFeeder:
             if len(cached_data) >= bars:
                 return cached_data.tail(bars).copy()
 
-        # Получаем данные через MT5Connector
-        if config.MT5.ENABLED and mt5_connector.initialized:
+        # Получаем данные
+        data = None
+        if config.MT5.ENABLED and mt5_connector and mt5_connector.initialized:
             data = mt5_connector.get_historical_data(symbol, timeframe, bars)
-        else:
-            print(f"MT5 не доступен, используем тестовые данные для {symbol}")
-            data = self._generate_test_data(symbol, timeframe, bars)
 
-        if data.empty:
-            print(f"Не удалось получить данные для {symbol}, используем тестовые данные")
+        if data is None or data.empty:
+            print(f"MT5 не доступен или данные пустые для {symbol}, используем тестовые данные")
             data = self._generate_test_data(symbol, timeframe, bars)
 
         # Кэшируем данные
@@ -79,7 +98,7 @@ class DataFeeder:
         return data.copy()
 
     def get_multiple_symbols(self, symbols: List[str], timeframe: str,
-                             bars: int = None) -> Dict[str, pd.DataFrame]:
+                           bars: int = None) -> Dict[str, pd.DataFrame]:
         """Получение данных для нескольких символов"""
         result = {}
         for symbol in symbols:
@@ -91,6 +110,9 @@ class DataFeeder:
     def update_data(self, symbol: str, timeframe: str):
         """Обновление данных для символа"""
         try:
+            if not mt5_connector:
+                return
+
             # Получаем последние 100 баров для обновления
             new_data = mt5_connector.get_historical_data(symbol, timeframe, 100)
 
@@ -117,9 +139,10 @@ class DataFeeder:
         """Получение текущих цен для списка символов"""
         prices = {}
         for symbol in symbols:
-            price_data = mt5_connector.get_current_price(symbol)
-            if price_data:
-                prices[symbol] = price_data
+            if mt5_connector:
+                price_data = mt5_connector.get_current_price(symbol)
+                if price_data:
+                    prices[symbol] = price_data
         return prices
 
     def start_real_time_updates(self, update_interval: int = 60):

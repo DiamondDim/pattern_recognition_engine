@@ -1,57 +1,23 @@
-# Core dependencies
-numpy>=1.21.0
-pandas>=1.3.0
-scipy>=1.7.0
-scikit-learn>=1.0.0
-matplotlib>=3.4.0
-plotly>=5.3.0
-
-# Web & API
-fastapi>=0.68.0
-uvicorn[standard]>=0.15.0
-websockets>=10.0
-python-socketio>=5.0.0
-
-# Database
-SQLAlchemy>=1.4.0
-alembic>=1.7.0
-psycopg2-binary>=2.9.0
-redis>=4.0.0
-
-# Monitoring & Logging
-prometheus-client>=0.12.0
-structlog>=21.0.0
-colorlog>=6.0.0
-
-# Configuration
-pyyaml>=6.0
-python-dotenv>=0.19.0
-
-# Trading & Finance
-MetaTrader5>=5.0.0
-ta-lib>=0.4.0
-
-# Performance
-numba>=0.54.0
-joblib>=1.1.0
-
-# Utilities
-tqdm>=4.62.0
-pydantic>=1.8.0
-python-multipart>=0.0.5
-email-validator>=1.1.0
-
-# Development (optional)
-pytest>=6.0
-pytest-cov>=2.0
-black>=21.0
-flake8>=3.9
-mypy>=0.900
-pre-commit>=2.0
-
-# ML Extensions (optional)
-tensorflow>=2.6.0
-torch>=1.9.0
-xgboost>=1.5.0
-lightgbm>=3.3.0
+# requirements.txt
+python-dotenv>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+MetaTrader5>=5.0.40
+plotly>=5.14.0
+seaborn>=0.12.0
+PyQt5>=5.15.0
+PyQt5-sip>=12.11.0
+sqlalchemy>=2.0.0
+dataset>=1.6.0
+websockets>=11.0.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+colorlog>=6.7.0
+tqdm>=4.65.0
+python-dateutil>=2.8.0
+pytz>=2023.0
+pyyaml>=6.0.0
 

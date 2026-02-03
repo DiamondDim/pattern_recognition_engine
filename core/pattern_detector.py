@@ -7,11 +7,24 @@ import numpy as np
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 
+# Исправляем импорт для обратной совместимости
 try:
-    from config import config
+    from config import config, DETECTION_CONFIG, DETECTION
 except ImportError:
-    # Для обратной совместимости
-    from config import config
+    try:
+        # Пробуем разные варианты
+        from config import DETECTION_CONFIG as DETECTION
+    except ImportError:
+        # Создаем fallback конфиг
+        DETECTION = type('DetectionConfig', (), {
+            'MIN_CANDLES_FOR_PATTERN': 5,
+            'MAX_CANDLES_FOR_PATTERN': 100,
+            'MAX_PATTERNS_PER_SYMBOL': 50,
+            'MIN_PATTERN_QUALITY': 0.6,
+            'ENABLE_CANDLESTICK': True,
+            'ENABLE_GEOMETRIC': True,
+            'ENABLE_HARMONIC': True
+        })()
 
 
 class PatternDetector:

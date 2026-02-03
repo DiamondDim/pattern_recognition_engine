@@ -11,6 +11,7 @@ from .statistics import calculate_statistics, StatisticsCalculator
 from .ml_models import MLModel, PatternClassifier
 from .pattern_analyzer import PatternAnalyzer  # Дублируем импорт для обратной совместимости
 
+# Определяем все экспортируемые классы
 __all__ = [
     'DataFeeder',
     'PatternDetector',

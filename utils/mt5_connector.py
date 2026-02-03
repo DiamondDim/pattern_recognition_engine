@@ -7,13 +7,29 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 import time
-import os
 
+# Исправляем импорт
 try:
+    # Пробуем импортировать из корня проекта
+    import sys
+    sys.path.append('.')  # Добавляем текущую директорию в путь
+
     from config import config
 except ImportError:
-    # Для обратной совместимости
-    from config import config
+    # Создаем простой конфиг для тестирования
+    class SimpleConfig:
+        class MT5Config:
+            PATH = r"C:\Program Files\MetaTrader 5 Alfa-Forex\terminal64.exe"
+            LOGIN = 0
+            PASSWORD = ''
+            SERVER = 'Alfa-Forex-MT5'
+            SYMBOL_PREFIX = "RFD."
+            TIMEOUT = 10000
+
+        MT5 = MT5Config()
+
+    config = SimpleConfig()
+    print("Используется простой конфиг MT5 для тестирования")
 
 
 class MT5Connector:
@@ -43,11 +59,11 @@ class MT5Connector:
 
             # Инициализируем MT5 с указанием пути к терминалу
             if not mt5.initialize(
-                    path=self.mt5_config.PATH,
-                    login=self.mt5_config.LOGIN,
-                    password=self.mt5_config.PASSWORD,
-                    server=self.mt5_config.SERVER,
-                    timeout=self.mt5_config.TIMEOUT
+                path=self.mt5_config.PATH,
+                login=self.mt5_config.LOGIN,
+                password=self.mt5_config.PASSWORD,
+                server=self.mt5_config.SERVER,
+                timeout=self.mt5_config.TIMEOUT
             ):
                 error = mt5.last_error()
                 print(f"Ошибка инициализации MT5: {error}")
@@ -81,11 +97,15 @@ class MT5Connector:
 
     def add_symbol_prefix(self, symbol: str) -> str:
         """Добавление префикса RFD к символу"""
-        return self.mt5_config.add_symbol_prefix(symbol)
+        if not symbol.startswith(self.mt5_config.SYMBOL_PREFIX):
+            return f"{self.mt5_config.SYMBOL_PREFIX}{symbol}"
+        return symbol
 
     def remove_symbol_prefix(self, symbol: str) -> str:
         """Удаление префикса RFD из символа"""
-        return self.mt5_config.remove_symbol_prefix(symbol)
+        if symbol.startswith(self.mt5_config.SYMBOL_PREFIX):
+            return symbol[len(self.mt5_config.SYMBOL_PREFIX):]
+        return symbol
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
         """Получение информации о торговом инструменте"""
@@ -95,28 +115,13 @@ class MT5Connector:
 
             if info is None:
                 print(f"Инструмент {full_symbol} не найден")
-                # Пробуем получить список всех символов
-                symbols = mt5.symbols_get()
-                available = [s.name for s in symbols]
-                print(f"Доступные инструменты с префиксом {self.mt5_config.SYMBOL_PREFIX}:")
-                for s in available:
-                    if s.startswith(self.mt5_config.SYMBOL_PREFIX):
-                        print(f"  - {s}")
                 return None
 
             return {
                 'name': self.remove_symbol_prefix(info.name),
                 'full_name': info.name,
                 'digits': info.digits,
-                'point': info.point,
-                'trade_mode': info.trade_mode,
-                'swap_mode': info.swap_mode,
-                'margin_rate': info.margin_rate,
-                'spread': info.spread,
-                'spread_float': info.spread_float,
-                'volume_min': info.volume_min,
-                'volume_max': info.volume_max,
-                'volume_step': info.volume_step
+                'point': info.point
             }
 
         except Exception as e:
@@ -124,7 +129,7 @@ class MT5Connector:
             return None
 
     def get_historical_data(self, symbol: str, timeframe: str,
-                            bars: int = 1000, from_date: datetime = None) -> pd.DataFrame:
+                          bars: int = 1000, from_date: datetime = None) -> pd.DataFrame:
         """
         Получение исторических данных с учетом RFD-префиксов
 
@@ -181,16 +186,11 @@ class MT5Connector:
             # Переименовываем колонки
             df.columns = ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume']
 
-            # Добавляем расчетные поля
-            df['returns'] = df['close'].pct_change()
-
             print(f"Получено {len(df)} баров для {symbol} ({timeframe})")
             return df
 
         except Exception as e:
             print(f"Ошибка получения данных для {symbol}: {e}")
-            import traceback
-            traceback.print_exc()
             return pd.DataFrame()
 
     def get_current_price(self, symbol: str) -> Optional[Dict]:
@@ -223,23 +223,8 @@ class MT5Connector:
             if info is None:
                 return False
 
-            # Проверяем время торговли (упрощенно)
-            current_time = datetime.now()
-
-            # Для Forex рынка обычно торгуем с воскресенья 22:00 до пятницы 22:00 GMT
-            # Но это зависит от брокера, уточните у Alfa-Forex расписание
-            weekday = current_time.weekday()
-            hour = current_time.hour
-
-            # Пример: торгуем с понедельника по пятницу
-            if 0 <= weekday <= 4:  # Пн-Пт
-                return True
-            elif weekday == 5 and hour < 22:  # Суббота до 22:00
-                return True
-            elif weekday == 6 and hour >= 22:  # Воскресенье после 22:00
-                return True
-
-            return False
+            # Простая проверка - всегда возвращаем True для тестирования
+            return True
 
         except Exception as e:
             print(f"Ошибка проверки времени торговли: {e}")

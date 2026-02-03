@@ -8,21 +8,38 @@ import time
 from datetime import datetime
 import pandas as pd
 
-# Импорты ядра
-from core.data_feeder import DataFeeder
-from core.pattern_detector import PatternDetector
-from core.pattern_database import PatternDatabase
+# Импорты ядра - исправляем импорты
+try:
+    from core.data_feeder import DataFeeder
+    from core.pattern_detector import PatternDetector
+    from core.pattern_database import PatternDatabase
+except ImportError as e:
+    print(f"Ошибка импорта core модулей: {e}")
+    sys.exit(1)
 
 # Импорты утилит
-from utils.logger import setup_logger
-from utils.visualization import plot_patterns
+try:
+    from utils.logger import setup_logger
+    from utils.visualization import plot_patterns
+except ImportError as e:
+    print(f"Ошибка импорта utils модулей: {e}")
+
+    # Создаем заглушки
+    def setup_logger(name):
+        import logging
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        return logger
+
+    def plot_patterns(*args, **kwargs):
+        print("Визуализация отключена")
 
 # Импорт конфигурации
 try:
     from config import config
-except ImportError:
-    # Для обратной совместимости
-    from config import config
+except ImportError as e:
+    print(f"Ошибка импорта конфигурации: {e}")
+    sys.exit(1)
 
 logger = setup_logger(__name__)
 
@@ -99,7 +116,6 @@ def run_detection_mode(args):
         # Получение данных
         print(f"\nПолучение данных для {args.symbol}...")
 
-        # Используем настройки из config
         data = feeder.get_data(
             symbol=args.symbol,
             timeframe=args.timeframe,
@@ -154,7 +170,7 @@ def run_detection_mode(args):
                     print(f"   Ошибка сохранения в БД: {e}")
 
             # Визуализация
-            if args.plot and config.VISUALIZATION.ENABLE_PLOTTING:
+            if args.plot:
                 print("\nГенерация графика...")
                 plot_patterns(data, patterns, args.symbol, args.timeframe)
 
@@ -168,8 +184,9 @@ def run_detection_mode(args):
             print(f"{key}: {value}")
 
     except Exception as e:
-        logger.error(f"Ошибка в режиме детекции: {e}", exc_info=True)
-        print(f"Ошибка: {e}")
+        print(f"Ошибка в режиме детекции: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         if hasattr(feeder, 'clear_cache'):
@@ -181,7 +198,6 @@ def run_backtest_mode(args):
     """Режим тестирования стратегии"""
     print("=== BACKTESTING MODE ===")
     print(f"В разработке...")
-    # TODO: Реализовать backtesting с учетом RFD-инструментов
 
 
 def run_gui_mode():
