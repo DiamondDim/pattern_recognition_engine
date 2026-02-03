@@ -3,10 +3,15 @@
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field, asdict
 import yaml
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения из .env файла
+load_dotenv()
 
 # Базовые пути проекта
 PROJECT_ROOT = Path(__file__).parent.absolute()
@@ -48,19 +53,40 @@ class DatabaseConfig:
 
 @dataclass
 class MT5Config:
-    """Конфигурация подключения к MetaTrader 5"""
+    """Конфигурация подключения к MetaTrader 5 с учетом RFD инструментов Alfa-Forex"""
     ENABLED: bool = True
     AUTO_CONNECT: bool = False
-    PATH: str = "C:/Program Files/MetaTrader 5/terminal64.exe"
-    LOGIN: Optional[int] = None
-    PASSWORD: Optional[str] = None
-    SERVER: Optional[str] = None
+    # Путь к терминалу MT5 от Alfa-Forex
+    PATH: str = r"C:\Program Files\MetaTrader 5 Alfa-Forex\terminal64.exe"
+
+    # Данные для подключения (из .env для безопасности)
+    LOGIN: Optional[int] = field(default_factory=lambda: int(os.getenv('MT5_LOGIN', '0')))
+    PASSWORD: Optional[str] = field(default_factory=lambda: os.getenv('MT5_PASSWORD', ''))
+    SERVER: Optional[str] = field(default_factory=lambda: os.getenv('MT5_SERVER', 'Alfa-Forex-MT5'))
+
+    # Префикс для RFD инструментов
+    SYMBOL_PREFIX: str = "RFD."
+
+    # Основные символы (без префикса, он будет добавляться автоматически)
+    SYMBOLS: List[str] = field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "USDRUB", "EURGBP"])
+    TIMEFRAMES: List[str] = field(default_factory=lambda: ["M1", "M5", "M15", "M30", "H1", "H4", "D1"])
+
     TIMEOUT: int = 10000
-    SYMBOLS: List[str] = field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY"])
-    TIMEFRAMES: List[str] = field(default_factory=lambda: ["M15", "H1", "H4", "D1"])
     INPUT_FILE_PATH: str = str(INPUT_DIR / "mt5_data.csv")
     OUTPUT_FILE_PATH: str = str(OUTPUT_DIR / "patterns.json")
     UPDATE_INTERVAL: int = 60  # секунды
+
+    def add_symbol_prefix(self, symbol: str) -> str:
+        """Добавление префикса RFD к символу"""
+        if not symbol.startswith(self.SYMBOL_PREFIX):
+            return f"{self.SYMBOL_PREFIX}{symbol}"
+        return symbol
+
+    def remove_symbol_prefix(self, symbol: str) -> str:
+        """Удаление префикса RFD из символа"""
+        if symbol.startswith(self.SYMBOL_PREFIX):
+            return symbol[len(self.SYMBOL_PREFIX):]
+        return symbol
 
 @dataclass
 class DetectionConfig:
@@ -190,6 +216,18 @@ class APIConfig:
     WEBSOCKET_PORT: int = 8765
 
 @dataclass
+class RiskManagementConfig:
+    """Конфигурация риск-менеджмента"""
+    MAX_POSITION_SIZE_PERCENT: float = 2.0  # Макс 2% от депозита на сделку
+    MAX_DAILY_LOSS_PERCENT: float = 5.0     # Макс 5% дневного убытка
+    STOP_LOSS_ATR_MULTIPLIER: float = 1.5   # SL = ATR * 1.5
+    TAKE_PROFIT_RATIO: float = 2.0          # TP/SL = 2:1
+    MAX_OPEN_POSITIONS: int = 3            # Макс одновременно открытых позиций
+    ENABLE_TRAILING_STOP: bool = True      # Включить трейлинг-стоп
+    TRAILING_STOP_ACTIVATION: float = 1.0  # Активация трейлинг-стопа при движении в плюс 1%
+    TRAILING_STOP_DISTANCE: float = 0.5    # Дистанция трейлинг-стопа 0.5%
+
+@dataclass
 class CONFIG:
     """Основная конфигурация приложения"""
 
@@ -206,6 +244,7 @@ class CONFIG:
     VISUALIZATION: VisualizationConfig = VisualizationConfig()
     LOGGING: LoggingConfig = LoggingConfig()
     API: APIConfig = APIConfig()
+    RISK_MANAGEMENT: RiskManagementConfig = RiskManagementConfig()
 
     # Производительность
     MAX_WORKERS: int = 4
@@ -294,6 +333,31 @@ class CONFIG:
             if self.LOGGING.METRICS_PORT < 1024 or self.LOGGING.METRICS_PORT > 65535:
                 errors.append(f"Недопустимый порт метрик: {self.LOGGING.METRICS_PORT}")
 
+        # Проверка MT5 конфигурации
+        if self.MT5.ENABLED:
+            # Проверка пути к терминалу
+            mt5_path = Path(self.MT5.PATH)
+            if not mt5_path.exists():
+                errors.append(f"Путь к терминалу MT5 не существует: {self.MT5.PATH}")
+                errors.append("Убедитесь, что MetaTrader 5 Alfa-Forex установлен по указанному пути")
+
+            # Проверка авторизационных данных
+            if self.MT5.LOGIN == 0:
+                errors.append("MT5_LOGIN не установлен. Добавьте в .env файл: MT5_LOGIN=ваш_логин")
+
+            if not self.MT5.PASSWORD:
+                errors.append("MT5_PASSWORD не установлен. Добавьте в .env файл: MT5_PASSWORD=ваш_пароль")
+
+            if not self.MT5.SERVER:
+                errors.append("MT5_SERVER не установлен. Добавьте в .env файл: MT5_SERVER=ваш_сервер")
+
+        # Проверка риск-менеджмента
+        if self.RISK_MANAGEMENT.MAX_POSITION_SIZE_PERCENT <= 0 or self.RISK_MANAGEMENT.MAX_POSITION_SIZE_PERCENT > 100:
+            errors.append(f"Недопустимый MAX_POSITION_SIZE_PERCENT: {self.RISK_MANAGEMENT.MAX_POSITION_SIZE_PERCENT}%")
+
+        if self.RISK_MANAGEMENT.MAX_DAILY_LOSS_PERCENT <= 0 or self.RISK_MANAGEMENT.MAX_DAILY_LOSS_PERCENT > 100:
+            errors.append(f"Недопустимый MAX_DAILY_LOSS_PERCENT: {self.RISK_MANAGEMENT.MAX_DAILY_LOSS_PERCENT}%")
+
         return errors
 
 # Глобальный экземпляр конфигурации
@@ -328,4 +392,26 @@ def create_default_configs():
 # Автоматическое создание конфигов при первом импорте
 if not list(CONFIG_DIR.glob("config_*.yaml")):
     create_default_configs()
+
+# Автоматическая валидация конфигурации при импорте
+if __name__ != "__main__":
+    validation_errors = config.validate()
+    if validation_errors:
+        print("=" * 60)
+        print("КОНФИГУРАЦИОННЫЕ ОШИБКИ:")
+        for error in validation_errors:
+            print(f"  • {error}")
+        print("=" * 60)
+
+        # Для критических ошибок останавливаем запуск
+        critical_errors = [e for e in validation_errors if "MT5" in e or "не установлен" in e]
+        if critical_errors:
+            print("\nКРИТИЧЕСКИЕ ОШИБКИ! Приложение не может быть запущено.")
+            print("Создайте .env файл в корне проекта с содержимым:")
+            print("=" * 40)
+            print("MT5_LOGIN=ваш_логин")
+            print("MT5_PASSWORD=ваш_пароль")
+            print("MT5_SERVER=ваш_сервер")
+            print("=" * 40)
+            sys.exit(1)
 
