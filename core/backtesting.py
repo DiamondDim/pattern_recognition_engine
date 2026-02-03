@@ -1,326 +1,375 @@
-"""
-Модуль для бэктестинга торговых стратегий
-"""
-
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime, timedelta
-from enum import Enum
-from dataclasses import dataclass, field
-import warnings
+from datetime import datetime
+import logging
+from .pattern_detector import PatternDetector
 
-# Исправляем импорты для обратной совместимости
-try:
-    from config import config, BACKTESTING_CONFIG, BACKTEST_CONFIG, TRADING_CONFIG
-except ImportError:
-    # Создаем fallback конфиг
-    class BacktestConfig:
-        INITIAL_BALANCE = 10000.0
-        RISK_PER_TRADE = 0.02
-        COMMISSION = 0.0001
-        SLIPPAGE = 0.0001
-        MAX_HOLDING_PERIOD = 100
-        MIN_TRADES_FOR_VALIDATION = 20
+logger = logging.getLogger(__name__)
 
-    BACKTESTING_CONFIG = BacktestConfig()
-    BACKTEST_CONFIG = BACKTESTING_CONFIG
-    TRADING_CONFIG = BACKTESTING_CONFIG
-    print("Используется fallback конфиг для backtesting")
-
-
-class OrderType(Enum):
-    """Типы ордеров"""
-    MARKET = "market"
-    LIMIT = "limit"
-    STOP = "stop"
-
-
-class OrderDirection(Enum):
-    """Направление ордера"""
-    BUY = "buy"
-    SELL = "sell"
-
-
-@dataclass
-class Order:
-    """Торговый ордер"""
-    order_id: str
-    symbol: str
-    order_type: OrderType
-    direction: OrderDirection
-    quantity: float
-    entry_price: float
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    timestamp: datetime = field(default_factory=datetime.now)
-    exit_price: Optional[float] = None
-    exit_time: Optional[datetime] = None
-    commission: float = 0.0
-    profit_loss: Optional[float] = None
-    closed: bool = False
-
-    def calculate_pnl(self, current_price: float) -> float:
-        """Расчет прибыли/убытка"""
-        if self.closed and self.profit_loss is not None:
-            return self.profit_loss
-
-        if self.direction == OrderDirection.BUY:
-            pnl = (current_price - self.entry_price) * self.quantity
-        else:
-            pnl = (self.entry_price - current_price) * self.quantity
-
-        return pnl - self.commission
-
-
-class BacktestEngine:
-    """Движок для бэктестинга торговых стратегий"""
-
-    def __init__(self, initial_balance: float = 10000.0, commission: float = 0.0001,
-                 slippage: float = 0.0001, risk_per_trade: float = 0.02):
+class Backtester:
+    def __init__(self, data_feeder, pattern_detector: PatternDetector, 
+                 initial_balance: float = 10000.0, commission: float = 0.001):
+        self.data_feeder = data_feeder
+        self.pattern_detector = pattern_detector
         self.initial_balance = initial_balance
-        self.balance = initial_balance
         self.commission = commission
-        self.slippage = slippage
-        self.risk_per_trade = risk_per_trade
-
-        self.orders: List[Order] = []
-        self.closed_orders: List[Order] = []
-        self.portfolio: Dict[str, float] = {}
-
+        self.positions = []
+        self.trades = []
+        self.balance = initial_balance
         self.equity_curve = []
-        self.drawdown_curve = []
-
-        self.current_date = None
-
-    def run_backtest(self, data: pd.DataFrame, strategy, **kwargs) -> Dict[str, Any]:
-        """
-        Запуск бэктеста
-
-        Args:
-            data: DataFrame с историческими данными
-            strategy: Функция стратегии, возвращающая торговые сигналы
-            **kwargs: Дополнительные параметры стратегии
-
-        Returns:
-            Словарь с результатами бэктеста
-        """
-        print(f"Запуск бэктеста на {len(data)} барах")
-
-        # Сбрасываем состояние
-        self.orders = []
-        self.closed_orders = []
-        self.portfolio = {}
-        self.balance = self.initial_balance
-        self.equity_curve = []
-        self.drawdown_curve = []
-
-        # Проходим по каждому бару
-        for idx, row in data.iterrows():
-            self.current_date = idx
-
-            # Закрываем ордера по стоп-лоссам и тейк-профитам
-            self._check_orders(row)
-
-            # Получаем сигналы от стратегии
-            signals = strategy(row, self.portfolio, self.balance, **kwargs)
-
-            # Исполняем сигналы
-            if signals:
-                self._execute_signals(signals, row)
-
-            # Рассчитываем текущий эквити
-            current_equity = self._calculate_equity(row)
-            self.equity_curve.append(current_equity)
-
-            # Рассчитываем просадку
-            if self.equity_curve:
-                peak = max(self.equity_curve)
-                drawdown = (peak - current_equity) / peak if peak > 0 else 0
-                self.drawdown_curve.append(drawdown)
-
-        # Закрываем все открытые ордера по последней цене
-        if len(data) > 0:
-            last_row = data.iloc[-1]
-            for order in self.orders[:]:
-                self._close_order(order, last_row['close'])
-
-        # Генерируем отчет
-        report = self._generate_report(data)
-
-        return report
-
-    def _check_orders(self, current_bar):
-        """Проверка ордеров на срабатывание стоп-лоссов и тейк-профитов"""
-        for order in self.orders[:]:
-            if order.closed:
-                continue
-
-            current_price = current_bar['close']
-
-            # Проверяем стоп-лосс
-            if order.stop_loss is not None:
-                if order.direction == OrderDirection.BUY and current_price <= order.stop_loss:
-                    self._close_order(order, order.stop_loss, reason="stop_loss")
-                    continue
-                elif order.direction == OrderDirection.SELL and current_price >= order.stop_loss:
-                    self._close_order(order, order.stop_loss, reason="stop_loss")
-                    continue
-
-            # Проверяем тейк-профит
-            if order.take_profit is not None:
-                if order.direction == OrderDirection.BUY and current_price >= order.take_profit:
-                    self._close_order(order, order.take_profit, reason="take_profit")
-                    continue
-                elif order.direction == OrderDirection.SELL and current_price <= order.take_profit:
-                    self._close_order(order, order.take_profit, reason="take_profit")
-                    continue
-
-    def _close_order(self, order: Order, exit_price: float, reason: str = "manual"):
-        """Закрытие ордера"""
-        order.exit_price = exit_price
-        order.exit_time = self.current_date
-        order.profit_loss = order.calculate_pnl(exit_price)
-        order.closed = True
-
+        self.current_bar_index = 0
+        
+    def _place_order(self, signal: str, price: float, timestamp: datetime, 
+                    symbol: str, stop_loss: Optional[float] = None, 
+                    take_profit: Optional[float] = None) -> Dict:
+        """Размещение ордера в бэктесте"""
+        if self.balance <= 0:
+            logger.warning("Недостаточно баланса для открытия позиции")
+            return {}
+        
+        # Рассчитываем объем позиции (1% от баланса на сделку)
+        risk_percentage = 0.01
+        position_value = self.balance * risk_percentage
+        volume = position_value / price
+        
+        order = {
+            'timestamp': timestamp,
+            'signal': signal,
+            'price': price,
+            'symbol': symbol,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'volume': volume,
+            'status': 'open',
+            'commission': price * volume * self.commission
+        }
+        
+        # Уменьшаем баланс на комиссию
+        self.balance -= order['commission']
+        
+        # Добавляем в список позиций
+        self.positions.append(order)
+        
+        logger.info(f"Открыта позиция: {signal} {symbol} по цене {price:.5f}, объем: {volume:.2f}")
+        return order
+    
+    def _close_position(self, position_idx: int, close_price: float, 
+                       close_time: datetime, reason: str = "manual") -> Optional[Dict]:
+        """Закрытие позиции"""
+        if position_idx >= len(self.positions) or position_idx < 0:
+            return None
+            
+        position = self.positions[position_idx]
+        
+        if position['status'] != 'open':
+            return None
+        
+        # Расчет P&L
+        if position['signal'] == 'buy':
+            profit = (close_price - position['price']) * position['volume']
+            profit_pct = (close_price - position['price']) / position['price'] * 100
+        else:  # sell
+            profit = (position['price'] - close_price) * position['volume']
+            profit_pct = (position['price'] - close_price) / position['price'] * 100
+        
+        # Вычитаем комиссию за закрытие
+        close_commission = close_price * position['volume'] * self.commission
+        profit -= close_commission
+        
+        trade = {
+            'open_time': position['timestamp'],
+            'close_time': close_time,
+            'symbol': position['symbol'],
+            'signal': position['signal'],
+            'open_price': position['price'],
+            'close_price': close_price,
+            'volume': position['volume'],
+            'profit': profit,
+            'profit_pct': profit_pct,
+            'commission': position['commission'] + close_commission,
+            'close_reason': reason
+        }
+        
         # Обновляем баланс
-        self.balance += order.profit_loss
-
-        # Перемещаем ордер в список закрытых
-        self.orders.remove(order)
-        self.closed_orders.append(order)
-
-        print(f"Закрыт ордер {order.order_id} по цене {exit_price:.5f}, PnL: {order.profit_loss:.2f}, Причина: {reason}")
-
-    def _execute_signals(self, signals: List[Dict], current_bar):
-        """Исполнение торговых сигналов"""
-        for signal in signals:
-            symbol = signal.get('symbol', 'EURUSD')
-            direction = OrderDirection.BUY if signal.get('direction') == 'buy' else OrderDirection.SELL
-            order_type = OrderType.MARKET
-
-            # Рассчитываем объем на основе риск-менеджмента
-            quantity = self._calculate_position_size(current_bar['close'], signal.get('risk', 0.02))
-
-            if quantity <= 0:
-                continue
-
-            # Создаем ордер
-            order_id = f"{symbol}_{direction.value}_{self.current_date.timestamp()}"
-            order = Order(
-                order_id=order_id,
-                symbol=symbol,
-                order_type=order_type,
-                direction=direction,
-                quantity=quantity,
-                entry_price=current_bar['close'],
-                stop_loss=signal.get('stop_loss'),
-                take_profit=signal.get('take_profit')
-            )
-
-            # Учитываем комиссию
-            order.commission = self.commission * quantity * current_bar['close']
-            self.balance -= order.commission
-
-            # Добавляем ордер в список
-            self.orders.append(order)
-
-            print(f"Открыт ордер {order_id}: {direction.value} {quantity:.2f} {symbol} по цене {current_bar['close']:.5f}")
-
-    def _calculate_position_size(self, price: float, risk_percent: float) -> float:
-        """Расчет размера позиции на основе риск-менеджмента"""
-        risk_amount = self.balance * risk_percent
-        position_size = risk_amount / price
-
-        # Ограничиваем размер позиции доступным балансом
-        max_position = self.balance * 0.1 / price  # Не более 10% баланса на сделку
-        position_size = min(position_size, max_position)
-
-        return position_size
-
-    def _calculate_equity(self, current_bar) -> float:
-        """Расчет текущего эквити (баланс + незакрытые позиции)"""
-        equity = self.balance
-
-        for order in self.orders:
-            if not order.closed:
-                unrealized_pnl = order.calculate_pnl(current_bar['close'])
-                equity += unrealized_pnl
-
-        return equity
-
-    def _generate_report(self, data: pd.DataFrame) -> Dict[str, Any]:
-        """Генерация отчета о бэктесте"""
-        if not self.closed_orders:
+        self.balance += profit
+        
+        # Добавляем в историю сделок
+        self.trades.append(trade)
+        
+        # Удаляем из открытых позиций
+        self.positions.pop(position_idx)
+        
+        logger.info(f"Закрыта позиция: {position['signal']} с прибылью {profit_pct:.2f}% ({profit:.2f})")
+        return trade
+    
+    def _check_stop_levels(self, current_bar: pd.Series) -> List[Dict]:
+        """Проверка стоп-лоссов и тейк-профитов"""
+        closed_trades = []
+        
+        for i in range(len(self.positions) - 1, -1, -1):
+            pos = self.positions[i]
+            
+            if pos['signal'] == 'buy':
+                # Проверка стоп-лосса (цена опустилась ниже стопа)
+                if pos['stop_loss'] and current_bar['low'] <= pos['stop_loss']:
+                    close_price = min(pos['stop_loss'], current_bar['open'])
+                    trade = self._close_position(i, close_price, current_bar.name, "stop_loss")
+                    if trade:
+                        closed_trades.append(trade)
+                # Проверка тейк-профита (цена поднялась выше профита)
+                elif pos['take_profit'] and current_bar['high'] >= pos['take_profit']:
+                    close_price = min(pos['take_profit'], current_bar['open'])
+                    trade = self._close_position(i, close_price, current_bar.name, "take_profit")
+                    if trade:
+                        closed_trades.append(trade)
+            else:  # sell
+                if pos['stop_loss'] and current_bar['high'] >= pos['stop_loss']:
+                    close_price = max(pos['stop_loss'], current_bar['open'])
+                    trade = self._close_position(i, close_price, current_bar.name, "stop_loss")
+                    if trade:
+                        closed_trades.append(trade)
+                elif pos['take_profit'] and current_bar['low'] <= pos['take_profit']:
+                    close_price = max(pos['take_profit'], current_bar['open'])
+                    trade = self._close_position(i, close_price, current_bar.name, "take_profit")
+                    if trade:
+                        closed_trades.append(trade)
+        
+        return closed_trades
+    
+    def _log_trade(self, trade: Dict):
+        """Логирование сделки"""
+        self.trades.append(trade)
+        logger.debug(f"Сделка залогирована: {trade}")
+    
+    def _calculate_metrics(self) -> Dict[str, Any]:
+        """Расчет метрик бэктестинга"""
+        if not self.trades:
             return {
-                'initial_balance': self.initial_balance,
-                'final_balance': self.balance,
                 'total_trades': 0,
-                'profitable_trades': 0,
-                'win_rate': 0.0,
-                'total_profit': 0.0,
-                'total_loss': 0.0,
-                'profit_factor': 0.0,
-                'max_drawdown': 0.0,
-                'sharpe_ratio': 0.0
+                'win_rate': 0,
+                'total_profit': 0,
+                'total_profit_pct': 0,
+                'max_drawdown': 0,
+                'max_drawdown_pct': 0,
+                'sharpe_ratio': 0,
+                'profit_factor': 0,
+                'avg_trade': 0,
+                'avg_win': 0,
+                'avg_loss': 0
             }
-
-        # Рассчитываем прибыли и убытки
-        profits = [o.profit_loss for o in self.closed_orders if o.profit_loss > 0]
-        losses = [o.profit_loss for o in self.closed_orders if o.profit_loss <= 0]
-
-        total_profit = sum(profits) if profits else 0
-        total_loss = abs(sum(losses)) if losses else 0
-
-        # Profit Factor
-        profit_factor = total_profit / total_loss if total_loss > 0 else 0
-
-        # Win Rate
-        win_rate = len(profits) / len(self.closed_orders)
-
-        # Максимальная просадка
-        max_drawdown = max(self.drawdown_curve) if self.drawdown_curve else 0
-
-        # Коэффициент Шарпа (упрощенный)
-        returns = np.diff(self.equity_curve) / self.equity_curve[:-1] if len(self.equity_curve) > 1 else [0]
-        sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if len(returns) > 1 and np.std(returns) > 0 else 0
-
-        report = {
-            'initial_balance': self.initial_balance,
-            'final_balance': self.balance,
-            'total_return': (self.balance - self.initial_balance) / self.initial_balance,
-            'total_trades': len(self.closed_orders),
-            'profitable_trades': len(profits),
-            'losing_trades': len(losses),
+        
+        # Расчет базовых метрик
+        profits = [t['profit'] for t in self.trades]
+        profits_pct = [t['profit_pct'] for t in self.trades]
+        
+        winning_trades = [p for p in profits if p > 0]
+        losing_trades = [p for p in profits if p < 0]
+        
+        total_trades = len(self.trades)
+        win_rate = len(winning_trades) / total_trades * 100 if total_trades > 0 else 0
+        total_profit = sum(profits)
+        total_profit_pct = (self.balance - self.initial_balance) / self.initial_balance * 100
+        
+        # Расчет максимальной просадки
+        equity_points = [self.initial_balance]
+        for trade in self.trades:
+            equity_points.append(equity_points[-1] + trade['profit'])
+        
+        max_equity = equity_points[0]
+        max_drawdown = 0
+        max_drawdown_pct = 0
+        
+        for equity in equity_points:
+            if equity > max_equity:
+                max_equity = equity
+            
+            drawdown = max_equity - equity
+            drawdown_pct = (max_equity - equity) / max_equity * 100 if max_equity > 0 else 0
+            
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+                max_drawdown_pct = drawdown_pct
+        
+        # Расчет Profit Factor
+        gross_profit = sum(winning_trades) if winning_trades else 0
+        gross_loss = abs(sum(losing_trades)) if losing_trades else 0
+        profit_factor = gross_profit / gross_loss if gross_loss != 0 else float('inf')
+        
+        # Расчет Sharpe Ratio (упрощенный)
+        if len(profits) > 1:
+            returns = np.array(profits_pct) / 100
+            if np.std(returns) > 0:
+                sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252)
+            else:
+                sharpe_ratio = 0
+        else:
+            sharpe_ratio = 0
+        
+        # Средние значения
+        avg_trade = np.mean(profits) if profits else 0
+        avg_win = np.mean(winning_trades) if winning_trades else 0
+        avg_loss = np.mean(losing_trades) if losing_trades else 0
+        
+        return {
+            'total_trades': total_trades,
             'win_rate': win_rate,
             'total_profit': total_profit,
-            'total_loss': total_loss,
-            'profit_factor': profit_factor,
+            'total_profit_pct': total_profit_pct,
             'max_drawdown': max_drawdown,
+            'max_drawdown_pct': max_drawdown_pct,
             'sharpe_ratio': sharpe_ratio,
-            'equity_curve': self.equity_curve,
-            'drawdown_curve': self.drawdown_curve
+            'profit_factor': profit_factor,
+            'final_balance': self.balance,
+            'avg_trade': avg_trade,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'gross_profit': gross_profit,
+            'gross_loss': gross_loss
         }
-
-        return report
-
-
-def simple_moving_average_strategy(data_point: pd.Series, portfolio: Dict, balance: float,
-                                  short_window: int = 10, long_window: int = 30) -> List[Dict]:
-    """
-    Простая стратегия на основе скользящих средних
-
-    Args:
-        data_point: Текущая строка данных
-        portfolio: Текущий портфель
-        balance: Текущий баланс
-        short_window: Период короткой SMA
-        long_window: Период длинной SMA
-
-    Returns:
-        Список торговых сигналов
-    """
-    # Эта стратегия требует исторических данных, поэтому в чистом виде не может работать на одном баре
-    # В реальном бэктесте нужно передавать весь DataFrame или рассчитанные индикаторы
-    return []
+    
+    def run(self, start_date: Optional[str] = None, end_date: Optional[str] = None, 
+            initial_balance: Optional[float] = None) -> Dict[str, Any]:
+        """Запуск бэктестинга"""
+        if initial_balance:
+            self.initial_balance = initial_balance
+            self.balance = initial_balance
+        
+        # Получение данных
+        logger.info("Загрузка данных для бэктестинга...")
+        data = self.data_feeder.get_data()
+        
+        if data.empty:
+            logger.error("Нет данных для бэктестинга")
+            return self._calculate_metrics()
+        
+        # Фильтрация по датам если указаны
+        if start_date:
+            data = data[data.index >= pd.to_datetime(start_date)]
+        if end_date:
+            data = data[data.index <= pd.to_datetime(end_date)]
+        
+        if len(data) == 0:
+            logger.error("Нет данных после фильтрации по датам")
+            return self._calculate_metrics()
+        
+        logger.info(f"Начало бэктестинга с {len(data)} барами")
+        logger.info(f"Период: {data.index[0]} - {data.index[-1]}")
+        
+        # Основной цикл бэктестинга
+        for i in range(20, len(data)):  # Начинаем с 20 для расчета индикаторов
+            current_bar = data.iloc[i]
+            previous_bars = data.iloc[:i+1].copy()  # Включая текущий бар
+            
+            # Проверка стоп-уровней для открытых позиций
+            self._check_stop_levels(current_bar)
+            
+            # Детектирование паттернов (на предыдущих данных)
+            if i > 0:
+                patterns = self.pattern_detector.detect_patterns(previous_bars.iloc[:-1])
+            else:
+                patterns = []
+            
+            # Получение сигналов
+            signals = []
+            for pattern in patterns:
+                if pattern.timestamp == previous_bars.index[-2]:  # Сигнал на предыдущем баре
+                    signal = pattern.get_signal()
+                    if signal != 'hold':
+                        signals.append({
+                            'pattern': pattern.__class__.__name__,
+                            'signal': signal,
+                            'confidence': pattern.confidence,
+                            'timestamp': pattern.timestamp
+                        })
+            
+            # Обработка сигналов (открываем новую позицию только если нет открытых)
+            if signals and not self.positions:
+                # Используем самый уверенный сигнал
+                best_signal = max(signals, key=lambda x: x['confidence'])
+                
+                # Расчет уровней стоп-лосса и тейк-профита на основе ATR
+                if len(previous_bars) >= 14:
+                    high_low = previous_bars['high'].tail(14) - previous_bars['low'].tail(14)
+                    atr = high_low.mean()
+                else:
+                    atr = previous_bars['high'].iloc[-1] - previous_bars['low'].iloc[-1]
+                
+                current_price = current_bar['close']
+                
+                if best_signal['signal'] == 'buy':
+                    stop_loss = current_price - atr * 2
+                    take_profit = current_price + atr * 3
+                else:  # sell
+                    stop_loss = current_price + atr * 2
+                    take_profit = current_price - atr * 3
+                
+                # Открытие позиции
+                self._place_order(
+                    signal=best_signal['signal'],
+                    price=current_price,
+                    timestamp=current_bar.name,
+                    symbol=current_bar.get('symbol', 'Unknown'),
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+            
+            # Запись точки equity curve
+            total_value = self.balance
+            
+            # Добавляем незакрытую прибыль/убыток
+            for pos in self.positions:
+                if pos['signal'] == 'buy':
+                    unrealized = (current_bar['close'] - pos['price']) * pos['volume']
+                else:
+                    unrealized = (pos['price'] - current_bar['close']) * pos['volume']
+                total_value += unrealized
+            
+            self.equity_curve.append({
+                'timestamp': current_bar.name,
+                'equity': total_value,
+                'balance': self.balance,
+                'open_positions': len(self.positions)
+            })
+        
+        # Закрытие всех открытых позиций в конце теста
+        for i in range(len(self.positions) - 1, -1, -1):
+            self._close_position(i, data.iloc[-1]['close'], data.iloc[-1].name, "end_of_test")
+        
+        # Расчет финальных метрик
+        metrics = self._calculate_metrics()
+        
+        # Дополнительная информация
+        metrics['initial_balance'] = self.initial_balance
+        metrics['final_balance'] = self.balance
+        metrics['equity_curve'] = self.equity_curve
+        metrics['trades'] = self.trades
+        
+        logger.info("=" * 50)
+        logger.info("РЕЗУЛЬТАТЫ БЭКТЕСТИНГА")
+        logger.info("=" * 50)
+        logger.info(f"Начальный баланс: {self.initial_balance:.2f}")
+        logger.info(f"Конечный баланс: {self.balance:.2f}")
+        logger.info(f"Общая прибыль: {metrics['total_profit']:.2f} ({metrics['total_profit_pct']:.2f}%)")
+        logger.info(f"Всего сделок: {metrics['total_trades']}")
+        logger.info(f"Процент прибыльных: {metrics['win_rate']:.2f}%")
+        logger.info(f"Максимальная просадка: {metrics['max_drawdown']:.2f} ({metrics['max_drawdown_pct']:.2f}%)")
+        logger.info(f"Profit Factor: {metrics['profit_factor']:.2f}")
+        logger.info(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+        
+        return metrics
+    
+    def get_trades_dataframe(self) -> pd.DataFrame:
+        """Получение сделок в виде DataFrame"""
+        if not self.trades:
+            return pd.DataFrame()
+        
+        return pd.DataFrame(self.trades)
+    
+    def get_equity_curve_dataframe(self) -> pd.DataFrame:
+        """Получение кривой эквити в виде DataFrame"""
+        if not self.equity_curve:
+            return pd.DataFrame()
+        
+        return pd.DataFrame(self.equity_curve).set_index('timestamp')
 
