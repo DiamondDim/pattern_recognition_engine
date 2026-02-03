@@ -1,578 +1,534 @@
 """
-Модуль бэктестинга паттернов
+Модуль бэктестинга торговых стратегий
 """
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum
 import warnings
 
-warnings.filterwarnings('ignore')
-
-from config import config
+from config import BACKTEST_CONFIG, TRADING_CONFIG
 from utils.logger import logger
-from .pattern_detector import PatternDetector
-from .pattern_analyzer import PatternAnalyzer
+from utils.helpers import calculate_returns, calculate_volatility
+
+
+class OrderType(Enum):
+    """Типы ордеров"""
+    BUY = 'buy'
+    SELL = 'sell'
+    BUY_LIMIT = 'buy_limit'
+    SELL_LIMIT = 'sell_limit'
+    BUY_STOP = 'buy_stop'
+    SELL_STOP = 'sell_stop'
+
+
+class OrderStatus(Enum):
+    """Статусы ордеров"""
+    PENDING = 'pending'
+    OPEN = 'open'
+    CLOSED = 'closed'
+    CANCELLED = 'cancelled'
 
 
 @dataclass
-class BacktestResult:
-    """Результат бэктестинга"""
+class Order:
+    """Торговый ордер"""
+    id: str
+    symbol: str
+    order_type: OrderType
+    volume: float
+    entry_price: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    entry_time: datetime = None
+    exit_time: Optional[datetime] = None
+    exit_price: Optional[float] = None
+    status: OrderStatus = OrderStatus.PENDING
+    commission: float = 0.0
+    swap: float = 0.0
+    profit: float = 0.0
+    comment: str = ""
 
-    # Статистика
-    total_trades: int = 0
-    winning_trades: int = 0
-    losing_trades: int = 0
-    win_rate: float = 0.0
-
-    # Прибыль/убыток
-    total_profit: float = 0.0
-    total_loss: float = 0.0
-    net_profit: float = 0.0
-    profit_factor: float = 0.0
-
-    # Показатели эффективности
-    avg_profit: float = 0.0
-    avg_loss: float = 0.0
-    avg_winning_trade: float = 0.0
-    avg_losing_trade: float = 0.0
-    largest_win: float = 0.0
-    largest_loss: float = 0.0
-
-    # Риск/прибыль
-    max_drawdown: float = 0.0
-    sharpe_ratio: Optional[float] = None
-    sortino_ratio: Optional[float] = None
-    calmar_ratio: Optional[float] = None
-
-    # Время
-    avg_holding_period: float = 0.0
-    max_consecutive_wins: int = 0
-    max_consecutive_losses: int = 0
-
-    # Детали сделок
-    trades: List[Dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def expectancy(self) -> float:
-        """Ожидаемая прибыль на сделку"""
-        if self.total_trades == 0:
-            return 0.0
-        return (self.win_rate * self.avg_winning_trade) - ((1 - self.win_rate) * self.avg_losing_trade)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Конвертация в словарь"""
-        return {
-            'statistics': {
-                'total_trades': self.total_trades,
-                'winning_trades': self.winning_trades,
-                'losing_trades': self.losing_trades,
-                'win_rate': self.win_rate,
-                'total_profit': self.total_profit,
-                'total_loss': self.total_loss,
-                'net_profit': self.net_profit,
-                'profit_factor': self.profit_factor,
-                'avg_profit': self.avg_profit,
-                'avg_loss': self.avg_loss,
-                'avg_winning_trade': self.avg_winning_trade,
-                'avg_losing_trade': self.avg_losing_trade,
-                'largest_win': self.largest_win,
-                'largest_loss': self.largest_loss,
-                'max_drawdown': self.max_drawdown,
-                'sharpe_ratio': self.sharpe_ratio,
-                'sortino_ratio': self.sortino_ratio,
-                'calmar_ratio': self.calmar_ratio,
-                'expectancy': self.expectancy,
-                'avg_holding_period': self.avg_holding_period,
-                'max_consecutive_wins': self.max_consecutive_wins,
-                'max_consecutive_losses': self.max_consecutive_losses
-            },
-            'trades': self.trades
-        }
+    def __post_init__(self):
+        if self.entry_time is None:
+            self.entry_time = datetime.now()
 
 
-class PatternBacktester:
-    """Класс для бэктестинга паттернов"""
+class BacktestEngine:
+    """Движок бэктестинга"""
 
-    def __init__(self):
-        self.logger = logger.bind(module="backtesting")
-        self.detector = PatternDetector()
-        self.analyzer = PatternAnalyzer()
+    def __init__(self, config: BACKTEST_CONFIG = None):
+        self.config = config or BACKTEST_CONFIG
+        self.logger = logger.bind(module="BacktestEngine")
+        self.initial_balance = self.config.INITIAL_BALANCE
+        self.balance = self.initial_balance
+        self.equity = self.initial_balance
+        self.margin = 0.0
+        self.free_margin = self.initial_balance
+        self.leverage = self.config.LEVERAGE
+        self.orders = []
+        self.closed_orders = []
+        self.equity_curve = []
+        self.drawdown_curve = []
+        self.max_drawdown = 0.0
+        self.current_drawdown = 0.0
+        self.peak_equity = self.initial_balance
+        self.position_count = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
 
-        # Параметры бэктестинга
-        self.initial_balance = config.BACKTESTING.INITIAL_BALANCE
-        self.risk_per_trade = config.BACKTESTING.RISK_PER_TRADE
-        self.commission = config.BACKTESTING.COMMISSION
-        self.slippage = config.BACKTESTING.SLIPPAGE
-        self.max_holding_period = config.BACKTESTING.MAX_HOLDING_PERIOD
-
-    async def run_backtest(self,
-                           data: Dict[str, np.ndarray],
-                           symbol: str = "TEST",
-                           timeframe: str = "H1",
-                           start_date: Optional[datetime] = None,
-                           end_date: Optional[datetime] = None) -> BacktestResult:
+    def calculate_position_size(self, entry_price: float, stop_loss: float, risk_percent: float = 1.0) -> float:
         """
-        Запуск бэктестинга на исторических данных
+        Расчет размера позиции на основе риска
 
         Args:
-            data: Исторические данные OHLC
-            symbol: Символ инструмента
-            timeframe: Таймфрейм
-            start_date: Начальная дата для тестирования
-            end_date: Конечная дата для тестирования
+            entry_price: Цена входа
+            stop_loss: Цена стоп-лосса
+            risk_percent: Процент риска от баланса
 
         Returns:
-            Результат бэктестинга
+            Размер позиции в лотах
         """
-        result = BacktestResult()
-        trades = []
+        if entry_price <= 0 or stop_loss <= 0:
+            return 0.0
 
-        # Извлекаем данные
-        timestamps = data.get('timestamp', np.arange(len(data.get('close', []))))
-        closes = data.get('close', np.array([]))
+        # Расчет риска в деньгах
+        risk_amount = self.balance * (risk_percent / 100)
 
-        if len(closes) == 0:
-            self.logger.error("Нет данных для бэктестинга")
-            return result
+        # Расчет риска в пунктах
+        if stop_loss < entry_price:  # BUY позиция
+            risk_points = entry_price - stop_loss
+        else:  # SELL позиция
+            risk_points = stop_loss - entry_price
 
-        # Фильтрация по дате
-        if start_date or end_date:
-            filtered_indices = await self._filter_by_date(timestamps, start_date, end_date)
-        else:
-            filtered_indices = np.arange(len(closes))
+        # Размер позиции (в единицах базовой валюты)
+        position_size = risk_amount / risk_points
 
-        if len(filtered_indices) == 0:
-            self.logger.error("Нет данных в указанном диапазоне дат")
-            return result
+        # Конвертация в лоты
+        lot_size = 100000  # Стандартный лот
+        lots = position_size / lot_size
 
-        # Запускаем детектирование паттернов
-        self.logger.info(f"Запуск бэктестинга на {len(filtered_indices)} свечах")
+        # Ограничение максимальным размером позиции
+        max_lots = self.config.MAX_POSITION_SIZE
+        lots = min(lots, max_lots)
 
-        # Для каждой точки данных (скользящее окно)
-        window_size = 100
-        for i in range(window_size, len(filtered_indices)):
-            current_idx = filtered_indices[i]
+        # Проверка на достаточность маржи
+        required_margin = (lots * lot_size * entry_price) / self.leverage
+        if required_margin > self.free_margin:
+            # Автоматическое уменьшение размера позиции
+            max_lots_by_margin = (self.free_margin * self.leverage) / (lot_size * entry_price)
+            lots = min(lots, max_lots_by_margin)
 
-            # Берем окно данных
-            window_start = max(0, current_idx - window_size)
-            window_end = current_idx
+        return round(lots, 2)
 
-            window_data = {
-                'open': data['open'][window_start:window_end],
-                'high': data['high'][window_start:window_end],
-                'low': data['low'][window_start:window_end],
-                'close': data['close'][window_start:window_end],
-                'volume': data.get('volume', np.ones(window_end - window_start))[window_start:window_end]
-            }
+    def place_order(self, order: Order) -> bool:
+        """
+        Размещение ордера
 
-            # Детектируем паттерны
-            detection_result = await self.detector.detect_all_patterns(
-                symbol=symbol,
-                timeframe=timeframe,
-                data=window_data
-            )
+        Args:
+            order: Объект ордера
 
-            # Анализируем найденные паттерны
-            for pattern in detection_result.patterns:
-                # Проверяем, нужно ли входить в сделку
-                if self._should_enter_trade(pattern, current_idx, closes):
-                    # Создаем сделку
-                    trade = await self._create_trade(
-                        pattern=pattern,
-                        entry_index=current_idx,
-                        entry_price=closes[current_idx],
-                        closes=closes
-                    )
-
-                    if trade:
-                        trades.append(trade)
-
-        # Анализируем сделки
-        if trades:
-            result = self._analyze_trades(trades)
-
-        self.logger.info(f"Бэктестинг завершен. Сделок: {len(trades)}")
-        return result
-
-    async def _filter_by_date(self,
-                              timestamps: np.ndarray,
-                              start_date: Optional[datetime],
-                              end_date: Optional[datetime]) -> np.ndarray:
-        """Фильтрация данных по дате"""
-        indices = []
-
-        for i, ts in enumerate(timestamps):
-            # Конвертируем timestamp в datetime если нужно
-            if isinstance(ts, (datetime, pd.Timestamp)):
-                dt = ts
-            elif isinstance(ts, np.datetime64):
-                dt = pd.Timestamp(ts)
-            else:
-                # Предполагаем, что это числовой индекс
-                dt = datetime.fromtimestamp(ts)
-
-            # Проверяем диапазон
-            if start_date and dt < start_date:
-                continue
-            if end_date and dt > end_date:
-                continue
-
-            indices.append(i)
-
-        return np.array(indices)
-
-    def _should_enter_trade(self,
-                            pattern: Dict[str, Any],
-                            current_idx: int,
-                            closes: np.ndarray) -> bool:
-        """Определение, нужно ли входить в сделку на основе паттерна"""
-        # Проверяем качество паттерна
-        quality = pattern.get('metadata', {}).get('quality_score', 0)
-        if quality < config.DETECTION.MIN_PATTERN_QUALITY:
-            return False
-
-        # Проверяем, что паттерн свежий (последние N свечей)
-        points = pattern.get('points', [])
-        if points:
-            last_point_idx = max(p['index'] for p in points)
-            if current_idx - last_point_idx > 10:  # Паттерн старше 10 свечей
+        Returns:
+            Успешность размещения
+        """
+        try:
+            # Проверка маржи
+            required_margin = self._calculate_required_margin(order)
+            if required_margin > self.free_margin:
+                self.logger.warning(f"Недостаточно маржи для ордера {order.id}")
                 return False
 
-        # Проверяем, что цена достигла точки входа
-        entry_price = pattern.get('targets', {}).get('entry_price')
-        if entry_price is None:
-            return False
+            # Расчет комиссии
+            order.commission = self._calculate_commission(order)
 
-        current_price = closes[current_idx]
+            # Обновление баланса
+            self.margin += required_margin
+            self.free_margin = self.equity - self.margin
 
-        # Для бычьего паттерна: цена выше точки входа
-        if pattern.get('direction') == 'bullish':
-            if current_price >= entry_price * 0.995:  # 0.5% ниже точки входа
-                return True
+            # Добавление ордера
+            order.status = OrderStatus.OPEN
+            self.orders.append(order)
+            self.position_count += 1
 
-        # Для медвежьего паттерна: цена ниже точки входа
-        elif pattern.get('direction') == 'bearish':
-            if current_price <= entry_price * 1.005:  # 0.5% выше точки входа
-                return True
-
-        return False
-
-    async def _create_trade(self,
-                            pattern: Dict[str, Any],
-                            entry_index: int,
-                            entry_price: float,
-                            closes: np.ndarray) -> Optional[Dict[str, Any]]:
-        """Создание сделки на основе паттерна"""
-        try:
-            targets = pattern.get('targets', {})
-            stop_loss = targets.get('stop_loss')
-            take_profit = targets.get('take_profit')
-
-            if stop_loss is None or take_profit is None:
-                return None
-
-            # Определяем направление
-            direction = pattern.get('direction', 'bullish')
-
-            # Ищем выход из сделки
-            exit_index, exit_price, exit_reason = await self._find_exit(
-                entry_index=entry_index,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                direction=direction,
-                closes=closes
-            )
-
-            if exit_index is None:
-                return None
-
-            # Рассчитываем P&L
-            if direction == 'bullish':
-                pnl_pips = exit_price - entry_price
-            else:
-                pnl_pips = entry_price - exit_price
-
-            # Учитываем комиссию и проскальзывание
-            pnl = pnl_pips - (entry_price * self.commission) - (entry_price * self.slippage)
-
-            # Создаем запись о сделке
-            trade = {
-                'pattern_id': pattern.get('id'),
-                'pattern_name': pattern.get('name'),
-                'direction': direction,
-                'entry_index': entry_index,
-                'entry_price': entry_price,
-                'exit_index': exit_index,
-                'exit_price': exit_price,
-                'exit_reason': exit_reason,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'pnl': pnl,
-                'pnl_pips': pnl_pips,
-                'quality': pattern.get('metadata', {}).get('quality_score', 0),
-                'holding_period': exit_index - entry_index
-            }
-
-            return trade
+            self.logger.info(f"Ордер размещен: {order.id} {order.order_type.value} {order.volume} @ {order.entry_price}")
+            return True
 
         except Exception as e:
-            self.logger.error(f"Ошибка создания сделки: {e}")
-            return None
+            self.logger.error(f"Ошибка размещения ордера: {e}")
+            return False
 
-    async def _find_exit(self,
-                         entry_index: int,
-                         entry_price: float,
-                         stop_loss: float,
-                         take_profit: float,
-                         direction: str,
-                         closes: np.ndarray) -> Tuple[Optional[int], Optional[float], str]:
-        """Поиск выхода из сделки"""
-        max_lookahead = self.max_holding_period
+    def _calculate_required_margin(self, order: Order) -> float:
+        """Расчет требуемой маржи"""
+        lot_size = 100000  # Стандартный лот
+        margin = (order.volume * lot_size * order.entry_price) / self.leverage
+        return margin
 
-        for i in range(1, min(max_lookahead, len(closes) - entry_index)):
-            current_idx = entry_index + i
-            current_price = closes[current_idx]
+    def _calculate_commission(self, order: Order) -> float:
+        """Расчет комиссии"""
+        # Комиссия в процентах от объема
+        commission_rate = self.config.COMMISSION_RATE
+        lot_size = 100000
+        commission = order.volume * lot_size * order.entry_price * commission_rate
+        return commission
 
-            # Проверяем стоп-лосс
-            if direction == 'bullish':
-                if current_price <= stop_loss:
-                    return current_idx, current_price, 'stop_loss'
-                elif current_price >= take_profit:
-                    return current_idx, current_price, 'take_profit'
-            else:
-                if current_price >= stop_loss:
-                    return current_idx, current_price, 'stop_loss'
-                elif current_price <= take_profit:
-                    return current_idx, current_price, 'take_profit'
+    def update_prices(self, current_prices: Dict[str, Dict[str, float]]):
+        """
+        Обновление цен и проверка условий ордеров
 
-        # Выход по времени
-        last_idx = entry_index + max_lookahead
-        if last_idx < len(closes):
-            return last_idx, closes[last_idx], 'time_exit'
+        Args:
+            current_prices: Текущие цены по символам
+        """
+        orders_to_close = []
 
-        return None, None, 'no_exit'
+        for order in self.orders:
+            if order.status != OrderStatus.OPEN:
+                continue
 
-    def _analyze_trades(self, trades: List[Dict[str, Any]]) -> BacktestResult:
-        """Анализ сделок и расчет статистики"""
-        result = BacktestResult()
-        result.trades = trades
+            symbol = order.symbol
+            if symbol not in current_prices:
+                continue
 
-        if not trades:
-            return result
+            current_price = current_prices[symbol]
+            bid = current_price.get('bid', order.entry_price)
+            ask = current_price.get('ask', order.entry_price)
 
-        # Базовая статистика
-        result.total_trades = len(trades)
-        result.winning_trades = len([t for t in trades if t['pnl'] > 0])
-        result.losing_trades = len([t for t in trades if t['pnl'] <= 0])
-        result.win_rate = result.winning_trades / result.total_trades if result.total_trades > 0 else 0
+            # Проверка стоп-лосса и тейк-профита
+            should_close = False
+            exit_price = 0.0
+            profit = 0.0
+
+            if order.order_type == OrderType.BUY:
+                # Для BUY позиции
+                current_value = bid
+
+                if order.stop_loss and current_value <= order.stop_loss:
+                    should_close = True
+                    exit_price = order.stop_loss
+                    profit = (exit_price - order.entry_price) * order.volume * 100000 - order.commission
+                elif order.take_profit and current_value >= order.take_profit:
+                    should_close = True
+                    exit_price = order.take_profit
+                    profit = (exit_price - order.entry_price) * order.volume * 100000 - order.commission
+
+            elif order.order_type == OrderType.SELL:
+                # Для SELL позиции
+                current_value = ask
+
+                if order.stop_loss and current_value >= order.stop_loss:
+                    should_close = True
+                    exit_price = order.stop_loss
+                    profit = (order.entry_price - exit_price) * order.volume * 100000 - order.commission
+                elif order.take_profit and current_value <= order.take_profit:
+                    should_close = True
+                    exit_price = order.take_profit
+                    profit = (order.entry_price - exit_price) * order.volume * 100000 - order.commission
+
+            if should_close:
+                order.exit_price = exit_price
+                order.exit_time = datetime.now()
+                order.status = OrderStatus.CLOSED
+                order.profit = profit
+
+                # Обновление статистики
+                if profit > 0:
+                    self.winning_trades += 1
+                else:
+                    self.losing_trades += 1
+
+                orders_to_close.append(order)
+
+        # Закрытие ордеров
+        for order in orders_to_close:
+            self.close_order(order)
+
+        # Обновление эквити
+        self._update_equity(current_prices)
+
+    def close_order(self, order: Order):
+        """
+        Закрытие ордера
+
+        Args:
+            order: Ордер для закрытия
+        """
+        try:
+            # Освобождение маржи
+            required_margin = self._calculate_required_margin(order)
+            self.margin -= required_margin
+
+            # Обновление баланса
+            self.balance += order.profit
+            self.equity = self.balance
+
+            # Обновление свободной маржи
+            self.free_margin = self.equity - self.margin
+
+            # Перемещение в закрытые ордера
+            self.orders.remove(order)
+            self.closed_orders.append(order)
+
+            self.logger.info(f"Ордер закрыт: {order.id} Profit: {order.profit:.2f}")
+
+        except Exception as e:
+            self.logger.error(f"Ошибка закрытия ордера: {e}")
+
+    def _update_equity(self, current_prices: Dict[str, Dict[str, float]]):
+        """Обновление эквити и просадки"""
+        # Расчет текущей прибыли/убытка по открытым позициям
+        floating_profit = 0.0
+
+        for order in self.orders:
+            if order.status != OrderStatus.OPEN:
+                continue
+
+            symbol = order.symbol
+            if symbol not in current_prices:
+                continue
+
+            current_price = current_prices[symbol]
+
+            if order.order_type == OrderType.BUY:
+                bid = current_price.get('bid', order.entry_price)
+                floating_profit += (bid - order.entry_price) * order.volume * 100000
+            elif order.order_type == OrderType.SELL:
+                ask = current_price.get('ask', order.entry_price)
+                floating_profit += (order.entry_price - ask) * order.volume * 100000
+
+        # Обновление эквити
+        self.equity = self.balance + floating_profit
+        self.equity_curve.append(self.equity)
+
+        # Расчет просадки
+        if self.equity > self.peak_equity:
+            self.peak_equity = self.equity
+
+        self.current_drawdown = (self.peak_equity - self.equity) / self.peak_equity * 100
+        self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
+        self.drawdown_curve.append(self.current_drawdown)
+
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """
+        Расчет метрик производительности
+
+        Returns:
+            Словарь с метриками
+        """
+        if not self.closed_orders:
+            return {}
+
+        # Базовые метрики
+        total_trades = len(self.closed_orders)
+        winning_trades = self.winning_trades
+        losing_trades = self.losing_trades
+
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
 
         # Прибыль/убыток
-        winning_trades = [t for t in trades if t['pnl'] > 0]
-        losing_trades = [t for t in trades if t['pnl'] <= 0]
-
-        result.total_profit = sum(t['pnl'] for t in winning_trades)
-        result.total_loss = abs(sum(t['pnl'] for t in losing_trades))
-        result.net_profit = result.total_profit - result.total_loss
-
-        if result.total_loss > 0:
-            result.profit_factor = result.total_profit / result.total_loss
+        total_profit = sum(order.profit for order in self.closed_orders if order.profit > 0)
+        total_loss = abs(sum(order.profit for order in self.closed_orders if order.profit < 0))
+        net_profit = total_profit - total_loss
 
         # Средние значения
-        if winning_trades:
-            result.avg_winning_trade = result.total_profit / len(winning_trades)
-            result.avg_profit = result.avg_winning_trade
-            result.largest_win = max(t['pnl'] for t in winning_trades)
+        avg_win = total_profit / winning_trades if winning_trades > 0 else 0
+        avg_loss = total_loss / losing_trades if losing_trades > 0 else 0
+        profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
 
-        if losing_trades:
-            result.avg_losing_trade = result.total_loss / len(losing_trades)
-            result.avg_loss = result.avg_losing_trade
-            result.largest_loss = min(t['pnl'] for t in losing_trades)
+        # Возвраты
+        total_return = (self.equity - self.initial_balance) / self.initial_balance * 100
+        annual_return = self._calculate_annual_return()
+
+        # Волатильность
+        returns = self._calculate_returns_series()
+        volatility = np.std(returns) * np.sqrt(252) if len(returns) > 1 else 0
+
+        # Коэффициент Шарпа
+        risk_free_rate = 0.02  # 2% безрисковая ставка
+        sharpe_ratio = (annual_return - risk_free_rate) / volatility if volatility > 0 else 0
 
         # Максимальная просадка
-        equity_curve = []
-        balance = self.initial_balance
+        max_dd = self.max_drawdown
 
-        for trade in trades:
-            balance += trade['pnl'] * balance * self.risk_per_trade
-            equity_curve.append(balance)
+        # Восстановление после просадки
+        recovery_factor = net_profit / (self.initial_balance * max_dd / 100) if max_dd > 0 else 0
 
-        if equity_curve:
-            result.max_drawdown = self._calculate_max_drawdown(equity_curve)
+        # Статистика по сделкам
+        profits = [order.profit for order in self.closed_orders]
+        largest_win = max(profits) if profits else 0
+        largest_loss = min(profits) if profits else 0
 
-        # Период удержания
-        holding_periods = [t['holding_period'] for t in trades]
-        if holding_periods:
-            result.avg_holding_period = np.mean(holding_periods)
+        # Серии прибылей/убытков
+        consecutive_wins = self._calculate_consecutive_wins()
+        consecutive_losses = self._calculate_consecutive_losses()
 
-        # Серии побед/поражений
-        result.max_consecutive_wins = self._calculate_max_consecutive(trades, 'win')
-        result.max_consecutive_losses = self._calculate_max_consecutive(trades, 'loss')
+        return {
+            'initial_balance': self.initial_balance,
+            'final_balance': self.equity,
+            'net_profit': net_profit,
+            'total_return_pct': total_return,
+            'annual_return_pct': annual_return,
 
-        # Рассчитываем коэффициенты Шарпа, Сортино и Калмара
-        returns = [t['pnl'] for t in trades]
-        if returns:
-            result.sharpe_ratio = self._calculate_sharpe_ratio(returns)
-            result.sortino_ratio = self._calculate_sortino_ratio(returns)
-            if result.max_drawdown > 0:
-                result.calmar_ratio = result.net_profit / result.max_drawdown
+            'total_trades': total_trades,
+            'winning_trades': winning_trades,
+            'losing_trades': losing_trades,
+            'win_rate_pct': win_rate * 100,
 
-        return result
+            'total_profit': total_profit,
+            'total_loss': total_loss,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': profit_factor,
 
-    def _calculate_max_drawdown(self, equity_curve: List[float]) -> float:
-        """Расчет максимальной просадки"""
-        peak = equity_curve[0]
-        max_dd = 0.0
+            'largest_win': largest_win,
+            'largest_loss': largest_loss,
 
-        for value in equity_curve:
-            if value > peak:
-                peak = value
+            'max_drawdown_pct': max_dd,
+            'recovery_factor': recovery_factor,
 
-            dd = (peak - value) / peak
-            if dd > max_dd:
-                max_dd = dd
+            'sharpe_ratio': sharpe_ratio,
+            'volatility_pct': volatility * 100,
 
-        return max_dd
+            'consecutive_wins': consecutive_wins,
+            'consecutive_losses': consecutive_losses,
 
-    def _calculate_max_consecutive(self, trades: List[Dict[str, Any]], trade_type: str) -> int:
-        """Расчет максимальной серии побед или поражений"""
-        max_streak = 0
-        current_streak = 0
+            'position_count': self.position_count,
+            'avg_position_hold_time': self._calculate_avg_hold_time()
+        }
 
-        for trade in trades:
-            is_win = trade['pnl'] > 0
+    def _calculate_annual_return(self) -> float:
+        """Расчет годовой доходности"""
+        if not self.closed_orders:
+            return 0.0
 
-            if (trade_type == 'win' and is_win) or (trade_type == 'loss' and not is_win):
-                current_streak += 1
-                max_streak = max(max_streak, current_streak)
+        # Время первой и последней сделки
+        first_trade = min(order.entry_time for order in self.closed_orders)
+        last_trade = max(order.exit_time for order in self.closed_orders)
+
+        total_days = (last_trade - first_trade).days
+        if total_days == 0:
+            return 0.0
+
+        total_return = (self.equity - self.initial_balance) / self.initial_balance
+        annual_return = (1 + total_return) ** (365 / total_days) - 1
+
+        return annual_return * 100
+
+    def _calculate_returns_series(self) -> np.ndarray:
+        """Расчет серии доходностей"""
+        if len(self.equity_curve) < 2:
+            return np.array([])
+
+        returns = np.diff(self.equity_curve) / self.equity_curve[:-1]
+        return returns
+
+    def _calculate_consecutive_wins(self) -> int:
+        """Расчет максимальной серии прибыльных сделок"""
+        if not self.closed_orders:
+            return 0
+
+        max_consecutive = 0
+        current_consecutive = 0
+
+        for order in self.closed_orders:
+            if order.profit > 0:
+                current_consecutive += 1
+                max_consecutive = max(max_consecutive, current_consecutive)
             else:
-                current_streak = 0
+                current_consecutive = 0
 
-        return max_streak
+        return max_consecutive
 
-    def _calculate_sharpe_ratio(self, returns: List[float], risk_free_rate: float = 0.02) -> float:
-        """Расчет коэффициента Шарпа"""
-        if len(returns) < 2:
+    def _calculate_consecutive_losses(self) -> int:
+        """Расчет максимальной серии убыточных сделок"""
+        if not self.closed_orders:
+            return 0
+
+        max_consecutive = 0
+        current_consecutive = 0
+
+        for order in self.closed_orders:
+            if order.profit < 0:
+                current_consecutive += 1
+                max_consecutive = max(max_consecutive, current_consecutive)
+            else:
+                current_consecutive = 0
+
+        return max_consecutive
+
+    def _calculate_avg_hold_time(self) -> float:
+        """Расчет среднего времени удержания позиции"""
+        if not self.closed_orders:
             return 0.0
 
-        returns_array = np.array(returns)
-        excess_returns = returns_array - risk_free_rate / 252  # Дневная безрисковая ставка
+        total_seconds = sum(
+            (order.exit_time - order.entry_time).total_seconds()
+            for order in self.closed_orders
+            if order.exit_time and order.entry_time
+        )
 
-        if np.std(excess_returns) == 0:
-            return 0.0
+        avg_seconds = total_seconds / len(self.closed_orders)
+        avg_hours = avg_seconds / 3600
 
-        sharpe = np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(252)
-        return float(sharpe)
+        return avg_hours
 
-    def _calculate_sortino_ratio(self, returns: List[float], risk_free_rate: float = 0.02) -> float:
-        """Расчет коэффициента Сортино"""
-        if len(returns) < 2:
-            return 0.0
+    def generate_report(self) -> Dict[str, Any]:
+        """
+        Генерация полного отчета
 
-        returns_array = np.array(returns)
-        excess_returns = returns_array - risk_free_rate / 252
+        Returns:
+            Полный отчет о бэктесте
+        """
+        metrics = self.get_performance_metrics()
 
-        # Только отрицательные возвраты
-        negative_returns = excess_returns[excess_returns < 0]
-
-        if len(negative_returns) == 0 or np.std(negative_returns) == 0:
-            return 0.0
-
-        sortino = np.mean(excess_returns) / np.std(negative_returns) * np.sqrt(252)
-        return float(sortino)
-
-    def generate_report(self, result: BacktestResult, save_path: Optional[str] = None) -> str:
-        """Генерация отчета о бэктестинге"""
-        report = "=" * 80 + "\n"
-        report += "BACKTESTING REPORT\n"
-        report += "=" * 80 + "\n\n"
-
-        # Основная статистика
-        report += "📊 PERFORMANCE SUMMARY\n"
-        report += "-" * 40 + "\n"
-        report += f"Total Trades: {result.total_trades}\n"
-        report += f"Winning Trades: {result.winning_trades} ({result.win_rate:.1%})\n"
-        report += f"Losing Trades: {result.losing_trades} ({1 - result.win_rate:.1%})\n"
-        report += f"Net Profit: ${result.net_profit:.2f}\n"
-        report += f"Profit Factor: {result.profit_factor:.2f}\n"
-        report += f"Expectancy: ${result.expectancy:.2f}\n\n"
-
-        # Прибыль/убыток
-        report += "💰 PROFIT/LOSS ANALYSIS\n"
-        report += "-" * 40 + "\n"
-        report += f"Total Profit: ${result.total_profit:.2f}\n"
-        report += f"Total Loss: ${result.total_loss:.2f}\n"
-        report += f"Average Winning Trade: ${result.avg_winning_trade:.2f}\n"
-        report += f"Average Losing Trade: ${result.avg_losing_trade:.2f}\n"
-        report += f"Largest Win: ${result.largest_win:.2f}\n"
-        report += f"Largest Loss: ${result.largest_loss:.2f}\n\n"
-
-        # Риск
-        report += "⚠️ RISK METRICS\n"
-        report += "-" * 40 + "\n"
-        report += f"Max Drawdown: {result.max_drawdown:.1%}\n"
-        report += f"Sharpe Ratio: {result.sharpe_ratio or 0:.2f}\n"
-        report += f"Sortino Ratio: {result.sortino_ratio or 0:.2f}\n"
-        report += f"Calmar Ratio: {result.calmar_ratio or 0:.2f}\n\n"
-
-        # Время
-        report += "⏰ TIME ANALYSIS\n"
-        report += "-" * 40 + "\n"
-        report += f"Average Holding Period: {result.avg_holding_period:.1f} periods\n"
-        report += f"Max Consecutive Wins: {result.max_consecutive_wins}\n"
-        report += f"Max Consecutive Losses: {result.max_consecutive_losses}\n\n"
-
-        # Последние сделки
-        report += "📈 RECENT TRADES\n"
-        report += "-" * 40 + "\n"
-
-        if result.trades:
-            last_trades = result.trades[-5:]  # Последние 5 сделок
-
-            for i, trade in enumerate(last_trades, 1):
-                report += f"{i}. {trade['pattern_name']} ({trade['direction']}): "
-                report += f"P&L: ${trade['pnl']:.2f}, "
-                report += f"Exit: {trade['exit_reason']}\n"
-
-        report += "\n" + "=" * 80 + "\n"
-
-        # Сохранение отчета
-        if save_path:
-            from pathlib import Path
-            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-
-            with open(save_path, 'w', encoding='utf-8') as f:
-                f.write(report)
-
-            self.logger.info(f"Отчет сохранен в {save_path}")
+        report = {
+            'summary': metrics,
+            'orders': [
+                {
+                    'id': order.id,
+                    'symbol': order.symbol,
+                    'type': order.order_type.value,
+                    'volume': order.volume,
+                    'entry_price': order.entry_price,
+                    'exit_price': order.exit_price,
+                    'entry_time': order.entry_time.isoformat() if order.entry_time else None,
+                    'exit_time': order.exit_time.isoformat() if order.exit_time else None,
+                    'profit': order.profit,
+                    'status': order.status.value,
+                    'comment': order.comment
+                }
+                for order in self.closed_orders
+            ],
+            'equity_curve': self.equity_curve,
+            'drawdown_curve': self.drawdown_curve,
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'initial_balance': self.config.INITIAL_BALANCE,
+                'leverage': self.config.LEVERAGE,
+                'commission_rate': self.config.COMMISSION_RATE,
+                'max_position_size': self.config.MAX_POSITION_SIZE
+            }
+        }
 
         return report
 
+    def reset(self):
+        """Сброс движка бэктестинга"""
+        self.balance = self.initial_balance
+        self.equity = self.initial_balance
+        self.margin = 0.0
+        self.free_margin = self.initial_balance
+        self.orders = []
+        self.closed_orders = []
+        self.equity_curve = []
+        self.drawdown_curve = []
+        self.max_drawdown = 0.0
+        self.current_drawdown = 0.0
+        self.peak_equity = self.initial_balance
+        self.position_count = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
 
-def run_backtest_cli():
-    """CLI для запуска бэктестинга"""
-    import argparse
-    import asyncio
-
-    parser = argparse.ArgumentParser(description="Backtesting CLI for Pattern Recognition Engine")
-    parser.add_argument("--symbol", type=str, default="EURUSD", help="Trading symbol")
-    parser.add_argument("--timeframe", type=str, default="H1", help="Timeframe")
-    parser.add_argument("--bars", type=int, default=1000, help="Number of bars")
-    parser.add_argument("--output", type=str, help="Output file for report")
-
-    args = parser.parse_args()
-
-    async def main():
-        # Здесь должен быть код загрузки данных и запуска бэктестинга
-        # Пока заглушка
-        print(f"Backtesting for {args.symbol} {args.timeframe}")
-
-    asyncio.run(main())
-
-
-if __name__ == "__main__":
-    run_backtest_cli()
+        self.logger.info("Движок бэктестинга сброшен")
 

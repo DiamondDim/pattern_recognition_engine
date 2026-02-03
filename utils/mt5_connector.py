@@ -1,3 +1,5 @@
+# utils/mt5_connector.py
+
 """
 Модуль подключения к MetaTrader 5
 """
@@ -18,6 +20,7 @@ try:
 except ImportError:
     MT5_AVAILABLE = False
     logger.warning("MetaTrader5 не установлен. MT5 функциональность недоступна.")
+
 
 class MT5Connector:
     """Класс для работы с MetaTrader 5"""
@@ -419,6 +422,9 @@ class MT5Connector:
 
     def _convert_timeframe(self, timeframe: str) -> Optional[int]:
         """Конвертация строкового таймфрейма в MT5 константу"""
+        if not MT5_AVAILABLE:
+            return None
+
         timeframe_map = {
             'M1': mt5.TIMEFRAME_M1,
             'M2': mt5.TIMEFRAME_M2,
@@ -444,13 +450,4 @@ class MT5Connector:
         }
 
         return timeframe_map.get(timeframe.upper())
-
-    async def __aenter__(self):
-        """Контекстный менеджер - вход"""
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Контекстный менеджер - выход"""
-        await self.disconnect()
 

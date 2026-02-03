@@ -368,22 +368,14 @@ class PatternVisualizer:
         # Добавляем текст на график
         fig.text(0.02, 0.02, info_text, fontsize=9,
                  verticalalignment='bottom',
-                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-        # Добавляем легенду
-        handles, labels = ax_price.get_legend_handles_labels()
-        if handles:
-            # Убираем дубликаты в легенде
-            by_label = dict(zip(labels, handles))
-            ax_price.legend(by_label.values(), by_label.keys(),
-                            loc='upper right', fontsize=8)
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
     def create_interactive_chart(self,
-                                 pattern: Dict[str, Any],
-                                 ohlc_data: Dict[str, np.ndarray],
-                                 indicators: Optional[Dict[str, np.ndarray]] = None) -> go.Figure:
+                                pattern: Dict[str, Any],
+                                ohlc_data: Dict[str, np.ndarray],
+                                indicators: Optional[Dict[str, np.ndarray]] = None) -> go.Figure:
         """
-        Создание интерактивного графика с помощью Plotly
+        Создание интерактивного графика с использованием Plotly
 
         Args:
             pattern: Данные паттерна
@@ -391,7 +383,7 @@ class PatternVisualizer:
             indicators: Технические индикаторы
 
         Returns:
-            Объект Figure Plotly
+            Интерактивный график Plotly
         """
         try:
             # Извлекаем данные
@@ -400,31 +392,30 @@ class PatternVisualizer:
             lows = ohlc_data.get('low', np.array([]))
             closes = ohlc_data.get('close', np.array([]))
             volumes = ohlc_data.get('volume', np.array([]))
+            timestamps = ohlc_data.get('timestamp', np.arange(len(closes)))
 
             if len(closes) == 0:
-                self.logger.error("Нет данных для построения графика")
+                self.logger.error("Нет данных для построения интерактивного графика")
                 return None
 
-            # Создаем subplots
+            # Создаем подграфики
             fig = make_subplots(
                 rows=3, cols=1,
                 shared_xaxes=True,
-                vertical_spacing=0.05,
-                row_heights=[0.6, 0.2, 0.2],
-                subplot_titles=('Price Chart', 'Volume', 'Indicators')
+                vertical_spacing=0.03,
+                subplot_titles=('Цены', 'Объемы', 'Индикаторы'),
+                row_width=[0.6, 0.2, 0.2]
             )
 
             # Добавляем свечи
             fig.add_trace(
                 go.Candlestick(
-                    x=list(range(len(opens))),
+                    x=timestamps,
                     open=opens,
                     high=highs,
                     low=lows,
                     close=closes,
-                    name='OHLC',
-                    increasing_line_color=self.colors['bullish'],
-                    decreasing_line_color=self.colors['bearish']
+                    name='OHLC'
                 ),
                 row=1, col=1
             )
@@ -438,35 +429,28 @@ class PatternVisualizer:
 
                 fig.add_trace(
                     go.Scatter(
-                        x=[idx],
+                        x=[timestamps[idx] if idx < len(timestamps) else timestamps[-1]],
                         y=[price],
-                        mode='markers',
+                        mode='markers+text',
                         name=point_type,
-                        marker=dict(
-                            size=10,
-                            color=self._get_point_color(point_type),
-                            symbol=self._get_point_symbol(point_type)
-                        ),
-                        showlegend=True
+                        marker=dict(size=10, symbol='diamond'),
+                        text=[point_type],
+                        textposition="top center"
                     ),
                     row=1, col=1
                 )
 
-            # Добавляем целевые уровни
-            targets = pattern.get('targets', {})
-            self._add_target_lines(fig, targets)
-
             # Добавляем объемы
             if len(volumes) > 0:
-                volume_colors = ['green' if closes[i] >= opens[i] else 'red'
-                                 for i in range(len(volumes))]
+                colors_volume = ['green' if closes[i] >= opens[i] else 'red'
+                               for i in range(len(closes))]
 
                 fig.add_trace(
                     go.Bar(
-                        x=list(range(len(volumes))),
+                        x=timestamps,
                         y=volumes,
                         name='Volume',
-                        marker_color=volume_colors,
+                        marker_color=colors_volume,
                         opacity=0.7
                     ),
                     row=2, col=1
@@ -474,399 +458,40 @@ class PatternVisualizer:
 
             # Добавляем индикаторы
             if indicators:
-                self._add_indicators_plotly(fig, indicators)
+                if 'rsi' in indicators:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=timestamps,
+                            y=indicators['rsi'],
+                            name='RSI',
+                            line=dict(color='purple', width=2)
+                        ),
+                        row=3, col=1
+                    )
+                    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+                    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 
             # Настраиваем layout
-            self._setup_plotly_layout(fig, pattern)
+            pattern_name = pattern.get('name', 'Unknown')
+            direction = pattern.get('direction', 'neutral')
+            symbol = pattern.get('metadata', {}).get('symbol', 'UNKNOWN')
+            timeframe = pattern.get('metadata', {}).get('timeframe', 'UNKNOWN')
+
+            fig.update_layout(
+                title=f"{symbol} - {timeframe} - {pattern_name} ({direction})",
+                xaxis_title="Дата",
+                yaxis_title="Цена",
+                template="plotly_dark",
+                height=800,
+                showlegend=True
+            )
+
+            # Отключаем режим масштабирования по диапазону
+            fig.update_xaxes(rangeslider_visible=False)
 
             return fig
 
         except Exception as e:
             self.logger.error(f"Ошибка создания интерактивного графика: {e}")
             return None
-
-    def _get_point_color(self, point_type: str) -> str:
-        """Получение цвета точки"""
-        color_map = {
-            'head': 'red',
-            'shoulder': 'orange',
-            'neckline': 'blue',
-            'top': self.colors['resistance'],
-            'bottom': self.colors['support'],
-            'entry': self.colors['entry'],
-            'stop_loss': self.colors['stop_loss'],
-            'take_profit': self.colors['take_profit']
-        }
-
-        for key, color in color_map.items():
-            if key in point_type.lower():
-                return color
-
-        return 'gray'
-
-    def _get_point_symbol(self, point_type: str) -> str:
-        """Получение символа точки"""
-        symbol_map = {
-            'head': 'triangle-down',
-            'shoulder': 'triangle-up',
-            'neckline': 'circle',
-            'top': 'triangle-down',
-            'bottom': 'triangle-up',
-            'entry': 'star',
-            'stop_loss': 'x',
-            'take_profit': 'diamond'
-        }
-
-        for key, symbol in symbol_map.items():
-            if key in point_type.lower():
-                return symbol
-
-        return 'circle'
-
-    def _add_target_lines(self, fig: go.Figure, targets: Dict[str, float]):
-        """Добавление целевых уровней"""
-        entry = targets.get('entry_price')
-        stop_loss = targets.get('stop_loss')
-        take_profit = targets.get('take_profit')
-
-        if entry:
-            fig.add_hline(
-                y=entry,
-                line_dash="solid",
-                line_color=self.colors['entry'],
-                opacity=0.7,
-                annotation_text=f"Entry: {entry:.4f}",
-                row=1, col=1
-            )
-
-        if stop_loss:
-            fig.add_hline(
-                y=stop_loss,
-                line_dash="dash",
-                line_color=self.colors['stop_loss'],
-                opacity=0.7,
-                annotation_text=f"Stop: {stop_loss:.4f}",
-                row=1, col=1
-            )
-
-        if take_profit:
-            fig.add_hline(
-                y=take_profit,
-                line_dash="dot",
-                line_color=self.colors['take_profit'],
-                opacity=0.7,
-                annotation_text=f"TP: {take_profit:.4f}",
-                row=1, col=1
-            )
-
-    def _add_indicators_plotly(self, fig: go.Figure, indicators: Dict[str, np.ndarray]):
-        """Добавление индикаторов в Plotly"""
-        # RSI
-        if 'rsi' in indicators:
-            rsi = indicators['rsi']
-            fig.add_trace(
-                go.Scatter(
-                    x=list(range(len(rsi))),
-                    y=rsi,
-                    name='RSI',
-                    line=dict(color='purple', width=1.5)
-                ),
-                row=3, col=1
-            )
-
-            # Уровни RSI
-            fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=3, col=1)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=3, col=1)
-
-        # MACD
-        elif 'macd' in indicators and 'macd_signal' in indicators:
-            macd = indicators['macd']
-            macd_signal = indicators['macd_signal']
-
-            fig.add_trace(
-                go.Scatter(
-                    x=list(range(len(macd))),
-                    y=macd,
-                    name='MACD',
-                    line=dict(color='blue', width=1.5)
-                ),
-                row=3, col=1
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=list(range(len(macd_signal))),
-                    y=macd_signal,
-                    name='Signal',
-                    line=dict(color='red', width=1.5)
-                ),
-                row=3, col=1
-            )
-
-    def _setup_plotly_layout(self, fig: go.Figure, pattern: Dict[str, Any]):
-        """Настройка layout Plotly"""
-        pattern_name = pattern.get('name', 'Unknown')
-        symbol = pattern.get('metadata', {}).get('symbol', 'UNKNOWN')
-        timeframe = pattern.get('metadata', {}).get('timeframe', 'UNKNOWN')
-        quality = pattern.get('metadata', {}).get('quality_score', 0)
-
-        title = f"{symbol} - {timeframe} - {pattern_name} (Quality: {quality:.2f})"
-
-        fig.update_layout(
-            title=title,
-            xaxis_title="Time",
-            yaxis_title="Price",
-            template="plotly_dark",
-            showlegend=True,
-            hovermode='x unified',
-            height=800
-        )
-
-        # Настраиваем оси
-        fig.update_xaxes(rangeslider_visible=False)
-        fig.update_yaxes(fixedrange=False)
-
-    def plot_multiple_patterns(self,
-                               patterns: List[Dict[str, Any]],
-                               ohlc_data: Dict[str, np.ndarray],
-                               save_path: Optional[str] = None) -> plt.Figure:
-        """
-        Построение графика с несколькими паттернами
-
-        Args:
-            patterns: Список паттернов
-            ohlc_data: Данные OHLC
-            save_path: Путь для сохранения
-
-        Returns:
-            Объект Figure matplotlib
-        """
-        try:
-            if not patterns:
-                self.logger.warning("Нет паттернов для отображения")
-                return None
-
-            # Создаем график
-            fig, ax = plt.subplots(figsize=self.config.FIGURE_SIZE)
-
-            # Рисуем свечи
-            opens = ohlc_data.get('open', np.array([]))
-            highs = ohlc_data.get('high', np.array([]))
-            lows = ohlc_data.get('low', np.array([]))
-            closes = ohlc_data.get('close', np.array([]))
-
-            self._plot_candlesticks(ax, opens, highs, lows, closes,
-                                    range(len(closes)))
-
-            # Рисуем каждый паттерн
-            for pattern in patterns:
-                self._plot_pattern_on_chart(ax, pattern, range(len(closes)))
-
-            # Настраиваем график
-            ax.set_title(f"Multiple Patterns Detected ({len(patterns)} patterns)")
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Price")
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='best')
-
-            plt.tight_layout()
-
-            if save_path:
-                plt.savefig(save_path, dpi=self.config.PLOT_DPI,
-                            bbox_inches='tight')
-                self.logger.debug(f"График сохранен: {save_path}")
-
-            return fig
-
-        except Exception as e:
-            self.logger.error(f"Ошибка построения графика: {e}")
-            return None
-
-    def plot_statistics(self,
-                        statistics: Dict[str, Any],
-                        save_path: Optional[str] = None) -> plt.Figure:
-        """
-        Построение графиков статистики
-
-        Args:
-            statistics: Статистика паттернов
-            save_path: Путь для сохранения
-
-        Returns:
-            Объект Figure matplotlib
-        """
-        try:
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            axes = axes.flatten()
-
-            # 1. Распределение по типам паттернов
-            if 'by_type' in statistics:
-                types = list(statistics['by_type'].keys())
-                counts = [statistics['by_type'][t]['count'] for t in types]
-
-                axes[0].bar(types, counts, color='skyblue')
-                axes[0].set_title('Patterns by Type')
-                axes[0].set_xlabel('Pattern Type')
-                axes[0].set_ylabel('Count')
-                axes[0].tick_params(axis='x', rotation=45)
-
-            # 2. Распределение по направлениям
-            if 'by_direction' in statistics:
-                directions = list(statistics['by_direction'].keys())
-                counts = [statistics['by_direction'][d] for d in directions]
-                colors = [self.colors['bullish'] if d == 'bullish'
-                          else self.colors['bearish'] if d == 'bearish'
-                else self.colors['neutral'] for d in directions]
-
-                axes[1].bar(directions, counts, color=colors)
-                axes[1].set_title('Patterns by Direction')
-                axes[1].set_xlabel('Direction')
-                axes[1].set_ylabel('Count')
-
-            # 3. Качество паттернов
-            if 'avg_quality' in statistics:
-                # Гистограмма качества
-                # TODO: Нужны реальные данные о качестве
-                pass
-
-            # 4. Успешность паттернов
-            if 'by_type' in statistics:
-                types = list(statistics['by_type'].keys())
-                success_rates = []
-
-                for pattern_type in types:
-                    stats = statistics['by_type'][pattern_type]
-                    if stats['count'] > 0:
-                        success_rate = stats.get('success_rate', 0)
-                        success_rates.append(success_rate)
-                    else:
-                        success_rates.append(0)
-
-                axes[3].bar(types, success_rates, color='lightgreen')
-                axes[3].set_title('Success Rate by Pattern Type')
-                axes[3].set_xlabel('Pattern Type')
-                axes[3].set_ylabel('Success Rate')
-                axes[3].tick_params(axis='x', rotation=45)
-                axes[3].set_ylim(0, 1)
-
-            plt.tight_layout()
-
-            if save_path:
-                plt.savefig(save_path, dpi=self.config.PLOT_DPI,
-                            bbox_inches='tight')
-
-            return fig
-
-        except Exception as e:
-            self.logger.error(f"Ошибка построения статистики: {e}")
-            return None
-
-    def save_figure(self, fig: plt.Figure, filename: str) -> bool:
-        """
-        Сохранение фигуры в файл
-
-        Args:
-            fig: Объект Figure
-            filename: Имя файла
-
-        Returns:
-            True если успешно сохранено
-        """
-        try:
-            filepath = Path(filename)
-            fig.savefig(filepath, dpi=self.config.PLOT_DPI,
-                        bbox_inches='tight', format=self.config.PLOT_FORMAT)
-            self.logger.debug(f"Фигура сохранена: {filepath}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Ошибка сохранения фигуры: {e}")
-            return False
-
-
-def create_pattern_report(pattern: Dict[str, Any],
-                          analysis: Dict[str, Any],
-                          prediction: Dict[str, Any]) -> str:
-    """
-    Создание текстового отчета о паттерне
-
-    Args:
-        pattern: Данные паттерна
-        analysis: Результаты анализа
-        prediction: Прогноз
-
-    Returns:
-        Текстовый отчет
-    """
-    try:
-        # Базовая информация
-        report = "=" * 60 + "\n"
-        report += "PATTERN ANALYSIS REPORT\n"
-        report += "=" * 60 + "\n\n"
-
-        # Информация о паттерне
-        report += f"Pattern: {pattern.get('name', 'Unknown')}\n"
-        report += f"Type: {pattern.get('type', 'Unknown')}\n"
-        report += f"Direction: {pattern.get('direction', 'neutral').upper()}\n"
-        report += f"Symbol: {pattern.get('metadata', {}).get('symbol', 'UNKNOWN')}\n"
-        report += f"Timeframe: {pattern.get('metadata', {}).get('timeframe', 'UNKNOWN')}\n"
-        report += f"Detected: {pattern.get('detection_time', 'Unknown')}\n"
-
-        report += "\n" + "-" * 40 + "\n"
-
-        # Качество и уверенность
-        metadata = pattern.get('metadata', {})
-        report += f"Quality Score: {metadata.get('quality_score', 0):.2f}\n"
-        report += f"Confidence: {metadata.get('confidence', 0):.2f}\n"
-        report += f"Market Context: {metadata.get('market_context', 'neutral')}\n"
-
-        report += "\n" + "-" * 40 + "\n"
-
-        # Целевые уровни
-        targets = pattern.get('targets', {})
-        report += "TARGET LEVELS:\n"
-        if targets.get('entry_price'):
-            report += f"  Entry: {targets['entry_price']:.4f}\n"
-        if targets.get('stop_loss'):
-            report += f"  Stop Loss: {targets['stop_loss']:.4f}\n"
-        if targets.get('take_profit'):
-            report += f"  Take Profit: {targets['take_profit']:.4f}\n"
-        if targets.get('profit_risk_ratio'):
-            report += f"  Risk/Reward: {targets['profit_risk_ratio']:.2f}\n"
-
-        report += "\n" + "-" * 40 + "\n"
-
-        # Анализ
-        if analysis:
-            report += "ANALYSIS:\n"
-            report += f"  Overall Score: {analysis.get('overall_score', 0):.2f}\n"
-            report += f"  Recommendation: {analysis.get('recommendation', 'HOLD')}\n"
-            report += f"  Confidence: {analysis.get('confidence', 'LOW')}\n"
-
-            # Детали анализа
-            report += "\n  Details:\n"
-            for key, value in analysis.items():
-                if key not in ['overall_score', 'recommendation', 'confidence', 'error']:
-                    if isinstance(value, (int, float)):
-                        report += f"    {key}: {value:.2f}\n"
-                    else:
-                        report += f"    {key}: {value}\n"
-
-        report += "\n" + "-" * 40 + "\n"
-
-        # Прогноз
-        if prediction:
-            report += "PREDICTION:\n"
-            report += f"  Success Probability: {prediction.get('probability_success', 0):.1%}\n"
-            report += f"  Expected Profit: {prediction.get('expected_profit', 0):.4f}\n"
-            report += f"  Expected Risk: {prediction.get('expected_risk', 0):.4f}\n"
-            report += f"  Confidence: {prediction.get('confidence', 0):.2f}\n"
-
-        report += "\n" + "=" * 60 + "\n"
-
-        return report
-
-    except Exception as e:
-        logger.error(f"Ошибка создания отчета: {e}")
-        return f"Error creating report: {e}"
 

@@ -1,238 +1,189 @@
 """
-Модуль работы с базой данных паттернов
+Модуль базы данных паттернов
 """
 
-import asyncio
+import sqlite3
 import json
-from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Any, Optional, Tuple, Union
 from datetime import datetime, timedelta
 from pathlib import Path
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, JSON, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.exc import SQLAlchemyError
-import pandas as pd
+import hashlib
 
-from config import config
+from config import DATABASE_CONFIG
 from utils.logger import logger
+from utils.helpers import generate_id
 
-# Создание базового класса для моделей
-Base = declarative_base()
-
-class PatternRecord(Base):
-    """Модель записи паттерна в базе данных"""
-
-    __tablename__ = 'patterns'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    pattern_id = Column(String(100), unique=True, index=True)
-    name = Column(String(100))
-    type = Column(String(50))  # geometric, candlestick, harmonic
-    symbol = Column(String(50))
-    timeframe = Column(String(10))
-    direction = Column(String(20))  # bullish, bearish, neutral
-    quality_score = Column(Float)
-    confidence_score = Column(Float)
-    detected_at = Column(DateTime)
-    points = Column(JSON)  # Координаты точек паттерна
-    metadata = Column(JSON)  # Дополнительные метаданные
-    is_active = Column(Boolean, default=True)
-    is_traded = Column(Boolean, default=False)
-    trade_result = Column(Float, nullable=True)  # Результат сделки
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Конвертация в словарь"""
-        return {
-            'id': self.id,
-            'pattern_id': self.pattern_id,
-            'name': self.name,
-            'type': self.type,
-            'symbol': self.symbol,
-            'timeframe': self.timeframe,
-            'direction': self.direction,
-            'quality_score': self.quality_score,
-            'confidence_score': self.confidence_score,
-            'detected_at': self.detected_at.isoformat() if self.detected_at else None,
-            'points': self.points,
-            'metadata': self.metadata,
-            'is_active': self.is_active,
-            'is_traded': self.is_traded,
-            'trade_result': self.trade_result,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None
-        }
 
 class PatternDatabase:
-    """Класс для работы с базой данных паттернов"""
+    """База данных для хранения паттернов"""
 
-    def __init__(self):
-        self.logger = logger.bind(module="pattern_database")
-        self.engine = None
-        self.SessionLocal = None
-        self.initialized = False
+    def __init__(self, db_path: str = None):
+        self.config = DATABASE_CONFIG
+        self.db_path = db_path or self.config.DB_PATH
+        self.logger = logger.bind(module="PatternDatabase")
+        self.connection = None
+        self._initialize_database()
 
-    async def initialize(self) -> bool:
-        """Инициализация подключения к базе данных"""
+    def _initialize_database(self):
+        """Инициализация базы данных"""
         try:
-            # Создание URL для подключения
-            db_url = config.DATABASE.url
+            # Создаем директорию если не существует
+            db_file = Path(self.db_path)
+            db_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Создание движка SQLAlchemy
-            self.engine = create_engine(
-                db_url,
-                echo=config.ENVIRONMENT == "development",
-                pool_size=config.DATABASE.POOL_SIZE,
-                max_overflow=config.DATABASE.MAX_OVERFLOW,
-                pool_pre_ping=True
-            )
+            # Подключаемся к БД
+            self.connection = sqlite3.connect(self.db_path)
+            self.connection.row_factory = sqlite3.Row
 
-            # Создание фабрики сессий
-            self.SessionLocal = sessionmaker(
-                autocommit=False,
-                autoflush=False,
-                bind=self.engine
-            )
+            # Создаем таблицы
+            self._create_tables()
 
-            # Создание таблиц если их нет
-            Base.metadata.create_all(bind=self.engine)
-
-            # Проверка подключения
-            with self.SessionLocal() as session:
-                session.execute("SELECT 1")
-
-            self.initialized = True
-            self.logger.info(f"База данных инициализирована: {db_url}")
-            return True
+            self.logger.info(f"База данных инициализирована: {self.db_path}")
 
         except Exception as e:
-            self.logger.error(f"Ошибка инициализации базы данных: {e}")
-            return False
+            self.logger.error(f"Ошибка инициализации БД: {e}")
+            raise
 
-    def get_session(self) -> Session:
-        """Получение сессии базы данных"""
-        if not self.initialized:
-            raise RuntimeError("База данных не инициализирована")
-        return self.SessionLocal()
+    def _create_tables(self):
+        """Создание таблиц базы данных"""
+        cursor = self.connection.cursor()
 
-    async def save_pattern(self, pattern_data: Dict[str, Any]) -> Optional[str]:
+        # Таблица паттернов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS patterns (
+                id TEXT PRIMARY KEY,
+                pattern_type TEXT NOT NULL,
+                pattern_name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                start_index INTEGER NOT NULL,
+                end_index INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                quality_score REAL,
+                data_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Таблица исторических результатов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pattern_history (
+                id TEXT PRIMARY KEY,
+                pattern_id TEXT NOT NULL,
+                entry_price REAL,
+                exit_price REAL,
+                profit REAL,
+                outcome TEXT,  -- 'success', 'failure', 'neutral'
+                duration_hours INTEGER,
+                max_profit REAL,
+                max_loss REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (pattern_id) REFERENCES patterns (id)
+            )
+        ''')
+
+        # Таблица статистики
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pattern_statistics (
+                pattern_name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                total_occurrences INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                failure_count INTEGER DEFAULT 0,
+                avg_confidence REAL,
+                avg_profit REAL,
+                avg_duration_hours REAL,
+                success_rate REAL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (pattern_name, symbol, timeframe)
+            )
+        ''')
+
+        # Индексы для оптимизации поиска
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_patterns_type ON patterns(pattern_type)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_patterns_symbol ON patterns(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_patterns_timeframe ON patterns(timeframe)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_patterns_confidence ON patterns(confidence)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_pattern_id ON pattern_history(pattern_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_outcome ON pattern_history(outcome)')
+
+        self.connection.commit()
+        self.logger.debug("Таблицы базы данных созданы")
+
+    def save_pattern(self, pattern_data: Dict[str, Any]) -> str:
         """
-        Сохранение паттерна в базу данных
+        Сохранение паттерна в БД
 
         Args:
             pattern_data: Данные паттерна
 
         Returns:
-            ID сохраненного паттерна или None
+            ID сохраненного паттерна
         """
         try:
-            # Генерация уникального ID паттерна
-            pattern_id = self._generate_pattern_id(pattern_data)
+            # Генерация ID
+            pattern_id = generate_id(prefix="pat")
 
-            with self.get_session() as session:
-                # Проверяем, существует ли уже такой паттерн
-                existing = session.query(PatternRecord).filter_by(
-                    pattern_id=pattern_id
-                ).first()
+            # Извлечение данных
+            pattern_type = pattern_data.get('pattern_type', 'unknown')
+            pattern_name = pattern_data.get('name', 'unknown')
+            symbol = pattern_data.get('metadata', {}).get('symbol', 'UNKNOWN')
+            timeframe = pattern_data.get('metadata', {}).get('timeframe', 'UNKNOWN')
+            direction = pattern_data.get('direction', 'neutral')
+            start_index = pattern_data.get('start_index', 0)
+            end_index = pattern_data.get('end_index', 0)
+            confidence = pattern_data.get('confidence', 0.5)
+            quality_score = pattern_data.get('quality_score', 0.5)
 
-                if existing:
-                    # Обновляем существующий паттерн
-                    existing.quality_score = pattern_data.get('quality_score', existing.quality_score)
-                    existing.confidence_score = pattern_data.get('confidence_score', existing.confidence_score)
-                    existing.points = pattern_data.get('points', existing.points)
-                    existing.metadata = pattern_data.get('metadata', existing.metadata)
-                    existing.updated_at = datetime.now()
+            # Сериализация данных
+            data_json = json.dumps(pattern_data, default=str)
 
-                    self.logger.debug(f"Паттерн обновлен: {pattern_id}")
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                INSERT INTO patterns 
+                (id, pattern_type, pattern_name, symbol, timeframe, direction, 
+                 start_index, end_index, confidence, quality_score, data_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (pattern_id, pattern_type, pattern_name, symbol, timeframe, direction,
+                  start_index, end_index, confidence, quality_score, data_json))
 
-                else:
-                    # Создаем новый паттерн
-                    pattern = PatternRecord(
-                        pattern_id=pattern_id,
-                        name=pattern_data.get('name', 'unknown'),
-                        type=pattern_data.get('type', 'unknown'),
-                        symbol=pattern_data.get('symbol', 'UNKNOWN'),
-                        timeframe=pattern_data.get('timeframe', 'H1'),
-                        direction=pattern_data.get('direction', 'neutral'),
-                        quality_score=pattern_data.get('quality_score', 0.5),
-                        confidence_score=pattern_data.get('confidence_score', 0.5),
-                        detected_at=pattern_data.get('detected_at', datetime.now()),
-                        points=pattern_data.get('points', []),
-                        metadata=pattern_data.get('metadata', {}),
-                        is_active=True,
-                        is_traded=False
-                    )
+            self.connection.commit()
 
-                    session.add(pattern)
-                    self.logger.debug(f"Паттерн сохранен: {pattern_id}")
+            # Обновление статистики
+            self._update_statistics(pattern_name, symbol, timeframe, confidence)
 
-                session.commit()
-                return pattern_id
+            self.logger.debug(f"Паттерн сохранен: {pattern_id} ({pattern_name})")
+            return pattern_id
 
-        except SQLAlchemyError as e:
-            self.logger.error(f"Ошибка сохранения паттерна: {e}")
-            session.rollback()
-            return None
         except Exception as e:
-            self.logger.error(f"Неожиданная ошибка при сохранении паттерна: {e}")
-            return None
+            self.logger.error(f"Ошибка сохранения паттерна: {e}")
+            return ""
 
-    async def save_patterns_batch(self, patterns_data: List[Dict[str, Any]]) -> List[str]:
+    def save_patterns_batch(self, patterns: List[Dict[str, Any]]) -> List[str]:
         """
         Пакетное сохранение паттернов
 
         Args:
-            patterns_data: Список данных паттернов
+            patterns: Список паттернов
 
         Returns:
             Список ID сохраненных паттернов
         """
-        saved_ids = []
+        ids = []
+        for pattern in patterns:
+            pattern_id = self.save_pattern(pattern)
+            if pattern_id:
+                ids.append(pattern_id)
 
-        try:
-            with self.get_session() as session:
-                for pattern_data in patterns_data:
-                    pattern_id = self._generate_pattern_id(pattern_data)
+        self.logger.info(f"Сохранено паттернов: {len(ids)}")
+        return ids
 
-                    # Проверяем существование
-                    existing = session.query(PatternRecord).filter_by(
-                        pattern_id=pattern_id
-                    ).first()
-
-                    if existing:
-                        existing.updated_at = datetime.now()
-                    else:
-                        pattern = PatternRecord(
-                            pattern_id=pattern_id,
-                            name=pattern_data.get('name', 'unknown'),
-                            type=pattern_data.get('type', 'unknown'),
-                            symbol=pattern_data.get('symbol', 'UNKNOWN'),
-                            timeframe=pattern_data.get('timeframe', 'H1'),
-                            direction=pattern_data.get('direction', 'neutral'),
-                            quality_score=pattern_data.get('quality_score', 0.5),
-                            confidence_score=pattern_data.get('confidence_score', 0.5),
-                            detected_at=pattern_data.get('detected_at', datetime.now()),
-                            points=pattern_data.get('points', []),
-                            metadata=pattern_data.get('metadata', {}),
-                            is_active=True,
-                            is_traded=False
-                        )
-                        session.add(pattern)
-
-                    saved_ids.append(pattern_id)
-
-                session.commit()
-                self.logger.info(f"Пакетно сохранено паттернов: {len(saved_ids)}")
-
-        except SQLAlchemyError as e:
-            self.logger.error(f"Ошибка пакетного сохранения паттернов: {e}")
-            session.rollback()
-            return []
-
-        return saved_ids
-
-    async def get_pattern(self, pattern_id: str) -> Optional[Dict[str, Any]]:
+    def get_pattern_by_id(self, pattern_id: str) -> Optional[Dict[str, Any]]:
         """
         Получение паттерна по ID
 
@@ -243,378 +194,488 @@ class PatternDatabase:
             Данные паттерна или None
         """
         try:
-            with self.get_session() as session:
-                pattern = session.query(PatternRecord).filter_by(
-                    pattern_id=pattern_id
-                ).first()
+            cursor = self.connection.cursor()
+            cursor.execute('SELECT * FROM patterns WHERE id = ?', (pattern_id,))
+            row = cursor.fetchone()
 
-                if pattern:
-                    return pattern.to_dict()
-                else:
-                    return None
+            if row:
+                pattern_data = json.loads(row['data_json'])
+                pattern_data['db_id'] = row['id']
+                pattern_data['created_at'] = row['created_at']
+                pattern_data['updated_at'] = row['updated_at']
+                return pattern_data
 
-        except Exception as e:
-            self.logger.error(f"Ошибка получения паттерна {pattern_id}: {e}")
             return None
 
-    async def get_patterns(self,
-                         symbol: Optional[str] = None,
-                         timeframe: Optional[str] = None,
-                         pattern_type: Optional[str] = None,
-                         direction: Optional[str] = None,
-                         min_quality: float = 0.0,
-                         min_confidence: float = 0.0,
-                         start_date: Optional[datetime] = None,
-                         end_date: Optional[datetime] = None,
-                         active_only: bool = True,
-                         limit: int = 100) -> List[Dict[str, Any]]:
+        except Exception as e:
+            self.logger.error(f"Ошибка получения паттерна: {e}")
+            return None
+
+    def find_patterns(self,
+                     pattern_type: Optional[str] = None,
+                     pattern_name: Optional[str] = None,
+                     symbol: Optional[str] = None,
+                     timeframe: Optional[str] = None,
+                     direction: Optional[str] = None,
+                     min_confidence: float = 0.0,
+                     start_date: Optional[datetime] = None,
+                     end_date: Optional[datetime] = None,
+                     limit: int = 100) -> List[Dict[str, Any]]:
         """
-        Получение паттернов по фильтрам
+        Поиск паттернов по критериям
 
         Args:
-            symbol: Фильтр по символу
-            timeframe: Фильтр по таймфрейму
-            pattern_type: Фильтр по типу паттерна
-            direction: Фильтр по направлению
-            min_quality: Минимальный качественный балл
+            pattern_type: Тип паттерна
+            pattern_name: Имя паттерна
+            symbol: Символ
+            timeframe: Таймфрейм
+            direction: Направление
             min_confidence: Минимальная уверенность
             start_date: Начальная дата
             end_date: Конечная дата
-            active_only: Только активные паттерны
-            limit: Максимальное количество записей
+            limit: Ограничение количества
 
         Returns:
-            Список паттернов
+            Список найденных паттернов
         """
         try:
-            with self.get_session() as session:
-                query = session.query(PatternRecord)
+            query = "SELECT * FROM patterns WHERE 1=1"
+            params = []
 
-                # Применяем фильтры
-                if symbol:
-                    query = query.filter_by(symbol=symbol)
+            if pattern_type:
+                query += " AND pattern_type = ?"
+                params.append(pattern_type)
 
-                if timeframe:
-                    query = query.filter_by(timeframe=timeframe)
+            if pattern_name:
+                query += " AND pattern_name = ?"
+                params.append(pattern_name)
 
-                if pattern_type:
-                    query = query.filter_by(type=pattern_type)
+            if symbol:
+                query += " AND symbol = ?"
+                params.append(symbol)
 
-                if direction:
-                    query = query.filter_by(direction=direction)
+            if timeframe:
+                query += " AND timeframe = ?"
+                params.append(timeframe)
 
-                if active_only:
-                    query = query.filter_by(is_active=True)
+            if direction:
+                query += " AND direction = ?"
+                params.append(direction)
 
-                # Фильтры по качеству
-                query = query.filter(
-                    PatternRecord.quality_score >= min_quality,
-                    PatternRecord.confidence_score >= min_confidence
-                )
+            if min_confidence > 0:
+                query += " AND confidence >= ?"
+                params.append(min_confidence)
 
-                # Фильтры по дате
-                if start_date:
-                    query = query.filter(PatternRecord.detected_at >= start_date)
+            if start_date:
+                query += " AND created_at >= ?"
+                params.append(start_date.isoformat())
 
-                if end_date:
-                    query = query.filter(PatternRecord.detected_at <= end_date)
+            if end_date:
+                query += " AND created_at <= ?"
+                params.append(end_date.isoformat())
 
-                # Сортировка и лимит
-                patterns = query.order_by(
-                    PatternRecord.quality_score.desc(),
-                    PatternRecord.detected_at.desc()
-                ).limit(limit).all()
+            query += " ORDER BY confidence DESC, created_at DESC LIMIT ?"
+            params.append(limit)
 
-                return [p.to_dict() for p in patterns]
+            cursor = self.connection.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+
+            patterns = []
+            for row in rows:
+                pattern_data = json.loads(row['data_json'])
+                pattern_data['db_id'] = row['id']
+                pattern_data['created_at'] = row['created_at']
+                pattern_data['updated_at'] = row['updated_at']
+                patterns.append(pattern_data)
+
+            self.logger.debug(f"Найдено паттернов: {len(patterns)}")
+            return patterns
 
         except Exception as e:
-            self.logger.error(f"Ошибка получения паттернов: {e}")
+            self.logger.error(f"Ошибка поиска паттернов: {e}")
             return []
 
-    async def get_pattern_statistics(self,
-                                   symbol: Optional[str] = None,
-                                   timeframe: Optional[str] = None) -> Dict[str, Any]:
+    def add_pattern_outcome(self,
+                           pattern_id: str,
+                           entry_price: float,
+                           exit_price: float,
+                           outcome: str,
+                           duration_hours: float = 0.0) -> str:
         """
-        Получение статистики по паттернам
+        Добавление результата паттерна
 
         Args:
-            symbol: Фильтр по символу
-            timeframe: Фильтр по таймфрейму
+            pattern_id: ID паттерна
+            entry_price: Цена входа
+            exit_price: Цена выхода
+            outcome: Результат ('success', 'failure', 'neutral')
+            duration_hours: Продолжительность в часах
+
+        Returns:
+            ID записи истории
+        """
+        try:
+            history_id = generate_id(prefix="hist")
+
+            profit = exit_price - entry_price if outcome != 'neutral' else 0
+
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                INSERT INTO pattern_history 
+                (id, pattern_id, entry_price, exit_price, profit, outcome, duration_hours)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (history_id, pattern_id, entry_price, exit_price, profit, outcome, duration_hours))
+
+            self.connection.commit()
+
+            # Обновление статистики паттерна
+            pattern = self.get_pattern_by_id(pattern_id)
+            if pattern:
+                pattern_name = pattern.get('name', 'unknown')
+                symbol = pattern.get('metadata', {}).get('symbol', 'UNKNOWN')
+                timeframe = pattern.get('metadata', {}).get('timeframe', 'UNKNOWN')
+
+                self._update_statistics_with_outcome(
+                    pattern_name, symbol, timeframe, outcome, profit, duration_hours)
+
+            self.logger.debug(f"Результат паттерна сохранен: {history_id}")
+            return history_id
+
+        except Exception as e:
+            self.logger.error(f"Ошибка добавления результата: {e}")
+            return ""
+
+    def _update_statistics(self,
+                          pattern_name: str,
+                          symbol: str,
+                          timeframe: str,
+                          confidence: float):
+        """Обновление статистики при сохранении паттерна"""
+        try:
+            cursor = self.connection.cursor()
+
+            # Проверяем существование записи
+            cursor.execute('''
+                SELECT total_occurrences, avg_confidence 
+                FROM pattern_statistics 
+                WHERE pattern_name = ? AND symbol = ? AND timeframe = ?
+            ''', (pattern_name, symbol, timeframe))
+
+            row = cursor.fetchone()
+
+            if row:
+                # Обновляем существующую запись
+                total = row['total_occurrences'] + 1
+                avg_conf = (row['avg_confidence'] * row['total_occurrences'] + confidence) / total
+
+                cursor.execute('''
+                    UPDATE pattern_statistics 
+                    SET total_occurrences = ?, avg_confidence = ?, last_updated = CURRENT_TIMESTAMP
+                    WHERE pattern_name = ? AND symbol = ? AND timeframe = ?
+                ''', (total, avg_conf, pattern_name, symbol, timeframe))
+            else:
+                # Создаем новую запись
+                cursor.execute('''
+                    INSERT INTO pattern_statistics 
+                    (pattern_name, symbol, timeframe, total_occurrences, avg_confidence)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (pattern_name, symbol, timeframe, 1, confidence))
+
+            self.connection.commit()
+
+        except Exception as e:
+            self.logger.error(f"Ошибка обновления статистики: {e}")
+
+    def _update_statistics_with_outcome(self,
+                                       pattern_name: str,
+                                       symbol: str,
+                                       timeframe: str,
+                                       outcome: str,
+                                       profit: float,
+                                       duration_hours: float):
+        """Обновление статистики с учетом результата"""
+        try:
+            cursor = self.connection.cursor()
+
+            cursor.execute('''
+                SELECT success_count, failure_count, avg_profit, avg_duration_hours
+                FROM pattern_statistics 
+                WHERE pattern_name = ? AND symbol = ? AND timeframe = ?
+            ''', (pattern_name, symbol, timeframe))
+
+            row = cursor.fetchone()
+
+            if row:
+                success_count = row['success_count']
+                failure_count = row['failure_count']
+                total_outcomes = success_count + failure_count
+
+                if outcome == 'success':
+                    success_count += 1
+                elif outcome == 'failure':
+                    failure_count += 1
+
+                total_outcomes_new = success_count + failure_count
+
+                # Обновляем средние значения
+                if total_outcomes > 0:
+                    avg_profit = (row['avg_profit'] * total_outcomes + profit) / total_outcomes_new
+                    avg_duration = (row['avg_duration_hours'] * total_outcomes + duration_hours) / total_outcomes_new
+                else:
+                    avg_profit = profit
+                    avg_duration = duration_hours
+
+                success_rate = success_count / total_outcomes_new if total_outcomes_new > 0 else 0
+
+                cursor.execute('''
+                    UPDATE pattern_statistics 
+                    SET success_count = ?, failure_count = ?, 
+                        avg_profit = ?, avg_duration_hours = ?, success_rate = ?,
+                        last_updated = CURRENT_TIMESTAMP
+                    WHERE pattern_name = ? AND symbol = ? AND timeframe = ?
+                ''', (success_count, failure_count, avg_profit, avg_duration, success_rate,
+                      pattern_name, symbol, timeframe))
+
+            self.connection.commit()
+
+        except Exception as e:
+            self.logger.error(f"Ошибка обновления статистики с результатом: {e}")
+
+    def get_pattern_statistics(self,
+                              pattern_name: Optional[str] = None,
+                              symbol: Optional[str] = None,
+                              timeframe: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Получение статистики паттернов
+
+        Args:
+            pattern_name: Имя паттерна
+            symbol: Символ
+            timeframe: Таймфрейм
 
         Returns:
             Статистика паттернов
         """
         try:
-            with self.get_session() as session:
-                query = session.query(PatternRecord)
+            query = "SELECT * FROM pattern_statistics WHERE 1=1"
+            params = []
 
-                if symbol:
-                    query = query.filter_by(symbol=symbol)
+            if pattern_name:
+                query += " AND pattern_name = ?"
+                params.append(pattern_name)
 
-                if timeframe:
-                    query = query.filter_by(timeframe=timeframe)
+            if symbol:
+                query += " AND symbol = ?"
+                params.append(symbol)
 
-                # Общая статистика
-                total_count = query.count()
-                active_count = query.filter_by(is_active=True).count()
-                traded_count = query.filter_by(is_traded=True).count()
+            if timeframe:
+                query += " AND timeframe = ?"
+                params.append(timeframe)
 
-                # Статистика по типам
-                type_stats = {}
-                for pattern_type in session.query(PatternRecord.type).distinct():
-                    if pattern_type[0]:
-                        count = query.filter_by(type=pattern_type[0]).count()
-                        type_stats[pattern_type[0]] = count
+            cursor = self.connection.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
-                # Статистика по направлениям
-                direction_stats = {}
-                for direction in session.query(PatternRecord.direction).distinct():
-                    if direction[0]:
-                        count = query.filter_by(direction=direction[0]).count()
-                        direction_stats[direction[0]] = count
-
-                # Средние значения
-                avg_quality = session.query(
-                    func.avg(PatternRecord.quality_score)
-                ).scalar() or 0
-
-                avg_confidence = session.query(
-                    func.avg(PatternRecord.confidence_score)
-                ).scalar() or 0
-
-                # Статистика торгов
-                profitable_trades = query.filter(
-                    PatternRecord.is_traded == True,
-                    PatternRecord.trade_result > 0
-                ).count()
-
-                losing_trades = query.filter(
-                    PatternRecord.is_traded == True,
-                    PatternRecord.trade_result <= 0
-                ).count()
-
-                avg_trade_result = session.query(
-                    func.avg(PatternRecord.trade_result)
-                ).filter(PatternRecord.is_traded == True).scalar() or 0
-
-                return {
-                    'total_patterns': total_count,
-                    'active_patterns': active_count,
-                    'traded_patterns': traded_count,
-                    'by_type': type_stats,
-                    'by_direction': direction_stats,
-                    'avg_quality_score': float(avg_quality),
-                    'avg_confidence_score': float(avg_confidence),
-                    'trade_statistics': {
-                        'profitable_trades': profitable_trades,
-                        'losing_trades': losing_trades,
-                        'total_trades': traded_count,
-                        'win_rate': profitable_trades / traded_count if traded_count > 0 else 0,
-                        'avg_trade_result': float(avg_trade_result)
-                    },
-                    'timestamp': datetime.now().isoformat()
+            statistics = []
+            for row in rows:
+                stats = {
+                    'pattern_name': row['pattern_name'],
+                    'symbol': row['symbol'],
+                    'timeframe': row['timeframe'],
+                    'total_occurrences': row['total_occurrences'],
+                    'success_count': row['success_count'],
+                    'failure_count': row['failure_count'],
+                    'avg_confidence': row['avg_confidence'],
+                    'avg_profit': row['avg_profit'],
+                    'avg_duration_hours': row['avg_duration_hours'],
+                    'success_rate': row['success_rate'],
+                    'last_updated': row['last_updated']
                 }
+                statistics.append(stats)
+
+            # Агрегированная статистика
+            if statistics:
+                total_stats = {
+                    'total_patterns': len(statistics),
+                    'avg_success_rate': np.mean([s['success_rate'] for s in statistics if s['success_rate']]),
+                    'total_occurrences': sum(s['total_occurrences'] for s in statistics),
+                    'total_successes': sum(s['success_count'] for s in statistics),
+                    'total_failures': sum(s['failure_count'] for s in statistics)
+                }
+            else:
+                total_stats = {}
+
+            return {
+                'detailed': statistics,
+                'aggregated': total_stats
+            }
 
         except Exception as e:
             self.logger.error(f"Ошибка получения статистики: {e}")
             return {}
 
-    async def update_pattern_status(self,
-                                  pattern_id: str,
-                                  is_active: Optional[bool] = None,
-                                  is_traded: Optional[bool] = None,
-                                  trade_result: Optional[float] = None) -> bool:
+    def get_similar_patterns(self,
+                            pattern_data: Dict[str, Any],
+                            max_distance: float = 0.1) -> List[Dict[str, Any]]:
         """
-        Обновление статуса паттерна
+        Поиск похожих паттернов
 
         Args:
-            pattern_id: ID паттерна
-            is_active: Активен ли паттерн
-            is_traded: Совершена ли сделка
-            trade_result: Результат сделки
+            pattern_data: Данные паттерна для сравнения
+            max_distance: Максимальное расстояние для схожести
 
         Returns:
-            Успешность обновления
+            Список похожих паттернов
         """
         try:
-            with self.get_session() as session:
-                pattern = session.query(PatternRecord).filter_by(
-                    pattern_id=pattern_id
-                ).first()
+            pattern_name = pattern_data.get('name', '')
+            symbol = pattern_data.get('metadata', {}).get('symbol', '')
+            timeframe = pattern_data.get('metadata', {}).get('timeframe', '')
 
-                if not pattern:
-                    self.logger.warning(f"Паттерн не найден: {pattern_id}")
-                    return False
+            # Получаем все паттерны того же типа
+            similar_patterns = self.find_patterns(
+                pattern_name=pattern_name,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=1000
+            )
 
-                if is_active is not None:
-                    pattern.is_active = is_active
+            # Если нет достаточно данных
+            if len(similar_patterns) < 5:
+                return []
 
-                if is_traded is not None:
-                    pattern.is_traded = is_traded
+            # Извлекаем характеристики для сравнения
+            target_points = pattern_data.get('points', [])
+            if not target_points:
+                return []
 
-                if trade_result is not None:
-                    pattern.trade_result = trade_result
+            target_prices = [p.get('price', 0) for p in target_points]
+            target_range = max(target_prices) - min(target_prices)
 
-                pattern.updated_at = datetime.now()
-                session.commit()
+            if target_range == 0:
+                return []
 
-                self.logger.debug(f"Статус паттерна обновлен: {pattern_id}")
-                return True
+            # Нормализация цен целевого паттерна
+            target_norm = [(p - min(target_prices)) / target_range for p in target_prices]
+
+            results = []
+            for pattern in similar_patterns:
+                # Пропускаем сам паттерн если он уже в БД
+                if pattern.get('db_id') == pattern_data.get('db_id'):
+                    continue
+
+                points = pattern.get('points', [])
+                if len(points) != len(target_points):
+                    continue
+
+                # Нормализация цен паттерна из БД
+                pattern_prices = [p.get('price', 0) for p in points]
+                pattern_range = max(pattern_prices) - min(pattern_prices)
+
+                if pattern_range == 0:
+                    continue
+
+                pattern_norm = [(p - min(pattern_prices)) / pattern_range for p in pattern_prices]
+
+                # Расчет расстояния (евклидово)
+                distance = np.sqrt(np.sum((np.array(target_norm) - np.array(pattern_norm)) ** 2))
+
+                if distance <= max_distance:
+                    pattern['similarity_distance'] = distance
+                    results.append(pattern)
+
+            # Сортировка по схожести
+            results.sort(key=lambda x: x.get('similarity_distance', 1.0))
+
+            self.logger.debug(f"Найдено похожих паттернов: {len(results)}")
+            return results[:10]  # Возвращаем топ-10
 
         except Exception as e:
-            self.logger.error(f"Ошибка обновления статуса паттерна: {e}")
-            session.rollback()
-            return False
+            self.logger.error(f"Ошибка поиска похожих паттернов: {e}")
+            return []
 
-    async def delete_old_patterns(self, days_old: int = 30) -> int:
+    def cleanup_old_patterns(self, days_to_keep: int = 30) -> int:
         """
-        Удаление старых паттернов
+        Очистка старых паттернов
 
         Args:
-            days_old: Удалять паттерны старше N дней
+            days_to_keep: Количество дней для хранения
 
         Returns:
-            Количество удаленных паттернов
+            Количество удаленных записей
         """
         try:
-            cutoff_date = datetime.now() - timedelta(days=days_old)
+            cutoff_date = datetime.now() - timedelta(days=days_to_keep)
 
-            with self.get_session() as session:
-                deleted_count = session.query(PatternRecord).filter(
-                    PatternRecord.detected_at < cutoff_date,
-                    PatternRecord.is_traded == False
-                ).delete()
+            cursor = self.connection.cursor()
 
-                session.commit()
+            # Сначала удаляем связанные записи истории
+            cursor.execute('''
+                DELETE FROM pattern_history 
+                WHERE pattern_id IN (
+                    SELECT id FROM patterns 
+                    WHERE created_at < ?
+                )
+            ''', (cutoff_date.isoformat(),))
 
-                self.logger.info(f"Удалено старых паттернов: {deleted_count}")
-                return deleted_count
+            # Затем удаляем старые паттерны
+            cursor.execute('DELETE FROM patterns WHERE created_at < ?', (cutoff_date.isoformat(),))
+
+            deleted_count = cursor.rowcount
+            self.connection.commit()
+
+            # Вакуумирование базы данных
+            cursor.execute('VACUUM')
+
+            self.logger.info(f"Удалено старых паттернов: {deleted_count}")
+            return deleted_count
 
         except Exception as e:
-            self.logger.error(f"Ошибка удаления старых паттернов: {e}")
-            session.rollback()
+            self.logger.error(f"Ошибка очистки старых паттернов: {e}")
             return 0
 
-    async def export_to_csv(self, filepath: str, filters: Dict[str, Any] = None) -> bool:
+    def export_to_csv(self, filepath: str, table_name: str = 'patterns') -> bool:
         """
-        Экспорт паттернов в CSV файл
+        Экспорт таблицы в CSV
 
         Args:
-            filepath: Путь к файлу
-            filters: Фильтры для экспорта
+            filepath: Путь для сохранения
+            table_name: Имя таблицы
 
         Returns:
             Успешность экспорта
         """
         try:
-            # Получаем данные с фильтрами
-            patterns = await self.get_patterns(
-                symbol=filters.get('symbol') if filters else None,
-                timeframe=filters.get('timeframe') if filters else None,
-                pattern_type=filters.get('type') if filters else None,
-                min_quality=filters.get('min_quality', 0) if filters else 0,
-                limit=filters.get('limit', 1000) if filters else 1000
-            )
-
-            if not patterns:
-                self.logger.warning("Нет данных для экспорта")
+            if table_name not in ['patterns', 'pattern_history', 'pattern_statistics']:
+                self.logger.error(f"Неподдерживаемая таблица: {table_name}")
                 return False
 
-            # Конвертируем в DataFrame
-            df = pd.DataFrame(patterns)
+            cursor = self.connection.cursor()
+            cursor.execute(f'SELECT * FROM {table_name}')
+            rows = cursor.fetchall()
 
-            # Сохраняем в CSV
-            df.to_csv(filepath, index=False, encoding='utf-8')
+            if not rows:
+                self.logger.warning(f"Таблица {table_name} пуста")
+                return False
 
-            self.logger.info(f"Экспортировано паттернов в CSV: {len(patterns)}")
+            # Конвертация в DataFrame
+            df = pd.DataFrame(rows, columns=[desc[0] for desc in cursor.description])
+
+            # Сохранение в CSV
+            df.to_csv(filepath, index=False)
+
+            self.logger.info(f"Таблица {table_name} экспортирована: {filepath}")
             return True
 
         except Exception as e:
             self.logger.error(f"Ошибка экспорта в CSV: {e}")
             return False
 
-    async def import_from_csv(self, filepath: str) -> int:
-        """
-        Импорт паттернов из CSV файла
-
-        Args:
-            filepath: Путь к файлу
-
-        Returns:
-            Количество импортированных паттернов
-        """
-        try:
-            # Читаем CSV
-            df = pd.read_csv(filepath)
-
-            # Конвертируем в список словарей
-            patterns_data = df.to_dict('records')
-
-            # Сохраняем в базу
-            imported_count = len(await self.save_patterns_batch(patterns_data))
-
-            self.logger.info(f"Импортировано паттернов из CSV: {imported_count}")
-            return imported_count
-
-        except Exception as e:
-            self.logger.error(f"Ошибка импорта из CSV: {e}")
-            return 0
-
-    async def backup_database(self, backup_dir: Optional[str] = None) -> str:
-        """
-        Создание резервной копии базы данных
-
-        Args:
-            backup_dir: Директория для бэкапа
-
-        Returns:
-            Путь к файлу бэкапа
-        """
-        try:
-            if backup_dir is None:
-                backup_dir = Path(config.PATHS["database_dir"]) / "backups"
-
-            backup_dir = Path(backup_dir)
-            backup_dir.mkdir(parents=True, exist_ok=True)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = backup_dir / f"patterns_backup_{timestamp}.db"
-
-            if config.DATABASE.TYPE == "sqlite":
-                # Копируем SQLite файл
-                import shutil
-                source_file = Path(config.DATABASE.NAME)
-                shutil.copy2(source_file, backup_file)
-            else:
-                # Для других БД экспортируем данные
-                patterns = await self.get_patterns(limit=10000)
-                with open(backup_file, 'w', encoding='utf-8') as f:
-                    json.dump(patterns, f, indent=2, ensure_ascii=False)
-
-            self.logger.info(f"Создана резервная копия: {backup_file}")
-            return str(backup_file)
-
-        except Exception as e:
-            self.logger.error(f"Ошибка создания резервной копии: {e}")
-            return ""
-
-    async def close(self):
-        """Закрытие соединения с базой данных"""
-        if self.engine:
-            self.engine.dispose()
-            self.logger.info("Соединение с базой данных закрыто")
-
-    def _generate_pattern_id(self, pattern_data: Dict[str, Any]) -> str:
-        """Генерация уникального ID паттерна"""
-        symbol = pattern_data.get('symbol', 'UNKNOWN')
-        pattern_type = pattern_data.get('type', 'unknown')
-        pattern_name = pattern_data.get('name', 'unknown')
-        detected_at = pattern_data.get('detected_at', datetime.now())
-
-        if isinstance(detected_at, str):
-            timestamp = detected_at
-        else:
-            timestamp = detected_at.strftime("%Y%m%d_%H%M%S")
-
-        return f"{symbol}_{pattern_type}_{pattern_name}_{timestamp}"
+    def close(self):
+        """Закрытие соединения с БД"""
+        if self.connection:
+            self.connection.close()
+            self.connection = None
+            self.logger.info("Соединение с БД закрыто")
 
