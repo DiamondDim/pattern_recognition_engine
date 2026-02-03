@@ -8,11 +8,17 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import pandas as pd
 
+# Исправляем импорты для обратной совместимости
 try:
-    from config import config
+    from config import config, DATABASE_CONFIG, DATABASE_PATH
 except ImportError:
-    # Для обратной совместимости
-    from config import config
+    # Создаем fallback конфиг
+    DATABASE_PATH = "patterns.db"
+    DATABASE_CONFIG = type('DatabaseConfig', (), {
+        'NAME': DATABASE_PATH,
+        'TYPE': 'sqlite'
+    })()
+    print("Используется fallback конфиг для базы данных")
 
 
 class PatternDatabase:

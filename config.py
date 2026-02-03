@@ -439,11 +439,14 @@ MT5_CONFIG = config.MT5
 DETECTION_CONFIG = config.DETECTION
 ML_CONFIG = config.ML
 BACKTESTING_CONFIG = config.BACKTESTING
-BACKTEST_CONFIG = config.BACKTESTING  # Добавили эту строку!
+BACKTEST_CONFIG = config.BACKTESTING
 VISUALIZATION_CONFIG = config.VISUALIZATION
 LOGGING_CONFIG = config.LOGGING
 API_CONFIG = config.API
 RISK_MANAGEMENT_CONFIG = config.RISK_MANAGEMENT
+
+# Добавляем TRADING_CONFIG для обратной совместимости
+TRADING_CONFIG = config.RISK_MANAGEMENT
 
 # Для удобства - основные переменные
 SYMBOLS = config.MT5.SYMBOLS
@@ -452,10 +455,10 @@ DATABASE_PATH = config.DATABASE.NAME
 LOG_LEVEL = config.LOGGING.LEVEL
 
 # Дополнительные переменные для обратной совместимости
-ANALYSIS_CONFIG = config.DETECTION  # Алиас для ANALYSIS_CONFIG
-PATTERN_DETECTOR_CONFIG = config.DETECTION  # Алиас для PATTERN_DETECTOR_CONFIG
-STATISTICS_CONFIG = config.ML  # Алиас для STATISTICS_CONFIG
-ML_MODEL_CONFIG = config.ML  # Алиас для ML_MODEL_CONFIG
+ANALYSIS_CONFIG = config.DETECTION
+PATTERN_DETECTOR_CONFIG = config.DETECTION
+STATISTICS_CONFIG = config.ML
+ML_MODEL_CONFIG = config.ML
 
 # Экспорт всех необходимых переменных
 __all__ = [
@@ -475,11 +478,12 @@ __all__ = [
     'DETECTION_CONFIG',
     'ML_CONFIG',
     'BACKTESTING_CONFIG',
-    'BACKTEST_CONFIG',  # Добавили эту строку!
+    'BACKTEST_CONFIG',
     'VISUALIZATION_CONFIG',
     'LOGGING_CONFIG',
     'API_CONFIG',
     'RISK_MANAGEMENT_CONFIG',
+    'TRADING_CONFIG',  # Добавили эту строку
     'ANALYSIS_CONFIG',
     'PATTERN_DETECTOR_CONFIG',
     'STATISTICS_CONFIG',

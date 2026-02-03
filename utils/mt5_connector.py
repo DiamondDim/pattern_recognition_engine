@@ -59,11 +59,11 @@ class MT5Connector:
 
             # Инициализируем MT5 с указанием пути к терминалу
             if not mt5.initialize(
-                path=self.mt5_config.PATH,
-                login=self.mt5_config.LOGIN,
-                password=self.mt5_config.PASSWORD,
-                server=self.mt5_config.SERVER,
-                timeout=self.mt5_config.TIMEOUT
+                    path=self.mt5_config.PATH,
+                    login=self.mt5_config.LOGIN,
+                    password=self.mt5_password,
+                    server=self.mt5_server,
+                    timeout=self.mt5_config.TIMEOUT
             ):
                 error = mt5.last_error()
                 print(f"Ошибка инициализации MT5: {error}")
@@ -81,10 +81,30 @@ class MT5Connector:
             self.terminal_info = mt5.terminal_info()
 
             print(f"Успешно подключены к MT5")
-            print(f"  Сервер: {self.terminal_info.community_server if self.terminal_info else 'N/A'}")
-            print(f"  Счет: {self.account_info.login if self.account_info else 'N/A'}")
-            print(f"  Баланс: {self.account_info.balance if self.account_info else 'N/A'}")
-            print(f"  Валюта: {self.account_info.currency if self.account_info else 'N/A'}")
+
+            # Безопасный вывод информации о сервере
+            if self.terminal_info:
+                server_info = 'N/A'
+                if hasattr(self.terminal_info, 'community_server'):
+                    server_info = self.terminal_info.community_server
+                elif hasattr(self.terminal_info, 'server'):
+                    server_info = self.terminal_info.server
+                elif hasattr(self.terminal_info, 'name'):
+                    server_info = self.terminal_info.name
+
+                print(f"  Сервер: {server_info}")
+            else:
+                print("  Сервер: N/A")
+
+            if self.account_info:
+                print(f"  Счет: {self.account_info.login}")
+                print(f"  Баланс: {self.account_info.balance}")
+                print(f"  Валюта: {self.account_info.currency}")
+            else:
+                print("  Счет: N/A")
+                print("  Баланс: N/A")
+                print("  Валюта: N/A")
+
             print(f"  Префикс инструментов: {self.mt5_config.SYMBOL_PREFIX}")
 
             return True
@@ -94,12 +114,6 @@ class MT5Connector:
             import traceback
             traceback.print_exc()
             return False
-
-    def add_symbol_prefix(self, symbol: str) -> str:
-        """Добавление префикса RFD к символу"""
-        if not symbol.startswith(self.mt5_config.SYMBOL_PREFIX):
-            return f"{self.mt5_config.SYMBOL_PREFIX}{symbol}"
-        return symbol
 
     def remove_symbol_prefix(self, symbol: str) -> str:
         """Удаление префикса RFD из символа"""

@@ -1,18 +1,31 @@
 """
-Модуль бэктестинга торговых стратегий
+Модуль для бэктестинга торговых стратегий
 """
 
-import numpy as np
-import pandas as pd
-from typing import Dict, List, Any, Optional, Tuple, Union
-from datetime import datetime, timedelta
-from dataclasses import dataclass
 from enum import Enum
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timedelta
 import warnings
 
-from config import BACKTEST_CONFIG, TRADING_CONFIG
-from utils.logger import logger
-from utils.helpers import calculate_returns, calculate_volatility
+# Исправляем импорты для обратной совместимости
+try:
+    from config import config, BACKTESTING_CONFIG, BACKTEST_CONFIG, TRADING_CONFIG
+except ImportError:
+    # Создаем fallback конфиг
+    class BacktestConfig:
+        INITIAL_BALANCE = 10000.0
+        RISK_PER_TRADE = 0.02
+        COMMISSION = 0.0001
+        SLIPPAGE = 0.0001
+        MAX_HOLDING_PERIOD = 100
+        MIN_TRADES_FOR_VALIDATION = 20
+
+    BACKTESTING_CONFIG = BacktestConfig()
+    BACKTEST_CONFIG = BACKTESTING_CONFIG
+    TRADING_CONFIG = BACKTESTING_CONFIG
+    print("Используется fallback конфиг для backtesting")
 
 
 class OrderType(Enum):
