@@ -7,13 +7,10 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 import time
+import traceback
 
 # Исправляем импорт
 try:
-    # Пробуем импортировать из корня проекта
-    import sys
-    sys.path.append('.')  # Добавляем текущую директорию в путь
-
     from config import config
 except ImportError:
     # Создаем простой конфиг для тестирования
@@ -59,11 +56,11 @@ class MT5Connector:
 
             # Инициализируем MT5 с указанием пути к терминалу
             if not mt5.initialize(
-                    path=self.mt5_config.PATH,
-                    login=self.mt5_config.LOGIN,
-                    password=self.mt5_password,
-                    server=self.mt5_server,
-                    timeout=self.mt5_config.TIMEOUT
+                path=self.mt5_config.PATH,
+                login=self.mt5_config.LOGIN,
+                password=self.mt5_config.PASSWORD,
+                server=self.mt5_config.SERVER,
+                timeout=self.mt5_config.TIMEOUT
             ):
                 error = mt5.last_error()
                 print(f"Ошибка инициализации MT5: {error}")
@@ -111,9 +108,14 @@ class MT5Connector:
 
         except Exception as e:
             print(f"Критическая ошибка инициализации MT5: {e}")
-            import traceback
             traceback.print_exc()
             return False
+
+    def add_symbol_prefix(self, symbol: str) -> str:
+        """Добавление префикса RFD к символу"""
+        if not symbol.startswith(self.mt5_config.SYMBOL_PREFIX):
+            return f"{self.mt5_config.SYMBOL_PREFIX}{symbol}"
+        return symbol
 
     def remove_symbol_prefix(self, symbol: str) -> str:
         """Удаление префикса RFD из символа"""

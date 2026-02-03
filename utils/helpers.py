@@ -4,7 +4,7 @@
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 import hashlib
 import json
@@ -96,17 +96,6 @@ def calculate_metrics(data: pd.DataFrame) -> Dict[str, Any]:
             'std': float(data['volume'].std())
         }
 
-    # Дополнительные метрики
-    if 'close' in data.columns and len(data) > 1:
-        returns = data['close'].pct_change().dropna()
-        if len(returns) > 0:
-            metrics['returns'] = {
-                'mean': float(returns.mean()),
-                'std': float(returns.std()),
-                'min': float(returns.min()),
-                'max': float(returns.max())
-            }
-
     return metrics
 
 
@@ -161,4 +150,17 @@ def generate_hash(data: Any) -> str:
         data_str = str(data)
 
     return hashlib.sha256(data_str.encode()).hexdigest()
+
+
+# Дополнительные функции для обратной совместимости
+def calculate_statistics(data: pd.DataFrame) -> Dict[str, Any]:
+    """Алиас для calculate_metrics для обратной совместимости"""
+    return calculate_metrics(data)
+
+
+def validate_input(data: pd.DataFrame) -> bool:
+    """Простая валидация входных данных"""
+    if data is None or data.empty:
+        return False
+    return True
 
