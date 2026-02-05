@@ -1,15 +1,21 @@
+#!/usr/bin/env python3
 """
-Альтернативный скрипт запуска Pattern Recognition Engine
+Run script for Pattern Recognition Engine.
 """
 
 import sys
-from pathlib import Path
+import os
 
-# Добавляем корневую директорию в путь Python
-sys.path.insert(0, str(Path(__file__).parent.absolute()))
+# Добавляем текущую директорию в путь
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from main import main
+def main():
+    """Main function."""
+    print("Pattern Recognition Engine - Run Script")
+    print("Use 'python start.py' for simple startup")
+    print("Or 'python main.py' for detailed logging")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
