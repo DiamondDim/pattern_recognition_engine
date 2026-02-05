@@ -1,302 +1,372 @@
+"""
+MetaTrader 5 connector for data retrieval and trading operations.
+"""
+
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import logging
 
-# Настройка логирования
-logger = logging.getLogger(__name__)
+import config
+from .logger import LoggingMixin
 
 
-class MT5Connector:
-    """
-    Класс для подключения к MetaTrader 5 и получения данных
-    """
+class MT5Connector(LoggingMixin):
+    """Connector for MetaTrader 5 terminal."""
 
-    def __init__(self):
-        """Инициализация коннектора MT5"""
-        self.connected = False
-        self.login = None
-        self.password = None
-        self.server = None
-        self.symbol_cache = {}
-        self._initialize_params()
+    def __init__(self, login: Optional[int] = None,
+                 password: Optional[str] = None,
+                 server: Optional[str] = None):
+        """Initialize MT5 connector.
 
-    def _initialize_params(self):
-        """Инициализация параметров из переменных окружения или конфига"""
-        try:
-            from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
-            self.login = MT5_LOGIN
-            self.password = MT5_PASSWORD
-            self.server = MT5_SERVER
-            logger.info("Параметры MT5 загружены из config.py")
-        except ImportError:
-            import os
-            self.login = os.getenv('MT5_LOGIN')
-            self.password = os.getenv('MT5_PASSWORD')
-            self.server = os.getenv('MT5_SERVER')
-            logger.info("Параметры MT5 загружены из переменных окружения")
-        except Exception as e:
-            logger.warning(f"Не удалось загрузить параметры MT5: {e}")
-
-    def connect(self) -> bool:
+        Args:
+            login: MT5 account login
+            password: MT5 account password
+            server: MT5 server name
         """
-        Подключение к терминалу MetaTrader 5
+        super().__init__()
+        self.login = login or config.MT5_LOGIN
+        self.password = password or config.MT5_PASSWORD
+        self.server = server or config.MT5_SERVER
+        self.connected = False
+
+        # Timeframe mapping
+        self.timeframe_map = {
+            'M1': mt5.TIMEFRAME_M1,
+            'M5': mt5.TIMEFRAME_M5,
+            'M15': mt5.TIMEFRAME_M15,
+            'M30': mt5.TIMEFRAME_M30,
+            'H1': mt5.TIMEFRAME_H1,
+            'H4': mt5.TIMEFRAME_H4,
+            'D1': mt5.TIMEFRAME_D1,
+            'W1': mt5.TIMEFRAME_W1,
+            'MN1': mt5.TIMEFRAME_MN1
+        }
+
+    def connect(self, login: Optional[int] = None,
+                password: Optional[str] = None,
+                server: Optional[str] = None) -> bool:
+        """Connect to MT5 terminal.
+
+        Args:
+            login: MT5 account login
+            password: MT5 account password
+            server: MT5 server name
 
         Returns:
-            bool: True если подключение успешно, False в противном случае
+            True if connection successful, False otherwise
         """
         try:
+            # Update credentials if provided
+            if login:
+                self.login = login
+            if password:
+                self.password = password
+            if server:
+                self.server = server
+
+            # Initialize MT5
             if not mt5.initialize():
-                logger.error(f"Ошибка инициализации MT5: {mt5.last_error()}")
+                error = mt5.last_error()
+                self.log_error(f"MT5 initialization failed: {error}")
+                return False
+
+            # Login to MT5
+            if not mt5.login(self.login, self.password, self.server, timeout=config.MT5_TIMEOUT):
+                error = mt5.last_error()
+                self.log_error(f"MT5 login failed: {error}")
+                mt5.shutdown()
                 return False
 
             self.connected = True
-            logger.info("Успешно подключено к MT5")
+            self.log_info(f"Connected to MT5 (Login: {self.login}, Server: {self.server})")
 
-            # Если есть учетные данные, пытаемся авторизоваться
-            if self.login and self.password and self.server:
-                authorized = mt5.login(
-                    login=int(self.login),
-                    password=self.password,
-                    server=self.server
-                )
-                if authorized:
-                    logger.info(f"Авторизован как {self.login} на сервере {self.server}")
-                else:
-                    logger.warning(f"Не удалось авторизоваться: {mt5.last_error()}")
+            # Print account info
+            account_info = self.get_account_info()
+            if account_info:
+                self.log_info(f"Account balance: {account_info.get('balance', 0):.2f} "
+                              f"{account_info.get('currency', 'USD')}")
 
             return True
 
         except Exception as e:
-            logger.error(f"Критическая ошибка подключения к MT5: {e}")
-            self.connected = False
+            self.log_error(f"Error connecting to MT5: {e}")
             return False
 
-    def disconnect(self):
-        """Отключение от терминала MT5"""
-        try:
-            mt5.shutdown()
-            self.connected = False
-            logger.info("Отключено от MT5")
-        except Exception as e:
-            logger.error(f"Ошибка при отключении от MT5: {e}")
-
-    def get_full_symbol_name(self, base_symbol: str) -> str:
-        """
-        Получение полного имени символа с суффиксом
-
-        Args:
-            base_symbol (str): Базовое имя символа (например, 'EURUSD')
+    def disconnect(self) -> bool:
+        """Disconnect from MT5 terminal.
 
         Returns:
-            str: Полное имя символа (например, 'EURUSDrfd')
+            True if disconnection successful, False otherwise
         """
-        if base_symbol in self.symbol_cache:
-            return self.symbol_cache[base_symbol]
-
         try:
-            # Получаем все доступные символы
-            all_symbols = mt5.symbols_get()
-
-            # Ищем символы, начинающиеся с базового имени
-            matching_symbols = []
-            for symbol in all_symbols:
-                if symbol.name.startswith(base_symbol):
-                    matching_symbols.append(symbol.name)
-
-            if matching_symbols:
-                # Предпочитаем символ без суффикса, если есть
-                if base_symbol in matching_symbols:
-                    full_symbol = base_symbol
-                else:
-                    full_symbol = matching_symbols[0]
-
-                self.symbol_cache[base_symbol] = full_symbol
-                logger.info(f"Найден символ: {base_symbol} -> {full_symbol}")
-                return full_symbol
-            else:
-                logger.warning(f"Символ {base_symbol} не найден среди {len(all_symbols)} доступных")
-                return base_symbol
-
+            if self.connected:
+                mt5.shutdown()
+                self.connected = False
+                self.log_info("Disconnected from MT5")
+            return True
         except Exception as e:
-            logger.error(f"Ошибка поиска символа {base_symbol}: {e}")
-            return base_symbol
+            self.log_error(f"Error disconnecting from MT5: {e}")
+            return False
 
-    def get_rates(self, symbol: str, timeframe: str, bars: int = 1000) -> pd.DataFrame:
-        """
-        Получение исторических данных
+    def get_rates(self, symbol: str, timeframe: str,
+                  bars: int = 100) -> pd.DataFrame:
+        """Get historical rates for a symbol.
 
         Args:
-            symbol (str): Имя символа
-            timeframe (str): Таймфрейм ('M1', 'M5', 'H1', etc.)
-            bars (int): Количество баров для получения
+            symbol: Trading symbol (e.g., 'EURUSD')
+            timeframe: Timeframe string (e.g., 'H1')
+            bars: Number of bars to retrieve
 
         Returns:
-            pd.DataFrame: DataFrame с историческими данными
+            DataFrame with historical rates
         """
         if not self.connected:
-            if not self.connect():
-                logger.error("Не удалось подключиться к MT5 для получения данных")
-                return pd.DataFrame()
+            self.log_error("Not connected to MT5")
+            return pd.DataFrame()
+
+        # Map timeframe string to MT5 constant
+        mt5_timeframe = self.timeframe_map.get(timeframe.upper())
+        if mt5_timeframe is None:
+            self.log_error(f"Unsupported timeframe: {timeframe}")
+            return pd.DataFrame()
 
         try:
-            # Преобразуем таймфрейм в формат MT5
-            timeframe_map = {
-                'M1': mt5.TIMEFRAME_M1,
-                'M5': mt5.TIMEFRAME_M5,
-                'M15': mt5.TIMEFRAME_M15,
-                'M30': mt5.TIMEFRAME_M30,
-                'H1': mt5.TIMEFRAME_H1,
-                'H4': mt5.TIMEFRAME_H4,
-                'D1': mt5.TIMEFRAME_D1,
-                'W1': mt5.TIMEFRAME_W1,
-                'MN1': mt5.TIMEFRAME_MN1,
-            }
-
-            mt5_timeframe = timeframe_map.get(timeframe.upper())
-            if mt5_timeframe is None:
-                logger.error(f"Неподдерживаемый таймфрейм: {timeframe}")
-                return pd.DataFrame()
-
-            # Получаем полное имя символа
-            full_symbol = self.get_full_symbol_name(symbol)
-
-            # Получаем исторические данные
-            rates = mt5.copy_rates_from_pos(full_symbol, mt5_timeframe, 0, bars)
+            # Get rates
+            rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, bars)
 
             if rates is None or len(rates) == 0:
-                logger.error(f"Не удалось получить данные для {full_symbol}: {mt5.last_error()}")
+                self.log_warning(f"No rates returned for {symbol} {timeframe}")
                 return pd.DataFrame()
 
-            # Преобразуем в DataFrame
+            # Convert to DataFrame
             df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df.set_index('time', inplace=True)
 
-            # Стандартизируем названия колонок
-            df.rename(columns={
-                'open': 'Open',
-                'high': 'High',
-                'low': 'Low',
-                'close': 'Close',
-                'tick_volume': 'Volume'
-            }, inplace=True)
+            # Convert time
+            if 'time' in df.columns:
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+                df.set_index('time', inplace=True)
 
-            logger.info(f"Получено {len(df)} баров для {full_symbol} ({timeframe})")
+            # Rename columns to lowercase
+            df.columns = [col.lower() for col in df.columns]
+
+            self.log_debug(f"Retrieved {len(df)} bars for {symbol} {timeframe}")
+
             return df
 
         except Exception as e:
-            logger.error(f"Ошибка при получении данных для {symbol}: {e}")
+            self.log_error(f"Error getting rates for {symbol} {timeframe}: {e}")
             return pd.DataFrame()
 
-    def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Получение информации о символе
-
-        Args:
-            symbol (str): Имя символа
-
-        Returns:
-            Optional[Dict]: Словарь с информацией о символе или None
-        """
-        if not self.connected:
-            if not self.connect():
-                return None
-
-        try:
-            full_symbol = self.get_full_symbol_name(symbol)
-            info = mt5.symbol_info(full_symbol)
-
-            if info is None:
-                logger.warning(f"Информация о символе {full_symbol} не найдена")
-                return None
-
-            # Преобразуем в словарь
-            info_dict = {}
-            for attr in dir(info):
-                if not attr.startswith('_'):
-                    try:
-                        value = getattr(info, attr)
-                        # Пропускаем методы
-                        if not callable(value):
-                            info_dict[attr] = value
-                    except:
-                        continue
-
-            return info_dict
-
-        except Exception as e:
-            logger.error(f"Ошибка при получении информации о символе {symbol}: {e}")
-            return None
-
     def get_account_info(self) -> Optional[Dict[str, Any]]:
-        """
-        Получение информации о счете
+        """Get account information.
 
         Returns:
-            Optional[Dict]: Словарь с информацией о счете или None
+            Dictionary with account info, None if error
         """
         if not self.connected:
-            if not self.connect():
-                return None
+            self.log_error("Not connected to MT5")
+            return None
 
         try:
             account_info = mt5.account_info()
-
             if account_info is None:
-                logger.warning("Информация о счете не найдена")
+                self.log_error(f"Failed to get account info: {mt5.last_error()}")
                 return None
 
-            # Преобразуем в словарь
-            account_dict = {}
-            for attr in dir(account_info):
-                if not attr.startswith('_'):
-                    try:
-                        value = getattr(account_info, attr)
-                        if not callable(value):
-                            account_dict[attr] = value
-                    except:
-                        continue
-
-            return account_dict
+            return {
+                'login': account_info.login,
+                'balance': account_info.balance,
+                'equity': account_info.equity,
+                'margin': account_info.margin,
+                'free_margin': account_info.margin_free,
+                'leverage': account_info.leverage,
+                'currency': account_info.currency,
+                'company': account_info.company,
+                'name': account_info.name,
+                'server': account_info.server,
+                'trade_mode': account_info.trade_mode,
+                'trade_allowed': account_info.trade_allowed,
+                'trade_expert': account_info.trade_expert
+            }
 
         except Exception as e:
-            logger.error(f"Ошибка при получении информации о счете: {e}")
+            self.log_error(f"Error getting account info: {e}")
             return None
 
-    def is_connected(self) -> bool:
-        """
-        Проверка подключения к MT5
-
-        Returns:
-            bool: True если подключено, False в противном случае
-        """
-        return self.connected
-
-    def wait_for_connection(self, timeout_seconds: int = 30) -> bool:
-        """
-        Ожидание подключения к MT5
+    def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get symbol information.
 
         Args:
-            timeout_seconds (int): Таймаут в секундах
+            symbol: Trading symbol
 
         Returns:
-            bool: True если подключение установлено, False в противном случае
+            Dictionary with symbol info, None if error
         """
-        start_time = time.time()
+        if not self.connected:
+            self.log_error("Not connected to MT5")
+            return None
 
-        while time.time() - start_time < timeout_seconds:
-            if self.connect():
-                return True
-            time.sleep(1)
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                # Try to find symbol with different name
+                all_symbols = mt5.symbols_get()
+                for sym in all_symbols:
+                    if symbol in sym.name:
+                        symbol_info = sym
+                        break
 
-        logger.error(f"Таймаут подключения к MT5 ({timeout_seconds} секунд)")
-        return False
+            if symbol_info is None:
+                self.log_warning(f"Symbol {symbol} not found")
+                return None
+
+            return {
+                'name': symbol_info.name,
+                'bid': symbol_info.bid,
+                'ask': symbol_info.ask,
+                'spread': symbol_info.spread,
+                'digits': symbol_info.digits,
+                'point': symbol_info.point,
+                'trade_contract_size': symbol_info.trade_contract_size,
+                'trade_mode': symbol_info.trade_mode,
+                'swap_mode': symbol_info.swap_mode,
+                'margin_initial': symbol_info.margin_initial,
+                'margin_maintenance': symbol_info.margin_maintenance,
+                'volume_min': symbol_info.volume_min,
+                'volume_max': symbol_info.volume_max,
+                'volume_step': symbol_info.volume_step
+            }
+
+        except Exception as e:
+            self.log_error(f"Error getting symbol info for {symbol}: {e}")
+            return None
+
+    def get_full_symbol_name(self, symbol: str) -> str:
+        """Get the full symbol name as it appears in MT5.
+
+        Args:
+            symbol: Trading symbol (e.g., 'EURUSD')
+
+        Returns:
+            Full symbol name (e.g., 'EURUSD.rfd')
+        """
+        symbol_info = self.get_symbol_info(symbol)
+        if symbol_info:
+            return symbol_info['name']
+
+        # Return original symbol if not found
+        return symbol
+
+    def get_current_price(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Get current bid/ask price for a symbol.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            Dictionary with bid and ask prices, None if error
+        """
+        if not self.connected:
+            self.log_error("Not connected to MT5")
+            return None
+
+        try:
+            symbol_info = mt5.symbol_info_tick(symbol)
+            if symbol_info is None:
+                self.log_error(f"Failed to get tick data for {symbol}: {mt5.last_error()}")
+                return None
+
+            return {
+                'bid': symbol_info.bid,
+                'ask': symbol_info.ask,
+                'last': symbol_info.last,
+                'volume': symbol_info.volume,
+                'time': pd.to_datetime(symbol_info.time, unit='s')
+            }
+
+        except Exception as e:
+            self.log_error(f"Error getting current price for {symbol}: {e}")
+            return None
+
+    def get_multiple_symbols_data(self, symbols: List[str],
+                                  timeframe: str,
+                                  bars: int = 100) -> Dict[str, pd.DataFrame]:
+        """Get data for multiple symbols.
+
+        Args:
+            symbols: List of trading symbols
+            timeframe: Timeframe string
+            bars: Number of bars to retrieve
+
+        Returns:
+            Dictionary mapping symbol to DataFrame
+        """
+        data = {}
+        for symbol in symbols:
+            df = self.get_rates(symbol, timeframe, bars)
+            if not df.empty:
+                data[symbol] = df
+            else:
+                self.log_warning(f"No data for {symbol}")
+
+        return data
+
+    def is_symbol_available(self, symbol: str) -> bool:
+        """Check if a symbol is available in MT5.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            True if symbol is available, False otherwise
+        """
+        if not self.connected:
+            return False
+
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            return symbol_info is not None
+        except:
+            return False
+
+    def get_server_time(self) -> Optional[datetime]:
+        """Get current server time.
+
+        Returns:
+            Server datetime, None if error
+        """
+        if not self.connected:
+            return None
+
+        try:
+            time = mt5.symbol_info_tick(config.SYMBOL).time
+            return pd.to_datetime(time, unit='s')
+        except:
+            return datetime.now()
+
+    def __del__(self):
+        """Destructor to ensure disconnection."""
+        try:
+            self.disconnect()
+        except:
+            pass
 
 
-# Создаем глобальный экземпляр для удобства
-mt5_connector = MT5Connector()
+# Global MT5 connector instance
+_mt5_connector = None
+
+
+def get_mt5_connector() -> MT5Connector:
+    """Get or create global MT5 connector instance.
+
+    Returns:
+        MT5Connector instance
+    """
+    global _mt5_connector
+    if _mt5_connector is None:
+        _mt5_connector = MT5Connector()
+    return _mt5_connector
 

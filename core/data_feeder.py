@@ -1,13 +1,29 @@
+"""
+Data feeder module for loading and preprocessing market data.
+"""
+import hashlib
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import hashlib
-import pickle
 import os
-from typing import Optional, Dict, Any
+import json
+import pickle
+from typing import Optional, Dict, Any, List, Tuple
 import logging
 
-# Настройка логирования
+# Try to import MT5, but continue if not available
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    logging.warning("MetaTrader5 not available. Using simulated data.")
+
+import config
+from utils.mt5_connector import MT5Connector
+from utils.helpers import validate_dataframe, calculate_returns, resample_data
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -131,7 +147,7 @@ class DataFeeder:
         ]
         
         key_string = '_'.join(key_parts)
-        return hashlib.md5(key_string.encode()).hexdigest()
+        return hashlib.mt5(key_string.encode()).hexdigest()
         
     def _load_from_cache(self, cache_key: str) -> Optional[pd.DataFrame]:
         """

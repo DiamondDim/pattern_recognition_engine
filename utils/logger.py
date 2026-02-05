@@ -1,74 +1,140 @@
 """
-Модуль для настройки логирования
+Logging configuration for Pattern Recognition Engine.
 """
 
 import logging
-import logging.handlers
 import sys
-from pathlib import Path
+import os
+from datetime import datetime
 from typing import Optional
 
-try:
-    from config import config
-    LOGGING_CONFIG = config.LOGGING
-except ImportError:
-    # Для обратной совместимости
-    from config import LOGGING_CONFIG
+import config
 
 
-def setup_logger(name: str, log_file: Optional[str] = None, level: Optional[str] = None) -> logging.Logger:
-    """
-    Настройка логгера
+def setup_logging(log_level: Optional[str] = None,
+                  log_file: Optional[str] = None) -> logging.Logger:
+    """Setup logging configuration for the application.
 
     Args:
-        name: Имя логгера
-        log_file: Путь к файлу лога
-        level: Уровень логирования
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: Path to log file
 
     Returns:
-        Настроенный логгер
+        Configured logger instance
     """
-    if level is None:
-        level = LOGGING_CONFIG.LEVEL
+    # Use config values if not provided
+    if log_level is None:
+        log_level = config.LOG_LEVEL
     if log_file is None:
-        log_file = LOGGING_CONFIG.FILE
+        log_file = config.LOG_FILE
 
-    # Создаем логгер
-    logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, level.upper()))
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not create log directory {log_dir}: {e}")
+            # Fallback to current directory
+            log_file = "pattern_engine.log"
 
-    # Проверяем, не добавлены ли уже обработчики
-    if logger.handlers:
-        return logger
+    # Configure root logger
+    logger = logging.getLogger()
 
-    # Форматтер
-    formatter = logging.Formatter(
-        LOGGING_CONFIG.FORMAT,
-        datefmt=LOGGING_CONFIG.DATE_FORMAT
+    # Remove existing handlers to avoid duplicates
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Set log level
+    log_level_numeric = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(log_level_numeric)
+
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # Обработчик для консоли
+    simple_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
+    # File handler (detailed)
+    try:
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(detailed_formatter)
+        logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Warning: Could not setup file logging: {e}")
+
+    # Console handler (simple)
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
+    console_handler.setLevel(log_level_numeric)
+    console_handler.setFormatter(simple_formatter)
     logger.addHandler(console_handler)
 
-    # Обработчик для файла
-    if log_file:
-        # Создаем директорию для логов если ее нет
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Set specific log levels for noisy libraries
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('websockets').setLevel(logging.WARNING)
 
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=LOGGING_CONFIG.MAX_SIZE_MB * 1024 * 1024,
-            backupCount=LOGGING_CONFIG.BACKUP_COUNT
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+    # Log startup message
+    logger.info(f"Logging configured. Level: {log_level}, File: {log_file}")
 
     return logger
 
 
-# Глобальный логгер по умолчанию
-logger = setup_logger("pattern_recognition_engine")
+def get_logger(name: str) -> logging.Logger:
+    """Get a logger instance with the given name.
+
+    Args:
+        name: Logger name (usually __name__)
+
+    Returns:
+        Logger instance
+    """
+    return logging.getLogger(name)
+
+
+class LoggingMixin:
+    """Mixin class to add logging capabilities to other classes."""
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the mixin."""
+        super().__init__(*args, **kwargs)
+        self._logger = None
+
+    @property
+    def logger(self) -> logging.Logger:
+        """Get the logger for this class."""
+        if self._logger is None:
+            self._logger = logging.getLogger(self.__class__.__name__)
+        return self._logger
+
+    def log_debug(self, message: str, *args, **kwargs):
+        """Log a debug message."""
+        self.logger.debug(message, *args, **kwargs)
+
+    def log_info(self, message: str, *args, **kwargs):
+        """Log an info message."""
+        self.logger.info(message, *args, **kwargs)
+
+    def log_warning(self, message: str, *args, **kwargs):
+        """Log a warning message."""
+        self.logger.warning(message, *args, **kwargs)
+
+    def log_error(self, message: str, *args, **kwargs):
+        """Log an error message."""
+        self.logger.error(message, *args, **kwargs)
+
+    def log_exception(self, message: str, *args, **kwargs):
+        """Log an exception with traceback."""
+        self.logger.exception(message, *args, **kwargs)
+
+
+# Create default logger
+logger = setup_logging()
 

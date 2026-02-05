@@ -1,0 +1,6 @@
+2026-02-05 06:47:13 - root - INFO - logger.py:85 - Logging configured. Level: INFO, File: logs/pattern_engine.log
+2026-02-05 07:01:39 - root - INFO - logger.py:85 - Logging configured. Level: INFO, File: logs/pattern_engine.log
+2026-02-05 07:01:50 - core.data_feeder - WARNING - data_feeder.py:34 - MT5Connector не найден, используется тестовый режим
+2026-02-05 07:01:50 - core.pattern_detector - WARNING - pattern_detector.py:268 - Не удалось импортировать модули паттернов: cannot import name 'CandlestickPatterns' from 'patterns.candlestick_patterns' (C:\Users\Dmitriy\Desktop\AI_TRADER_0.1.1\pattern_recognition_engine\pattern_recognition_engine\patterns\candlestick_patterns.py)
+2026-02-05 07:01:50 - core.pattern_database - INFO - pattern_database.py:107 - База данных инициализирована: patterns.db
+2026-02-05 07:01:51 - core.pattern_database - INFO - pattern_database.py:772 - Соединение с базой данных закрыто

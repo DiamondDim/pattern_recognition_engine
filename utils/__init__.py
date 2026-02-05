@@ -1,27 +1,54 @@
 """
-Пакет утилит для Pattern Recognition Engine
+Utility modules for Pattern Recognition Engine.
 """
 
-# Импортируем только то, что действительно существует
-from .logger import setup_logger, logger
-
-# Из helpers импортируем только существующие функции
-from .helpers import validate_data, calculate_metrics, format_datetime
-
-from .visualization import PatternVisualizer, plot_patterns, plot_interactive, plot_statistics
-from .mt5_connector import MT5Connector, mt5_connector
+from .logger import setup_logging, get_logger, LoggingMixin, logger
+from .mt5_connector import MT5Connector, get_mt5_connector
+from .helpers import (
+    validate_dataframe, calculate_returns,
+    normalize_data, create_lagged_features,
+    split_train_test, calculate_metrics,
+    resample_data, detect_outliers_iqr,
+    calculate_correlation_matrix,
+    save_dataframe, load_dataframe
+)
+from .visualization import (
+    plot_patterns, plot_results, plot_equity_curve,
+    plot_correlation_matrix, plot_confusion_matrix,
+    create_interactive_chart, save_plot
+)
 
 __all__ = [
-    'setup_logger',
+    # Logging
+    'setup_logging',
+    'get_logger',
+    'LoggingMixin',
     'logger',
-    'validate_data',
-    'calculate_metrics',
-    'format_datetime',
-    'PatternVisualizer',
-    'plot_patterns',
-    'plot_interactive',
-    'plot_statistics',
+
+    # MT5
     'MT5Connector',
-    'mt5_connector'
+    'get_mt5_connector',
+
+    # Helpers
+    'validate_dataframe',
+    'calculate_returns',
+    'normalize_data',
+    'create_lagged_features',
+    'split_train_test',
+    'calculate_metrics',
+    'resample_data',
+    'detect_outliers_iqr',
+    'calculate_correlation_matrix',
+    'save_dataframe',
+    'load_dataframe',
+
+    # Visualization
+    'plot_patterns',
+    'plot_results',
+    'plot_equity_curve',
+    'plot_correlation_matrix',
+    'plot_confusion_matrix',
+    'create_interactive_chart',
+    'save_plot'
 ]
 
