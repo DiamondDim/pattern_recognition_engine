@@ -15,6 +15,35 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+
+class MLModels:
+    """Machine Learning models for pattern recognition."""
+
+    def __init__(self):
+        """Initialize ML models."""
+        logger.info("MLModels initialized")
+
+    def train_pattern_classifier(self, X_train, y_train):
+        """Train pattern classifier."""
+        logger.info("Training pattern classifier")
+        # Заглушка - на практике здесь будет модель ML
+        return None
+
+    def predict_patterns(self, X_test):
+        """Predict patterns."""
+        logger.info("Predicting patterns")
+        # Заглушка
+        return []
+
+    def save_model(self, path):
+        """Save model to file."""
+        logger.info(f"Saving model to {path}")
+
+    def load_model(self, path):
+        """Load model from file."""
+        logger.info(f"Loading model from {path}")
+        return self
+
 class PatternPredictor:
     """ML модель для предсказания паттернов и торговых сигналов"""
     

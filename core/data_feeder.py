@@ -147,7 +147,7 @@ class DataFeeder:
         ]
         
         key_string = '_'.join(key_parts)
-        return hashlib.mt5(key_string.encode()).hexdigest()
+        return hashlib.md5(key_string.encode()).hexdigest()
         
     def _load_from_cache(self, cache_key: str) -> Optional[pd.DataFrame]:
         """

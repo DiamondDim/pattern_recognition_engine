@@ -1,11 +1,126 @@
+"""
+Candlestick pattern detection.
+"""
+
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import logging
 
-from patterns.base_pattern import BasePattern
-
 logger = logging.getLogger(__name__)
+
+
+class CandlestickPatterns:
+    """Candlestick pattern detector."""
+
+    def __init__(self):
+        """Initialize candlestick pattern detector."""
+        logger.info("CandlestickPatterns initialized")
+
+    def detect_doji(self, data: pd.DataFrame, threshold: float = 0.1) -> List[Dict[str, Any]]:
+        """Detect Doji patterns."""
+        patterns = []
+        for i in range(len(data)):
+            if i < 1:
+                continue
+
+            open_price = data['open'].iloc[i]
+            close_price = data['close'].iloc[i]
+            high = data['high'].iloc[i]
+            low = data['low'].iloc[i]
+
+            # Doji: открытие и закрытие почти равны
+            body_size = abs(close_price - open_price)
+            range_size = high - low
+
+            if range_size > 0 and body_size / range_size < threshold:
+                pattern = {
+                    'index': i,
+                    'pattern_type': 'doji',
+                    'confidence': 1 - (body_size / range_size),
+                    'signal': 'neutral',
+                    'description': f"Doji pattern at index {i}"
+                }
+                patterns.append(pattern)
+
+        return patterns
+
+    def detect_hammer(self, data: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Detect Hammer patterns."""
+        patterns = []
+        for i in range(len(data)):
+            if i < 1:
+                continue
+
+            open_price = data['open'].iloc[i]
+            close_price = data['close'].iloc[i]
+            high = data['high'].iloc[i]
+            low = data['low'].iloc[i]
+
+            body_size = abs(close_price - open_price)
+            upper_shadow = high - max(open_price, close_price)
+            lower_shadow = min(open_price, close_price) - low
+
+            # Hammer: маленькое тело, маленькая верхняя тень, длинная нижняя тень
+            total_size = high - low
+            if total_size > 0:
+                if (body_size / total_size < 0.3 and
+                        lower_shadow > 2 * body_size and
+                        upper_shadow < body_size * 0.3):
+                    is_bullish = close_price > open_price
+                    pattern_type = 'hammer' if is_bullish else 'hanging_man'
+
+                    pattern = {
+                        'index': i,
+                        'pattern_type': pattern_type,
+                        'confidence': 0.7,
+                        'signal': 'bullish' if is_bullish else 'bearish',
+                        'description': f"{pattern_type} pattern at index {i}"
+                    }
+                    patterns.append(pattern)
+
+        return patterns
+
+    def detect_engulfing(self, data: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Detect Engulfing patterns."""
+        patterns = []
+        for i in range(1, len(data)):
+            prev_open = data['open'].iloc[i - 1]
+            prev_close = data['close'].iloc[i - 1]
+            curr_open = data['open'].iloc[i]
+            curr_close = data['close'].iloc[i]
+
+            prev_body = abs(prev_close - prev_open)
+            curr_body = abs(curr_close - curr_open)
+
+            # Engulfing: текущая свеча полностью поглощает предыдущую
+            if (curr_body > prev_body and
+                    min(curr_open, curr_close) < min(prev_open, prev_close) and
+                    max(curr_open, curr_close) > max(prev_open, prev_close)):
+                is_bullish = curr_close > curr_open
+                pattern_type = 'bullish_engulfing' if is_bullish else 'bearish_engulfing'
+
+                pattern = {
+                    'index': i,
+                    'pattern_type': pattern_type,
+                    'confidence': 0.8,
+                    'signal': 'bullish' if is_bullish else 'bearish',
+                    'description': f"{pattern_type} pattern at index {i}"
+                }
+                patterns.append(pattern)
+
+        return patterns
+
+    def detect_all_patterns(self, data: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Detect all candlestick patterns."""
+        all_patterns = []
+
+        all_patterns.extend(self.detect_doji(data))
+        all_patterns.extend(self.detect_hammer(data))
+        all_patterns.extend(self.detect_engulfing(data))
+
+        logger.info(f"Detected {len(all_patterns)} candlestick patterns")
+        return all_patterns
 
 
 class DojiPattern(BasePattern):
