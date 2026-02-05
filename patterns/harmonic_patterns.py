@@ -1,561 +1,646 @@
-"""
-Модуль гармонических паттернов
-"""
-
+import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
-from scipy.spatial import KDTree
-from scipy.signal import find_peaks
+import logging
 
-from .base_pattern import BasePattern, PatternPoint, PatternResult
-from config import config
+from patterns.base_pattern import BasePattern
 
-@dataclass
-class ExtremePoint:
-    """Экстремальная точка для гармонических паттернов"""
-    index: int
-    price: float
-    type: str  # 'X', 'A', 'B', 'C', 'D'
-    is_high: bool
+logger = logging.getLogger(__name__)
 
-class HarmonicPatterns(BasePattern):
-    """Класс для детектирования гармонических паттернов"""
-
-    def __init__(self):
-        super().__init__(name="harmonic_patterns", min_points=4)
-
-        # Определения гармонических паттернов (идеальные соотношения Фибоначчи)
-        self.pattern_definitions = {
+class HarmonicPattern(BasePattern):
+    """
+    Класс для обнаружения гармонических паттернов (Фибоначчи-паттернов)
+    """
+    
+    def __init__(self, data: Optional[pd.DataFrame] = None):
+        """Инициализация гармонического паттерна"""
+        super().__init__(data)
+        self.fibonacci_levels = {
+            'retracement': [0.236, 0.382, 0.5, 0.618, 0.786],
+            'extension': [0.618, 1.0, 1.272, 1.414, 1.618, 2.0, 2.618]
+        }
+        self.pattern_definitions = self._initialize_pattern_definitions()
+        
+    def _initialize_pattern_definitions(self) -> Dict[str, Dict[str, float]]:
+        """
+        Инициализация определений гармонических паттернов
+        
+        Returns:
+            dict: Определения паттернов
+        """
+        return {
             'gartley': {
-                'AB': 0.618,    # XA * 0.618
-                'BC': 0.618,    # AB * 0.618
-                'CD': 1.618,    # BC * 1.618
-                'AD': 0.786     # XA * 0.786
+                'XA': None,  # Любое движение
+                'AB': 0.618,  # 61.8% от XA
+                'BC': 0.382,  # 38.2% от AB
+                'CD': 1.272,  # 127.2% от BC
+                'AD': 0.786   # 78.6% от XA
             },
             'butterfly': {
-                'AB': 0.786,    # XA * 0.786
-                'BC': 0.618,    # AB * 0.618
-                'CD': 2.618,    # BC * 2.618
-                'AD': 1.272     # XA * 1.272
+                'XA': None,
+                'AB': 0.786,
+                'BC': 0.382,
+                'CD': 1.618,
+                'AD': 1.272
             },
             'bat': {
-                'AB': 0.382,    # XA * 0.382
-                'BC': 0.618,    # AB * 0.618
-                'CD': 2.618,    # BC * 2.618
-                'AD': 0.886     # XA * 0.886
+                'XA': None,
+                'AB': 0.382,
+                'BC': 0.382,
+                'CD': 2.618,
+                'AD': 0.886
             },
             'crab': {
-                'AB': 0.382,    # XA * 0.382
-                'BC': 0.618,    # AB * 0.618
-                'CD': 3.618,    # BC * 3.618
-                'AD': 1.618     # XA * 1.618
+                'XA': None,
+                'AB': 0.382,
+                'BC': 0.382,
+                'CD': 3.618,
+                'AD': 1.618
             },
             'shark': {
-                'AB': 0.382,    # XA * 0.382
-                'BC': 1.130,    # AB * 1.130
-                'CD': 1.618,    # BC * 1.618
-                'AD': 0.886     # XA * 0.886
-            },
-            'cypher': {
-                'AB': 0.382,    # XA * 0.382
-                'BC': 1.130,    # AB * 1.130
-                'CD': 1.414,    # BC * 1.414
-                'AD': 0.786     # XA * 0.786
-            },
-            'five_o': {
-                'AB': 0.618,    # XA * 0.618
-                'BC': 1.618,    # AB * 1.618
-                'CD': 1.618,    # BC * 1.618
-                'AD': 0.618     # XA * 0.618
+                'XA': None,
+                'AB': 1.13,
+                'BC': 1.618,
+                'CD': 1.27,
+                'AD': 0.886
             }
         }
-
-        # Допустимое отклонение от идеальных соотношений
-        self.fib_tolerance = config.DETECTION.FIBONACCI_TOLERANCE
-
-    def detect(self, data: Dict[str, np.ndarray]) -> List[PatternResult]:
+        
+    def detect(self, max_patterns: int = 10, fib_tolerance: float = 0.05) -> List[Dict[str, Any]]:
         """
-        Детектирование гармонических паттернов
-
+        Обнаружение гармонических паттернов
+        
         Args:
-            data: Входные данные OHLC
-
+            max_patterns (int): Максимальное количество паттернов для поиска
+            fib_tolerance (float): Допуск для соотношений Фибоначчи
+            
         Returns:
-            Список обнаруженных паттернов
+            list: Список обнаруженных гармонических паттернов
         """
-        results = []
-
-        # Проверка входных данных
-        required = ['high', 'low']
-        if not all(key in data for key in required):
-            return results
-
-        # Находим экстремумы
-        extremes = self._find_all_extremes(data)
-
-        if len(extremes) < config.DETECTION.MIN_HARMONIC_POINTS:
-            return results
-
-        # Ищем гармонические паттерны
-        for pattern_name, fib_ratios in self.pattern_definitions.items():
-            if config.DETECTION.ENABLE_HARMONIC:
-                pattern_results = self._detect_specific_pattern(
-                    extremes, pattern_name, fib_ratios, data
-                )
-                results.extend(pattern_results)
-
-        # Фильтрация результатов
-        filtered_results = self._filter_results(results)
-
-        return filtered_results
-
-    def _find_all_extremes(self, data: Dict[str, np.ndarray]) -> List[ExtremePoint]:
-        """Поиск всех экстремумов (пиков и впадин)"""
-        extremes = []
-
+        patterns = []
+        
+        if self.data is None or self.data.empty:
+            logger.warning("Нет данных для обнаружения гармонических паттернов")
+            return patterns
+            
+        if len(self.data) < 100:
+            logger.warning(f"Недостаточно данных для гармонических паттернов: {len(self.data)} < 100")
+            return patterns
+            
         try:
-            # Используем scipy для поиска пиков
-            high_prices = data['high']
-            low_prices = data['low']
-
-            # Находим локальные максимумы
-            high_indices, _ = find_peaks(
-                high_prices,
-                prominence=self.peak_prominence * np.mean(high_prices),
-                distance=config.DETECTION.MIN_CANDLES_FOR_PATTERN // 2
-            )
-
-            # Находим локальные минимумы
-            low_indices, _ = find_peaks(
-                -low_prices,
-                prominence=self.peak_prominence * np.mean(low_prices),
-                distance=config.DETECTION.MIN_CANDLES_FOR_PATTERN // 2
-            )
-
-            # Создаем точки максимумов
-            for idx in high_indices:
-                if idx < len(high_prices):
-                    point = ExtremePoint(
-                        index=idx,
-                        price=float(high_prices[idx]),
-                        type='',
-                        is_high=True
-                    )
-                    extremes.append(point)
-
-            # Создаем точки минимумов
-            for idx in low_indices:
-                if idx < len(low_prices):
-                    point = ExtremePoint(
-                        index=idx,
-                        price=float(low_prices[idx]),
-                        type='',
-                        is_high=False
-                    )
-                    extremes.append(point)
-
-            # Сортируем по индексу
-            extremes.sort(key=lambda x: x.index)
-
-            # Чередование максимумов и минимумов
-            filtered_extremes = []
-            for i, point in enumerate(extremes):
-                if i == 0:
-                    filtered_extremes.append(point)
-                else:
-                    # Проверяем что тип чередуется
-                    if point.is_high != filtered_extremes[-1].is_high:
-                        filtered_extremes.append(point)
-
-            extremes = filtered_extremes
-
+            # Находим точки разворота (пивоты)
+            pivot_points = self._find_pivot_points()
+            
+            if len(pivot_points) < 5:
+                logger.warning(f"Недостаточно точек разворота: {len(pivot_points)} < 5")
+                return patterns
+            
+            logger.info(f"Найдено {len(pivot_points)} точек разворота для анализа гармонических паттернов")
+            
+            # Анализируем возможные паттерны
+            for i in range(len(pivot_points) - 4):
+                # Получаем последовательность из 5 точек (XABCD)
+                points = pivot_points[i:i+5]
+                
+                # Проверяем, что точки образуют зигзаг
+                if not self._is_zigzag(points):
+                    continue
+                
+                # Идентифицируем паттерн
+                pattern_info = self._identify_pattern(points, fib_tolerance)
+                
+                if pattern_info:
+                    pattern_info['points'] = points
+                    pattern_info['pattern_family'] = 'harmonic'
+                    pattern_info['detection_time'] = pd.Timestamp.now()
+                    
+                    # Добавляем дополнительную информацию
+                    pattern_info.update(self._analyze_pattern_quality(points, pattern_info['pattern_type']))
+                    
+                    patterns.append(pattern_info)
+                    
+                    if len(patterns) >= max_patterns:
+                        break
+            
+            logger.info(f"Обнаружено {len(patterns)} гармонических паттернов")
+            self.patterns = patterns
+            return patterns
+            
         except Exception as e:
-            # Резервный метод
-            extremes = self._find_extremes_simple(data)
-
-        return extremes
-
-    def _find_extremes_simple(self, data: Dict[str, np.ndarray]) -> List[ExtremePoint]:
-        """Простой поиск экстремумов (резервный метод)"""
-        extremes = []
-
-        high_prices = data['high']
-        low_prices = data['low']
-
-        window = config.DETECTION.MIN_CANDLES_FOR_PATTERN // 2
-
-        for i in range(window, len(high_prices) - window):
-            # Проверяем максимум
-            if high_prices[i] == np.max(high_prices[i-window:i+window+1]):
-                point = ExtremePoint(
-                    index=i,
-                    price=float(high_prices[i]),
-                    type='',
-                    is_high=True
-                )
-                extremes.append(point)
-
-            # Проверяем минимум
-            if low_prices[i] == np.min(low_prices[i-window:i+window+1]):
-                point = ExtremePoint(
-                    index=i,
-                    price=float(low_prices[i]),
-                    type='',
-                    is_high=False
-                )
-                extremes.append(point)
-
-        # Сортируем и чередуем
-        extremes.sort(key=lambda x: x.index)
-
-        filtered = []
-        for point in extremes:
-            if not filtered or point.is_high != filtered[-1].is_high:
-                filtered.append(point)
-
-        return filtered
-
-    def _detect_specific_pattern(self,
-                                extremes: List[ExtremePoint],
-                                pattern_name: str,
-                                fib_ratios: Dict[str, float],
-                                data: Dict[str, np.ndarray]) -> List[PatternResult]:
-        """Детектирование конкретного гармонического паттерна"""
-        results = []
-
-        # Нужно минимум 5 точек для гармонического паттерна (X, A, B, C, D)
-        if len(extremes) < 5:
-            return results
-
-        # Проверяем все возможные комбинации из 5 точек
-        for i in range(len(extremes) - 4):
-            points = extremes[i:i+5]
-
-            # Проверяем чередование максимумов и минимумов
-            if not self._check_alternation(points):
-                continue
-
-            # Присваиваем типа точкам (X, A, B, C, D)
-            typed_points = self._assign_point_types(points)
-
-            # Проверяем гармонические соотношения
-            is_valid, actual_ratios = self._check_fibonacci_ratios(typed_points, fib_ratios)
-
-            if not is_valid:
-                continue
-
-            # Рассчитываем качество паттерна
-            quality = self._calculate_harmonic_quality(actual_ratios, fib_ratios)
-
-            if quality < config.DETECTION.MIN_PATTERN_QUALITY:
-                continue
-
-            # Определяем направление
-            direction = self._determine_harmonic_direction(typed_points)
-
-            # Создаем точки паттерна в формате PatternPoint
-            pattern_points = []
-            for j, point in enumerate(typed_points):
-                pattern_point = PatternPoint(
-                    index=point.index,
-                    price=point.price,
-                    type=point.type,
-                    metadata={'is_high': point.is_high}
-                )
-                pattern_points.append(pattern_point)
-
-            # Рассчитываем цели
-            targets = self._calculate_harmonic_targets(typed_points, pattern_name, direction)
-
-            # Создаем результат
-            result = PatternResult(
-                name=pattern_name,
-                direction=direction,
-                points=pattern_points,
-                quality=quality,
-                confidence=self.calculate_confidence(pattern_points, data),
-                targets=targets,
-                metadata={
-                    'pattern_type': 'harmonic',
-                    'fibonacci_ratios': actual_ratios,
-                    'ideal_ratios': fib_ratios
-                }
-            )
-
-            results.append(result)
-
-        return results
-
-    def _check_alternation(self, points: List[ExtremePoint]) -> bool:
-        """Проверка чередования максимумов и минимумов"""
+            logger.error(f"Ошибка при обнаружении гармонических паттернов: {e}")
+            return []
+            
+    def _find_pivot_points(self, window: int = 5) -> List[Dict[str, Any]]:
+        """
+        Поиск точек разворота (пивот-поинтов)
+        
+        Args:
+            window (int): Размер окна для поиска экстремумов
+            
+        Returns:
+            list: Список точек разворота
+        """
+        points = []
+        
+        try:
+            highs = self.data['High'].values
+            lows = self.data['Low'].values
+            
+            for i in range(window, len(self.data) - window):
+                # Проверяем максимум
+                if highs[i] == max(highs[i-window:i+window+1]):
+                    points.append({
+                        'index': i,
+                        'price': highs[i],
+                        'type': 'high',
+                        'timestamp': self.data.index[i]
+                    })
+                
+                # Проверяем минимум
+                if lows[i] == min(lows[i-window:i+window+1]):
+                    points.append({
+                        'index': i,
+                        'price': lows[i],
+                        'type': 'low',
+                        'timestamp': self.data.index[i]
+                    })
+            
+            # Сортируем по индексу
+            points.sort(key=lambda x: x['index'])
+            
+            # Удаляем соседние точки одинакового типа
+            filtered_points = []
+            for i in range(len(points)):
+                if i == 0 or points[i]['type'] != points[i-1]['type']:
+                    filtered_points.append(points[i])
+            
+            logger.debug(f"Найдено {len(filtered_points)} точек разворота")
+            return filtered_points
+            
+        except Exception as e:
+            logger.error(f"Ошибка при поиске точек разворота: {e}")
+            return []
+            
+    def _is_zigzag(self, points: List[Dict[str, Any]]) -> bool:
+        """
+        Проверка, образуют ли точки зигзаг (чередование максимумов и минимумов)
+        
+        Args:
+            points (list): Список точек
+            
+        Returns:
+            bool: True если точки образуют зигзаг
+        """
+        if len(points) < 2:
+            return False
+            
+        # Проверяем чередование типов
         for i in range(1, len(points)):
-            if points[i].is_high == points[i-1].is_high:
+            if points[i]['type'] == points[i-1]['type']:
                 return False
+        
+        # Проверяем, что цены образуют волну
+        if len(points) >= 3:
+            # Для паттерна XABCD нужны конкретные движения
+            # X->A, A->B, B->C, C->D
+            # Проверяем направления движений
+            directions = []
+            for i in range(1, len(points)):
+                if points[i]['price'] > points[i-1]['price']:
+                    directions.append('up')
+                else:
+                    directions.append('down')
+            
+            # Для гармонических паттернов ожидаем определенную последовательность
+            # Например, для бычьего паттерна: X->A вниз, A->B вверх, B->C вниз, C->D вверх
+            # Проверяем эту последовательность
+            if len(directions) == 4:
+                # Проверяем бычий паттерн
+                bullish_pattern = directions == ['down', 'up', 'down', 'up']
+                # Проверяем медвежий паттерн
+                bearish_pattern = directions == ['up', 'down', 'up', 'down']
+                
+                return bullish_pattern or bearish_pattern
+        
         return True
-
-    def _assign_point_types(self, points: List[ExtremePoint]) -> List[ExtremePoint]:
-        """Присвоение типа точкам (X, A, B, C, D)"""
-        typed_points = points.copy()
-
-        # Первая точка всегда X
-        typed_points[0].type = 'X'
-
-        # Определяем направление движения от X к A
-        if typed_points[1].price > typed_points[0].price:
-            # Движение вверх: X - низ, A - высоко
-            typed_points[1].type = 'A'
-        else:
-            # Движение вниз: X - высоко, A - низко
-            typed_points[1].type = 'A'
-
-        # Остальные точки
-        typed_points[2].type = 'B'
-        typed_points[3].type = 'C'
-        typed_points[4].type = 'D'
-
-        return typed_points
-
-    def _check_fibonacci_ratios(self,
-                               points: List[ExtremePoint],
-                               ideal_ratios: Dict[str, float]) -> Tuple[bool, Dict[str, float]]:
-        """Проверка соотношений Фибоначчи"""
-        # Извлекаем цены
-        X = points[0].price
-        A = points[1].price
-        B = points[2].price
-        C = points[3].price
-        D = points[4].price
-
-        # Вычисляем длины волн
-        XA = abs(A - X)
-        AB = abs(B - A)
-        BC = abs(C - B)
-        # CD рассчитывается ниже
-
-        if XA == 0:
-            return False, {}
-
-        # Вычисляем фактические соотношения
-        actual_ratios = {}
-
-        # AB как процент от XA
-        actual_ratios['AB'] = AB / XA if XA != 0 else 0
-
-        # BC как процент от AB
-        actual_ratios['BC'] = BC / AB if AB != 0 else 0
-
-        # CD как процент от BC (пока неизвестно D, используем проекцию)
-        # Сначала вычисляем идеальное D на основе паттерна
-        if 'AD' in ideal_ratios:
-            # AD как процент от XA
-            ideal_AD = ideal_ratios['AD']
-
-            # Определяем направление
-            if A > X:  # Бычье движение XA
-                D_projected = X + ideal_AD * XA if ideal_AD > 0 else X - abs(ideal_AD) * XA
-            else:  # Медвежье движение XA
-                D_projected = X - ideal_AD * XA if ideal_AD > 0 else X + abs(ideal_AD) * XA
-
-            CD = abs(D_projected - C)
-            actual_ratios['CD'] = CD / BC if BC != 0 else 0
-
-        # Проверяем соответствие идеальным соотношениям
-        is_valid = True
-        for ratio_key, ideal_value in ideal_ratios.items():
-            if ratio_key in actual_ratios:
-                actual_value = actual_ratios[ratio_key]
-                if actual_value == 0:
-                    is_valid = False
-                    break
-
-                # Проверяем отклонение
-                deviation = abs(actual_value - ideal_value) / ideal_value
-                if deviation > self.fib_tolerance:
-                    is_valid = False
-                    break
-
-        return is_valid, actual_ratios
-
-    def _calculate_harmonic_quality(self,
-                                   actual_ratios: Dict[str, float],
-                                   ideal_ratios: Dict[str, float]) -> float:
-        """Расчет качества гармонического паттерна"""
+        
+    def _identify_pattern(self, points: List[Dict[str, Any]], 
+                         tolerance: float = 0.05) -> Optional[Dict[str, Any]]:
+        """
+        Идентификация гармонического паттерна
+        
+        Args:
+            points (list): Точки XABCD
+            tolerance (float): Допуск для соотношений
+            
+        Returns:
+            dict: Информация о паттерне или None
+        """
+        if len(points) != 5:
+            return None
+            
+        try:
+            # Извлекаем цены
+            X = points[0]['price']
+            A = points[1]['price']
+            B = points[2]['price']
+            C = points[3]['price']
+            D = points[4]['price']
+            
+            # Определяем направления движений
+            XA_move = A - X
+            AB_move = B - A
+            BC_move = C - B
+            XB_move = B - X
+            XC_move = C - X
+            
+            # Проверяем каждое определение паттерна
+            for pattern_name, pattern_ratios in self.pattern_definitions.items():
+                is_valid = True
+                actual_ratios = {}
+                
+                # Проверяем соотношение AB/XA
+                if pattern_ratios['AB'] is not None:
+                    AB_ratio = abs(AB_move / XA_move) if XA_move != 0 else 0
+                    expected_ratio = pattern_ratios['AB']
+                    
+                    if not self._is_within_tolerance(AB_ratio, expected_ratio, tolerance):
+                        is_valid = False
+                    
+                    actual_ratios['AB/XA'] = AB_ratio
+                
+                # Проверяем соотношение BC/AB
+                if pattern_ratios['BC'] is not None and AB_move != 0:
+                    BC_ratio = abs(BC_move / AB_move)
+                    expected_ratio = pattern_ratios['BC']
+                    
+                    if not self._is_within_tolerance(BC_ratio, expected_ratio, tolerance):
+                        is_valid = False
+                    
+                    actual_ratios['BC/AB'] = BC_ratio
+                
+                # Проверяем соотношение CD/BC (расчетное)
+                if pattern_ratios['CD'] is not None and BC_move != 0:
+                    # Предполагаемая точка D на основе паттерна
+                    if AB_move > 0:  # A->B вверх
+                        projected_D = C + abs(BC_move) * pattern_ratios['CD']
+                    else:  # A->B вниз
+                        projected_D = C - abs(BC_move) * pattern_ratios['CD']
+                    
+                    CD_ratio = abs(D - C) / abs(BC_move) if BC_move != 0 else 0
+                    expected_ratio = pattern_ratios['CD']
+                    
+                    if not self._is_within_tolerance(CD_ratio, expected_ratio, tolerance * 1.5):
+                        is_valid = False
+                    
+                    actual_ratios['CD/BC'] = CD_ratio
+                    actual_ratios['projected_D'] = projected_D
+                
+                # Проверяем соотношение AD/XA (расчетное)
+                if pattern_ratios['AD'] is not None and XA_move != 0:
+                    AD_ratio = abs(D - A) / abs(XA_move)
+                    expected_ratio = pattern_ratios['AD']
+                    
+                    if not self._is_within_tolerance(AD_ratio, expected_ratio, tolerance):
+                        is_valid = False
+                    
+                    actual_ratios['AD/XA'] = AD_ratio
+                
+                # Если паттерн прошел все проверки
+                if is_valid:
+                    # Определяем направление паттерна
+                    direction = 'bullish' if D > C else 'bearish'
+                    
+                    # Определяем потенциальную зону разворота
+                    if direction == 'bullish':
+                        potential_reversal_zone = {
+                            'lower': C,
+                            'upper': D,
+                            'target': D + abs(D - C) * 0.618  # Фибо расширение
+                        }
+                    else:
+                        potential_reversal_zone = {
+                            'lower': D,
+                            'upper': C,
+                            'target': D - abs(C - D) * 0.618
+                        }
+                    
+                    # Рассчитываем уверенность на основе точности соотношений
+                    confidence = self._calculate_pattern_confidence(actual_ratios, pattern_ratios, tolerance)
+                    
+                    pattern_info = {
+                        'pattern_type': pattern_name,
+                        'direction': direction,
+                        'points_indices': [p['index'] for p in points],
+                        'prices': {'X': X, 'A': A, 'B': B, 'C': C, 'D': D},
+                        'actual_ratios': actual_ratios,
+                        'expected_ratios': pattern_ratios,
+                        'tolerance': tolerance,
+                        'confidence': confidence,
+                        'potential_reversal_zone': potential_reversal_zone,
+                        'signal': 'buy' if direction == 'bullish' else 'sell',
+                        'timestamp': points[4]['timestamp']
+                    }
+                    
+                    return pattern_info
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка идентификации паттерна: {e}")
+            return None
+            
+    def _is_within_tolerance(self, actual: float, expected: float, 
+                            tolerance: float) -> bool:
+        """
+        Проверка нахождения значения в пределах допуска
+        
+        Args:
+            actual (float): Фактическое значение
+            expected (float): Ожидаемое значение
+            tolerance (float): Допуск
+            
+        Returns:
+            bool: True если в пределах допуска
+        """
+        if expected == 0:
+            return actual == 0
+        
+        ratio = actual / expected
+        return abs(1 - ratio) <= tolerance
+        
+    def _calculate_pattern_confidence(self, actual_ratios: Dict[str, float],
+                                     expected_ratios: Dict[str, float],
+                                     tolerance: float) -> float:
+        """
+        Расчет уверенности в паттерне
+        
+        Args:
+            actual_ratios (dict): Фактические соотношения
+            expected_ratios (dict): Ожидаемые соотношения
+            tolerance (float): Допуск
+            
+        Returns:
+            float: Уверенность (0-1)
+        """
         if not actual_ratios:
-            return 0.0
-
-        total_error = 0.0
+            return 0.5
+            
+        total_error = 0
         count = 0
-
-        for ratio_key, ideal_value in ideal_ratios.items():
-            if ratio_key in actual_ratios:
-                actual_value = actual_ratios[ratio_key]
-                if actual_value > 0:
-                    error = abs(actual_value - ideal_value) / ideal_value
+        
+        for key, expected in expected_ratios.items():
+            if expected is not None and key in actual_ratios:
+                actual = actual_ratios[key]
+                if expected != 0:
+                    error = abs(actual / expected - 1)
                     total_error += error
                     count += 1
-
+        
         if count == 0:
-            return 0.0
-
+            return 0.5
+            
         avg_error = total_error / count
-        quality = 1.0 - min(1.0, avg_error / self.fib_tolerance)
-
-        return quality
-
-    def _determine_harmonic_direction(self, points: List[ExtremePoint]) -> str:
-        """Определение направления гармонического паттерна"""
-        # Паттерн считается бычьим, если D ниже C для покупки
-        # или медвежьим, если D выше C для продажи
-
-        # Но в гармонических паттернах направление определяется по XA движению
-        X = points[0].price
-        A = points[1].price
-        D = points[4].price
-
-        if A > X:  # Бычье движение XA
-            # Для бычьих паттернов (Gartley, Butterfly, Crab)
-            # D должна быть ниже C для покупки
-            return 'bullish'
-        else:  # Медвежье движение XA
-            # Для медвежьих паттернов
-            # D должна быть выше C для продажи
-            return 'bearish'
-
-    def _calculate_harmonic_targets(self,
-                                   points: List[ExtremePoint],
-                                   pattern_name: str,
-                                   direction: str) -> Dict[str, float]:
-        """Расчет целевых уровней для гармонического паттерна"""
-        X = points[0].price
-        A = points[1].price
-        B = points[2].price
-        C = points[3].price
-        D = points[4].price
-
-        # Вычисляем соотношения
-        XA = abs(A - X)
-        AB = abs(B - A)
-        BC = abs(C - B)
-
-        # Определяем точку входа (D)
-        entry_price = D
-
-        # Стоп-лосс зависит от паттерна
-        if pattern_name in ['gartley', 'bat']:
-            stop_loss = X * 1.01 if direction == 'bearish' else X * 0.99
-        elif pattern_name == 'butterfly':
-            stop_loss = A * 1.01 if direction == 'bearish' else A * 0.99
-        elif pattern_name == 'crab':
-            stop_loss = (X + (A - X) * 1.618) * 1.01 if direction == 'bearish' else (X - (X - A) * 1.618) * 0.99
-        else:
-            stop_loss = C * 1.01 if direction == 'bearish' else C * 0.99
-
-        # Тейк-профит (обычно 61.8% от CD)
-        if direction == 'bullish':
-            take_profit = entry_price + abs(D - C) * 0.618
-        else:
-            take_profit = entry_price - abs(D - C) * 0.618
-
-        return {
-            'entry_price': entry_price,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit,
-            'XA_length': XA,
-            'AB_length': AB,
-            'BC_length': BC,
-            'pattern_type': pattern_name
-        }
-
-    def _filter_results(self, results: List[PatternResult]) -> List[PatternResult]:
-        """Фильтрация результатов"""
-        if not results:
-            return []
-
-        # 1. Фильтрация по качеству
-        filtered = [r for r in results if r.quality >= config.DETECTION.MIN_PATTERN_QUALITY]
-
-        # 2. Фильтрация по уверенности
-        filtered = [r for r in filtered if r.confidence >= config.DETECTION.CONFIDENCE_THRESHOLD]
-
-        # 3. Удаление дубликатов (похожие паттерны на одних и тех же точках)
-        filtered.sort(key=lambda x: x.quality * x.confidence, reverse=True)
-
-        used_points = set()
-        unique_results = []
-
-        for result in filtered:
-            # Создаем ключ на основе индексов точек
-            point_key = tuple(sorted(p.index for p in result.points))
-
-            if point_key not in used_points:
-                unique_results.append(result)
-                used_points.add(point_key)
-
-        return unique_results
-
-    def _calculate_fibonacci_levels(self,
-                                   X: float,
-                                   A: float,
-                                   B: float,
-                                   C: float,
-                                   pattern_type: str) -> Tuple[float, Dict[str, float]]:
+        confidence = 1.0 - min(1.0, avg_error / tolerance)
+        
+        return max(0.1, min(1.0, confidence))
+        
+    def _analyze_pattern_quality(self, points: List[Dict[str, Any]], 
+                                pattern_type: str) -> Dict[str, Any]:
         """
-        Расчет уровней Фибоначчи для гармонического паттерна
-
+        Анализ качества паттерна
+        
         Args:
-            X, A, B, C: Цены точек
-            pattern_type: Тип паттерна
-
+            points (list): Точки паттерна
+            pattern_type (str): Тип паттерна
+            
         Returns:
-            (D, fibonacci_levels)
+            dict: Информация о качестве
         """
-        # Вычисляем длины волн
-        XA = abs(A - X)
-        AB = abs(B - A)
-        BC = abs(C - B)
-
-        # Определяем идеальные соотношения для паттерна
-        if pattern_type in self.pattern_definitions:
-            ratios = self.pattern_definitions[pattern_type]
-        else:
-            ratios = self.pattern_definitions['gartley']  # По умолчанию
-
-        # Вычисляем проекцию D
-        AB_ratio = AB / XA if XA != 0 else 0
-        BC_ratio = BC / AB if AB != 0 else 0
-
-        # Определяем направление
-        if A > X:  # Бычье движение XA
-            direction = 1
-        else:  # Медвежье движение XA
-            direction = -1
-
-        # Рассчитываем D на основе паттерна
-        if 'AD' in ratios:
-            AD_ratio = ratios['AD']
-
-            if direction == 1:  # Бычий
-                D = X + AD_ratio * XA
-            else:  # Медвежий
-                D = X - AD_ratio * XA
-        else:
-            # Альтернативный расчет
-            CD_ratio = ratios.get('CD', 1.618)
-            D = C + direction * BC * CD_ratio
-
-        # Вычисляем все соотношения
-        fibonacci_levels = {
-            'AB': AB_ratio,
-            'BC': BC_ratio,
-            'CD': abs(D - C) / BC if BC != 0 else 0,
-            'AD': abs(D - X) / XA if XA != 0 else 0
+        quality = {
+            'volume_analysis': {},
+            'time_analysis': {},
+            'market_context': {}
         }
+        
+        try:
+            # Анализ объема
+            if 'Volume' in self.data.columns:
+                volume_data = []
+                for point in points:
+                    idx = point['index']
+                    if idx < len(self.data):
+                        volume_data.append(self.data.iloc[idx]['Volume'])
+                
+                if volume_data:
+                    quality['volume_analysis'] = {
+                        'avg_volume': np.mean(volume_data),
+                        'volume_trend': 'increasing' if volume_data[-1] > volume_data[0] else 'decreasing',
+                        'volume_at_D': volume_data[-1] if volume_data else 0
+                    }
+            
+            # Анализ времени
+            if len(points) >= 2:
+                times = [point['timestamp'] for point in points]
+                time_diffs = []
+                
+                for i in range(1, len(times)):
+                    if isinstance(times[i], pd.Timestamp) and isinstance(times[i-1], pd.Timestamp):
+                        diff = (times[i] - times[i-1]).total_seconds() / 3600  # в часах
+                        time_diffs.append(diff)
+                
+                if time_diffs:
+                    quality['time_analysis'] = {
+                        'avg_time_between_points_hours': np.mean(time_diffs),
+                        'total_pattern_duration_hours': sum(time_diffs)
+                    }
+            
+            # Контекст рынка
+            last_point_idx = points[-1]['index']
+            if last_point_idx > 20:
+                # Анализ тренда перед паттерном
+                prev_data = self.data.iloc[last_point_idx-20:last_point_idx]
+                if len(prev_data) > 1:
+                    price_change = (prev_data.iloc[-1]['Close'] - prev_data.iloc[0]['Close']) / prev_data.iloc[0]['Close'] * 100
+                    
+                    if price_change > 3:
+                        quality['market_context']['trend'] = 'strong_uptrend'
+                    elif price_change > 1:
+                        quality['market_context']['trend'] = 'uptrend'
+                    elif price_change < -3:
+                        quality['market_context']['trend'] = 'strong_downtrend'
+                    elif price_change < -1:
+                        quality['market_context']['trend'] = 'downtrend'
+                    else:
+                        quality['market_context']['trend'] = 'sideways'
+            
+            # Дополнительные проверки для конкретных паттернов
+            if pattern_type == 'gartley':
+                quality['pattern_specific'] = {
+                    'is_ideal': self._check_gartley_ideal_conditions(points)
+                }
+            elif pattern_type == 'butterfly':
+                quality['pattern_specific'] = {
+                    'is_ideal': self._check_butterfly_ideal_conditions(points)
+                }
+            
+        except Exception as e:
+            logger.error(f"Ошибка анализа качества паттерна: {e}")
+            
+        return quality
+        
+    def _check_gartley_ideal_conditions(self, points: List[Dict[str, Any]]) -> bool:
+        """
+        Проверка идеальных условий для паттерна Гартли
+        
+        Args:
+            points (list): Точки паттерна
+            
+        Returns:
+            bool: True если условия идеальные
+        """
+        # Для идеального Гартли:
+        # 1. Точка B должна быть на 61.8% от XA
+        # 2. Точка C должна быть на 38.2% от AB
+        # 3. Точка D должна быть на 78.6% от XA
+        
+        try:
+            X = points[0]['price']
+            A = points[1]['price']
+            B = points[2]['price']
+            C = points[3]['price']
+            D = points[4]['price']
+            
+            XA_move = A - X
+            AB_move = B - A
+            BC_move = C - B
+            
+            AB_ratio = abs(AB_move / XA_move) if XA_move != 0 else 0
+            BC_ratio = abs(BC_move / AB_move) if AB_move != 0 else 0
+            AD_ratio = abs(D - A) / abs(XA_move) if XA_move != 0 else 0
+            
+            # Проверяем близость к идеальным соотношениям
+            ideal_AB = 0.618
+            ideal_BC = 0.382
+            ideal_AD = 0.786
+            
+            tolerance = 0.03  # Более строгий допуск для "идеального"
+            
+            return (
+                self._is_within_tolerance(AB_ratio, ideal_AB, tolerance) and
+                self._is_within_tolerance(BC_ratio, ideal_BC, tolerance) and
+                self._is_within_tolerance(AD_ratio, ideal_AD, tolerance)
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки условий Гартли: {e}")
+            return False
+            
+    def _check_butterfly_ideal_conditions(self, points: List[Dict[str, Any]]) -> bool:
+        """
+        Проверка идеальных условий для паттерна Баттерфляй
+        
+        Args:
+            points (list): Точки паттерна
+            
+        Returns:
+            bool: True если условия идеальные
+        """
+        try:
+            X = points[0]['price']
+            A = points[1]['price']
+            B = points[2]['price']
+            C = points[3]['price']
+            D = points[4]['price']
+            
+            XA_move = A - X
+            AB_move = B - A
+            BC_move = C - B
+            
+            AB_ratio = abs(AB_move / XA_move) if XA_move != 0 else 0
+            BC_ratio = abs(BC_move / AB_move) if AB_move != 0 else 0
+            AD_ratio = abs(D - A) / abs(XA_move) if XA_move != 0 else 0
+            
+            # Идеальные соотношения для Баттерфляй
+            ideal_AB = 0.786
+            ideal_BC = 0.382
+            ideal_AD = 1.272
+            
+            tolerance = 0.03
+            
+            return (
+                self._is_within_tolerance(AB_ratio, ideal_AB, tolerance) and
+                self._is_within_tolerance(BC_ratio, ideal_BC, tolerance) and
+                self._is_within_tolerance(AD_ratio, ideal_AD, tolerance)
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки условий Баттерфляй: {e}")
+            return False
+            
+    def get_fibonacci_levels(self, start_price: float, end_price: float, 
+                            level_type: str = 'retracement') -> Dict[str, float]:
+        """
+        Расчет уровней Фибоначчи
+        
+        Args:
+            start_price (float): Начальная цена
+            end_price (float): Конечная цена
+            level_type (str): Тип уровней ('retracement' или 'extension')
+            
+        Returns:
+            dict: Уровни Фибоначчи
+        """
+        if level_type not in self.fibonacci_levels:
+            level_type = 'retracement'
+            
+        move = end_price - start_price
+        levels = {}
+        
+        for level in self.fibonacci_levels[level_type]:
+            if level_type == 'retracement':
+                price_level = end_price - move * level
+                levels[f'FIB_{int(level*1000)}'] = price_level
+            else:
+                price_level = end_price + move * level
+                levels[f'EXT_{int(level*1000)}'] = price_level
+                
+        return levels
+        
+    def validate_pattern(self, pattern_info: Dict[str, Any], 
+                        min_confidence: float = 0.7) -> bool:
+        """
+        Валидация гармонического паттерна
+        
+        Args:
+            pattern_info (dict): Информация о паттерне
+            min_confidence (float): Минимальная уверенность
+            
+        Returns:
+            bool: True если паттерн валиден
+        """
+        if pattern_info.get('confidence', 0) < min_confidence:
+            return False
+            
+        # Дополнительные проверки
+        points = pattern_info.get('points', [])
+        if len(points) != 5:
+            return False
+            
+        # Проверяем объем (если есть данные)
+        volume_analysis = pattern_info.get('volume_analysis', {})
+        volume_at_D = volume_analysis.get('volume_at_D', 0)
+        
+        # Для гармонических паттернов часто важен объем в точке D
+        if volume_at_D > 0:
+            # Проверяем, что объем в точке D выше среднего
+            avg_volume = volume_analysis.get('avg_volume', volume_at_D)
+            if volume_at_D < avg_volume * 0.5:
+                return False
+        
+        return True
 
-        return D, fibonacci_levels
 
-    @property
-    def peak_prominence(self) -> float:
-        """Минимальная значимость экстремума"""
-        return 0.003  # 0.3%
+# Создаем экземпляр для удобства
+harmonic_pattern = HarmonicPattern(None)
 

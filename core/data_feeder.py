@@ -1,250 +1,380 @@
-"""
-Модуль загрузки данных с интеграцией MT5Connector для RFD-инструментов
-"""
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
-import threading
-import queue
-import time
+import hashlib
+import pickle
+import os
+from typing import Optional, Dict, Any
+import logging
 
-# Исправляем импорты - используем абсолютные импорты
+# Настройка логирования
+logger = logging.getLogger(__name__)
+
 try:
-    # Пробуем импортировать из корня проекта
-    import sys
-    sys.path.append('.')  # Добавляем текущую директорию в путь
-
-    from config import config
     from utils.mt5_connector import mt5_connector
-except ImportError as e:
-    print(f"Ошибка импорта: {e}")
-
-    # Создаем простой конфиг для тестирования
-    class SimpleConfig:
-        class MT5Config:
-            ENABLED = True
-            SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY"]
-            TIMEFRAMES = ["H1", "H4", "D1"]
-            AUTO_CONNECT = False
-
-        class DetectionConfig:
-            MAX_CANDLES_FOR_PATTERN = 100
-
-        MT5 = MT5Config()
-        DETECTION = DetectionConfig()
-
-    config = SimpleConfig()
+except ImportError:
+    # Для тестового режима
     mt5_connector = None
-    print("Используется простой конфиг для тестирования")
-
+    logger.warning("MT5Connector не найден, используется тестовый режим")
 
 class DataFeeder:
-    """Класс для загрузки и управления рыночными данными"""
-
-    def __init__(self, custom_config: Dict = None):
-        self.config = custom_config or {}
-        self.data_cache = {}  # Кэш данных: {symbol: {timeframe: DataFrame}}
-        self.update_queue = queue.Queue()
-        self.running = False
-        self.update_thread = None
-
-        # Используем настройки из конфига по умолчанию
-        self.symbols = config.MT5.SYMBOLS
-        self.timeframes = config.MT5.TIMEFRAMES
-
-        # Инициализируем MT5
-        if config.MT5.ENABLED and config.MT5.AUTO_CONNECT:
-            if mt5_connector and not mt5_connector.initialized:
-                if not mt5_connector._init_mt5():
-                    print("Предупреждение: MT5 не инициализирован, будут использоваться тестовые данные")
-
-    def get_data(self, symbol: str, timeframe: str,
-                bars: int = None, use_cache: bool = True) -> pd.DataFrame:
+    """
+    Класс для получения и подготовки данных для анализа
+    """
+    
+    def __init__(self, cache_enabled: bool = True, cache_dir: str = "data_cache"):
+        """
+        Инициализация фидера данных
+        
+        Args:
+            cache_enabled (bool): Включить кэширование данных
+            cache_dir (str): Директория для кэша
+        """
+        self.cache_enabled = cache_enabled
+        self.cache_dir = cache_dir
+        self.data_cache = {}
+        
+        # Создаем директорию для кэша, если нужно
+        if cache_enabled and not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, exist_ok=True)
+            logger.info(f"Создана директория кэша: {cache_dir}")
+            
+    def get_data(self, symbol: str, timeframe: str, bars: int = 1000, 
+                 from_date: Optional[datetime] = None, 
+                 to_date: Optional[datetime] = None,
+                 use_cache: bool = True) -> pd.DataFrame:
         """
         Получение данных для указанного символа и таймфрейма
-
+        
         Args:
-            symbol: Торговый символ (без префикса RFD)
-            timeframe: Таймфрейм
-            bars: Количество баров (если None - из конфига)
-            use_cache: Использовать кэш
-
+            symbol (str): Имя символа (например, 'EURUSD')
+            timeframe (str): Таймфрейм ('M1', 'M5', 'H1', etc.)
+            bars (int): Количество баров для получения
+            from_date (datetime): Начальная дата (если указана, игнорируется bars)
+            to_date (datetime): Конечная дата
+            use_cache (bool): Использовать кэш
+            
         Returns:
-            DataFrame с данными
+            pd.DataFrame: DataFrame с данными
         """
-        if bars is None:
-            bars = config.DETECTION.MAX_CANDLES_FOR_PATTERN
-
-        # Проверяем кэш
-        cache_key = f"{symbol}_{timeframe}"
-        if use_cache and cache_key in self.data_cache:
-            cached_data = self.data_cache[cache_key]
-            if len(cached_data) >= bars:
-                return cached_data.tail(bars).copy()
-
-        # Получаем данные
-        data = None
-        if config.MT5.ENABLED and mt5_connector and mt5_connector.initialized:
-            data = mt5_connector.get_historical_data(symbol, timeframe, bars)
-
-        if data is None or data.empty:
-            print(f"MT5 не доступен или данные пустые для {symbol}, используем тестовые данные")
-            data = self._generate_test_data(symbol, timeframe, bars)
-
-        # Кэшируем данные
-        self.data_cache[cache_key] = data
-
-        return data.copy()
-
-    def get_multiple_symbols(self, symbols: List[str], timeframe: str,
-                           bars: int = None) -> Dict[str, pd.DataFrame]:
-        """Получение данных для нескольких символов"""
-        result = {}
-        for symbol in symbols:
-            data = self.get_data(symbol, timeframe, bars)
-            if not data.empty:
-                result[symbol] = data
-        return result
-
-    def update_data(self, symbol: str, timeframe: str):
-        """Обновление данных для символа"""
-        try:
-            if not mt5_connector:
-                return
-
-            # Получаем последние 100 баров для обновления
-            new_data = mt5_connector.get_historical_data(symbol, timeframe, 100)
-
-            if new_data.empty:
-                return
-
-            cache_key = f"{symbol}_{timeframe}"
-
+        cache_key = None
+        
+        # Генерируем ключ кэша
+        if self.cache_enabled and use_cache:
+            cache_key = self._generate_cache_key(symbol, timeframe, bars, from_date, to_date)
+            
+            # Проверяем кэш в памяти
             if cache_key in self.data_cache:
-                # Объединяем с существующими данными
-                old_data = self.data_cache[cache_key]
-                combined = pd.concat([old_data, new_data])
-                combined = combined[~combined.index.duplicated(keep='last')]
-                self.data_cache[cache_key] = combined.sort_index()
-            else:
-                self.data_cache[cache_key] = new_data
-
-            print(f"Данные обновлены для {symbol} ({timeframe}): {len(new_data)} новых баров")
-
-        except Exception as e:
-            print(f"Ошибка обновления данных для {symbol}: {e}")
-
-    def get_current_prices(self, symbols: List[str]) -> Dict[str, Dict]:
-        """Получение текущих цен для списка символов"""
-        prices = {}
-        for symbol in symbols:
-            if mt5_connector:
-                price_data = mt5_connector.get_current_price(symbol)
-                if price_data:
-                    prices[symbol] = price_data
-        return prices
-
-    def start_real_time_updates(self, update_interval: int = 60):
-        """Запуск потокового обновления данных"""
-        if self.running:
-            return
-
-        self.running = True
-        self.update_thread = threading.Thread(
-            target=self._update_worker,
-            args=(update_interval,),
-            daemon=True
-        )
-        self.update_thread.start()
-        print(f"Запущено потоковое обновление данных каждые {update_interval} секунд")
-
-    def stop_real_time_updates(self):
-        """Остановка потокового обновления"""
-        self.running = False
-        if self.update_thread:
-            self.update_thread.join(timeout=5)
-        print("Потоковое обновление данных остановлено")
-
-    def _update_worker(self, interval: int):
-        """Рабочий поток для обновления данных"""
-        while self.running:
+                logger.debug(f"Данные найдены в кэше памяти: {cache_key}")
+                return self.data_cache[cache_key].copy()
+                
+            # Проверяем кэш на диске
+            cached_data = self._load_from_cache(cache_key)
+            if cached_data is not None:
+                logger.debug(f"Данные загружены из кэша на диске: {cache_key}")
+                self.data_cache[cache_key] = cached_data
+                return cached_data.copy()
+        
+        # Получаем данные из MT5
+        logger.info(f"Загрузка данных: {symbol} {timeframe}, баров: {bars}")
+        
+        if mt5_connector is None:
+            logger.warning("MT5Connector недоступен, генерируем тестовые данные")
+            df = self._generate_test_data(symbol, timeframe, bars)
+        else:
+            df = mt5_connector.get_rates(symbol, timeframe, bars)
+            
+        if df.empty:
+            logger.warning(f"Получены пустые данные для {symbol} {timeframe}")
+            return df
+            
+        # Применяем фильтры по дате, если указаны
+        if from_date is not None:
+            df = df[df.index >= from_date]
+        if to_date is not None:
+            df = df[df.index <= to_date]
+            
+        # Добавляем технические индикаторы
+        df = self._add_technical_indicators(df)
+        
+        # Кэшируем данные
+        if self.cache_enabled and use_cache and cache_key is not None:
+            self.data_cache[cache_key] = df.copy()
+            self._save_to_cache(cache_key, df)
+            logger.debug(f"Данные сохранены в кэш: {cache_key}")
+            
+        return df
+        
+    def _generate_cache_key(self, symbol: str, timeframe: str, bars: int,
+                           from_date: Optional[datetime], 
+                           to_date: Optional[datetime]) -> str:
+        """
+        Генерация ключа для кэша
+        
+        Args:
+            symbol (str): Имя символа
+            timeframe (str): Таймфрейм
+            bars (int): Количество баров
+            from_date (datetime): Начальная дата
+            to_date (datetime): Конечная дата
+            
+        Returns:
+            str: Ключ кэша
+        """
+        key_parts = [
+            symbol,
+            timeframe,
+            str(bars),
+            str(from_date) if from_date else 'None',
+            str(to_date) if to_date else 'None',
+            datetime.now().strftime('%Y%m%d')  # Дата для инвалидации кэша
+        ]
+        
+        key_string = '_'.join(key_parts)
+        return hashlib.md5(key_string.encode()).hexdigest()
+        
+    def _load_from_cache(self, cache_key: str) -> Optional[pd.DataFrame]:
+        """
+        Загрузка данных из кэша на диске
+        
+        Args:
+            cache_key (str): Ключ кэша
+            
+        Returns:
+            Optional[pd.DataFrame]: DataFrame из кэша или None
+        """
+        if not self.cache_enabled:
+            return None
+            
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.pkl")
+        
+        if os.path.exists(cache_file):
             try:
-                # Обновляем данные для всех символов и таймфреймов из конфига
-                for symbol in self.symbols:
-                    for timeframe in self.timeframes:
-                        self.update_data(symbol, timeframe)
-
-                # Ждем указанный интервал
-                time.sleep(interval)
-
+                # Проверяем возраст файла (максимум 1 день)
+                file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_file))
+                if file_age.days > 1:
+                    logger.debug(f"Файл кэша устарел: {cache_file}")
+                    return None
+                    
+                with open(cache_file, 'rb') as f:
+                    data = pickle.load(f)
+                    
+                if isinstance(data, pd.DataFrame) and not data.empty:
+                    return data
+                    
             except Exception as e:
-                print(f"Ошибка в потоке обновления: {e}")
-                time.sleep(interval)
-
+                logger.warning(f"Ошибка загрузки из кэша {cache_file}: {e}")
+                
+        return None
+        
+    def _save_to_cache(self, cache_key: str, data: pd.DataFrame):
+        """
+        Сохранение данных в кэш на диске
+        
+        Args:
+            cache_key (str): Ключ кэша
+            data (pd.DataFrame): Данные для сохранения
+        """
+        if not self.cache_enabled:
+            return
+            
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.pkl")
+        
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Ошибка сохранения в кэш {cache_file}: {e}")
+            
+    def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Добавление технических индикаторов к данным
+        
+        Args:
+            df (pd.DataFrame): Исходные данные
+            
+        Returns:
+            pd.DataFrame: Данные с индикаторами
+        """
+        if df.empty:
+            return df
+            
+        # Создаем копию, чтобы избежать предупреждений
+        df = df.copy()
+        
+        try:
+            # Простые скользящие средние
+            df['SMA_20'] = df['Close'].rolling(window=20).mean()
+            df['SMA_50'] = df['Close'].rolling(window=50).mean()
+            df['SMA_200'] = df['Close'].rolling(window=200).mean()
+            
+            # Экспоненциальные скользящие средние
+            df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+            df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+            
+            # MACD
+            df['MACD'] = df['EMA_12'] - df['EMA_26']
+            df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+            
+            # RSI
+            delta = df['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['RSI'] = 100 - (100 / (1 + rs))
+            
+            # Bollinger Bands
+            df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+            bb_std = df['Close'].rolling(window=20).std()
+            df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+            df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+            df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
+            
+            # ATR (Average True Range)
+            high_low = df['High'] - df['Low']
+            high_close = np.abs(df['High'] - df['Close'].shift())
+            low_close = np.abs(df['Low'] - df['Close'].shift())
+            ranges = pd.concat([high_low, high_close, low_close], axis=1)
+            true_range = np.max(ranges, axis=1)
+            df['ATR'] = true_range.rolling(window=14).mean()
+            
+            # Volume indicators
+            if 'Volume' in df.columns:
+                df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+                df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+            
+            # Price momentum
+            df['Momentum'] = df['Close'].diff(5)
+            df['ROC'] = (df['Close'].diff(10) / df['Close'].shift(10)) * 100
+            
+            # Volatility
+            df['Volatility'] = df['Close'].rolling(window=20).std() / df['Close'].rolling(window=20).mean()
+            
+            # Support and Resistance levels (простой расчет)
+            df['Resistance'] = df['High'].rolling(window=20).max()
+            df['Support'] = df['Low'].rolling(window=20).min()
+            
+            # Заполняем NaN значения
+            df = df.fillna(method='bfill').fillna(method='ffill')
+            
+            logger.debug(f"Добавлены технические индикаторы: {len(df.columns)} колонок")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении индикаторов: {e}")
+            
+        return df
+        
     def _generate_test_data(self, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
-        """Генерация тестовых данных (используется при отсутствии подключения к MT5)"""
-        print(f"Генерация тестовых данных для {symbol} ({timeframe})")
-
-        # Определяем базовую цену в зависимости от символа
-        base_prices = {
-            'EURUSD': 1.0800,
-            'GBPUSD': 1.2600,
-            'USDJPY': 150.00,
-            'XAUUSD': 1950.00,
-            'USDRUB': 90.00,
-            'EURGBP': 0.8600
-        }
-
-        base_price = base_prices.get(symbol, 1.0000)
-
-        # Определяем частоту в зависимости от таймфрейма
-        freq_map = {
-            'M1': '1min',
-            'M5': '5min',
-            'M15': '15min',
-            'M30': '30min',
-            'H1': '1H',
-            'H4': '4H',
-            'D1': '1D',
-            'W1': '1W',
-            'MN1': '1M'
-        }
-
-        freq = freq_map.get(timeframe, '1H')
-
-        # Генерируем даты
+        """
+        Генерация тестовых данных для отладки
+        
+        Args:
+            symbol (str): Имя символа
+            timeframe (str): Таймфрейм
+            bars (int): Количество баров
+            
+        Returns:
+            pd.DataFrame: Тестовые данные
+        """
+        logger.info(f"Генерация тестовых данных для {symbol} ({bars} баров)")
+        
+        # Создаем временную шкалу
         end_date = datetime.now()
-        dates = pd.date_range(end=end_date, periods=bars, freq=freq)
-
+        
+        # Определяем интервал между барами
+        timeframe_minutes = {
+            'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30,
+            'H1': 60, 'H4': 240, 'D1': 1440, 'W1': 10080
+        }
+        
+        minutes_per_bar = timeframe_minutes.get(timeframe.upper(), 1)
+        start_date = end_date - timedelta(minutes=bars * minutes_per_bar)
+        
+        dates = pd.date_range(start=start_date, end=end_date, periods=bars)
+        
         # Генерируем случайные цены с трендом
         np.random.seed(42)  # Для воспроизводимости
-        returns = np.random.normal(0.0001, 0.005, bars)
-        price = base_price * np.exp(np.cumsum(returns))
-
+        
+        base_price = 100.0 if 'USD' in symbol else 1.0
+        volatility = 0.01  # 1% волатильность
+        
+        # Создаем тренд
+        trend = np.linspace(0, 0.1, bars)  # 10% тренд за весь период
+        
+        # Генерируем случайные изменения
+        returns = np.random.normal(0, volatility, bars) + trend
+        
+        # Рассчитываем цены
+        prices = base_price * np.exp(np.cumsum(returns))
+        
         # Создаем OHLC данные
-        data = pd.DataFrame(index=dates)
-        data['close'] = price
-
-        # Генерируем open, high, low
-        data['open'] = data['close'].shift(1).fillna(base_price)
-        data['high'] = data[['open', 'close']].max(axis=1) * (1 + np.random.uniform(0, 0.001, bars))
-        data['low'] = data[['open', 'close']].min(axis=1) * (1 - np.random.uniform(0, 0.001, bars))
-
+        df = pd.DataFrame(index=dates)
+        df['Close'] = prices
+        
+        # Генерируем High/Low на основе Close
+        df['High'] = df['Close'] * (1 + np.abs(np.random.normal(0, volatility/2, bars)))
+        df['Low'] = df['Close'] * (1 - np.abs(np.random.normal(0, volatility/2, bars)))
+        
+        # Open немного отличается от предыдущего Close
+        df['Open'] = df['Close'].shift(1) * (1 + np.random.normal(0, volatility/4, bars))
+        df['Open'].iloc[0] = df['Close'].iloc[0] * (1 + np.random.normal(0, volatility/4))
+        
         # Объемы
-        data['volume'] = np.random.randint(1000, 100000, bars)
+        df['Volume'] = np.random.lognormal(mean=10, sigma=1, size=bars)
+        
+        # Заполняем NaN
+        df = df.fillna(method='bfill').fillna(method='ffill')
+        
+        logger.info(f"Сгенерировано {len(df)} тестовых баров для {symbol}")
+        return df
+        
+    def clear_cache(self, older_than_days: int = 1):
+        """
+        Очистка кэша
+        
+        Args:
+            older_than_days (int): Удалять файлы старше указанного количества дней
+        """
+        if not os.path.exists(self.cache_dir):
+            return
+            
+        try:
+            cutoff_time = datetime.now() - timedelta(days=older_than_days)
+            deleted_count = 0
+            
+            for filename in os.listdir(self.cache_dir):
+                if filename.endswith('.pkl'):
+                    filepath = os.path.join(self.cache_dir, filename)
+                    file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                    
+                    if file_time < cutoff_time:
+                        os.remove(filepath)
+                        deleted_count += 1
+                        
+            logger.info(f"Очищен кэш: удалено {deleted_count} файлов")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при очистке кэша: {e}")
+            
+    def get_available_symbols(self) -> list:
+        """
+        Получение списка доступных символов
+        
+        Returns:
+            list: Список символов
+        """
+        if mt5_connector is None or not mt5_connector.is_connected():
+            return ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'BTCUSD']
+            
+        try:
+            symbols = mt5.symbols_get()
+            return [s.name for s in symbols[:50]]  # Ограничиваем для скорости
+        except Exception as e:
+            logger.error(f"Ошибка получения списка символов: {e}")
+            return ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'BTCUSD']
 
-        # Проверяем, что low <= high <= close и low <= open <= high
-        data['high'] = data[['high', 'close', 'open']].max(axis=1)
-        data['low'] = data[['low', 'close', 'open']].min(axis=1)
 
-        return data
-
-    def clear_cache(self):
-        """Очистка кэша данных"""
-        self.data_cache.clear()
-        print("Кэш данных очищен")
-
-    def __del__(self):
-        self.stop_real_time_updates()
+# Создаем глобальный экземпляр для удобства
+data_feeder = DataFeeder()
 

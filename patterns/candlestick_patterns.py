@@ -1,382 +1,571 @@
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional
-from .base_pattern import Pattern
+from typing import List, Dict, Any, Optional
 import logging
+
+from patterns.base_pattern import BasePattern
 
 logger = logging.getLogger(__name__)
 
-class DojiPattern(Pattern):
-    """Паттерн Доджи"""
-    
-    def detect(self, data: pd.DataFrame) -> List['DojiPattern']:
+
+class DojiPattern(BasePattern):
+    """
+    Класс для обнаружения паттерна Doji (доджи)
+    """
+
+    def detect(self, threshold: float = 0.1, min_wick_ratio: float = 2.0) -> List[Dict[str, Any]]:
+        """
+        Обнаружение паттерна Doji
+
+        Args:
+            threshold (float): Максимальное соотношение тела к диапазону
+            min_wick_ratio (float): Минимальное соотношение теней
+
+        Returns:
+            list: Список обнаруженных паттернов Doji
+        """
         patterns = []
-        
-        if len(data) < 1:
+
+        if self.data is None or self.data.empty:
+            logger.warning("Нет данных для обнаружения паттерна Doji")
             return patterns
-        
-        for i in range(len(data)):
-            current = data.iloc[i]
-            
-            open_price = current['open']
-            close_price = current['close']
-            high_price = current['high']
-            low_price = current['low']
-            
-            # Определение Доджи: тело свечи очень маленькое
-            body_size = abs(close_price - open_price)
-            total_range = high_price - low_price
-            
-            if total_range > 0:
+
+        try:
+            for i in range(1, len(self.data) - 1):
+                current = self.data.iloc[i]
+
+                # Проверяем, что есть необходимые колонки
+                if not all(col in current for col in ['Open', 'High', 'Low', 'Close']):
+                    continue
+
+                # Рассчитываем размеры
+                body_size = abs(current['Close'] - current['Open'])
+                total_range = current['High'] - current['Low']
+
+                # Избегаем деления на ноль
+                if total_range == 0:
+                    continue
+
                 body_ratio = body_size / total_range
-                
-                # Доджи имеет тело меньше 10% от всего диапазона
-                if body_ratio < 0.1:
-                    # Определяем тип Доджи
-                    upper_shadow = high_price - max(open_price, close_price)
-                    lower_shadow = min(open_price, close_price) - low_price
-                    
-                    if upper_shadow > lower_shadow * 3 and lower_shadow < total_range * 0.1:
-                        pattern_type = "gravestone_doji"
-                        confidence = 0.8
-                    elif lower_shadow > upper_shadow * 3 and upper_shadow < total_range * 0.1:
-                        pattern_type = "dragonfly_doji"
-                        confidence = 0.8
-                    elif upper_shadow > 0 and lower_shadow > 0 and abs(upper_shadow - lower_shadow) < total_range * 0.1:
-                        pattern_type = "long_legged_doji"
-                        confidence = 0.7
-                    else:
-                        pattern_type = "doji"
-                        confidence = 0.6
-                    
-                    # Проверяем контекст для повышения уверенности
-                    if i > 0:
-                        prev_close = data.iloc[i-1]['close']
-                        trend = "up" if close_price > prev_close else "down"
-                        
-                        if pattern_type == "dragonfly_doji" and trend == "down":
-                            confidence += 0.1
-                        elif pattern_type == "gravestone_doji" and trend == "up":
-                            confidence += 0.1
-                    
-                    pattern = DojiPattern(
-                        symbol=data['symbol'].iloc[i] if 'symbol' in data.columns else "Unknown",
-                        timestamp=data.index[i],
-                        pattern_type=pattern_type,
-                        confidence=min(confidence, 1.0),
-                        data={
-                            'open': open_price,
-                            'high': high_price,
-                            'low': low_price,
-                            'close': close_price,
-                            'body_ratio': body_ratio,
-                            'upper_shadow': upper_shadow,
-                            'lower_shadow': lower_shadow
-                        }
+
+                # Проверяем условие Doji: маленькое тело
+                if body_ratio < threshold:
+                    # Рассчитываем тени
+                    upper_wick = current['High'] - max(current['Open'], current['Close'])
+                    lower_wick = min(current['Open'], current['Close']) - current['Low']
+
+                    # Проверяем наличие обеих теней
+                    if upper_wick > 0 and lower_wick > 0:
+                        # Рассчитываем соотношение теней
+                        wick_ratio = max(upper_wick, lower_wick) / min(upper_wick, lower_wick)
+
+                        # Проверяем соотношение теней
+                        if wick_ratio >= min_wick_ratio:
+                            # Определяем тип Doji
+                            if abs(upper_wick - lower_wick) < total_range * 0.1:
+                                doji_type = "perfect_doji"
+                            elif upper_wick > lower_wick * 2:
+                                doji_type = "dragonfly_doji"
+                            elif lower_wick > upper_wick * 2:
+                                doji_type = "gravestone_doji"
+                            else:
+                                doji_type = "doji"
+
+                            # Создаем описание паттерна
+                            pattern = {
+                                'index': i,
+                                'pattern_type': doji_type,
+                                'timestamp': self.data.index[i],
+                                'open': current['Open'],
+                                'high': current['High'],
+                                'low': current['Low'],
+                                'close': current['Close'],
+                                'body_size': body_size,
+                                'total_range': total_range,
+                                'body_ratio': body_ratio,
+                                'upper_wick': upper_wick,
+                                'lower_wick': lower_wick,
+                                'wick_ratio': wick_ratio,
+                                'volume': current.get('Volume', 0),
+                                'confidence': 1.0 - body_ratio,  # Чем меньше тело, тем выше уверенность
+                                'trend_context': self._get_trend_context(i),
+                                'signal': self._get_signal_type(i, doji_type)
+                            }
+
+                            patterns.append(pattern)
+
+            logger.info(f"Обнаружено {len(patterns)} паттернов Doji")
+            self.patterns = patterns
+            return patterns
+
+        except Exception as e:
+            logger.error(f"Ошибка при обнаружении паттерна Doji: {e}")
+            return []
+
+    def _get_trend_context(self, index: int, lookback: int = 20) -> str:
+        """
+        Определение трендового контекста
+
+        Args:
+            index (int): Индекс текущей свечи
+            lookback (int): Количество свечей для анализа
+
+        Returns:
+            str: Контекст тренда
+        """
+        if index < lookback:
+            return "insufficient_data"
+
+        try:
+            # Получаем данные для анализа
+            start_idx = max(0, index - lookback)
+            data_slice = self.data.iloc[start_idx:index]
+
+            if len(data_slice) < 5:
+                return "insufficient_data"
+
+            # Рассчитываем скользящие средние
+            closes = data_slice['Close'].values
+            sma_short = closes[-5:].mean() if len(closes) >= 5 else closes.mean()
+            sma_long = closes.mean()
+
+            # Определяем тренд
+            price_change = (closes[-1] - closes[0]) / closes[0] * 100
+
+            if price_change > 2:
+                return "strong_uptrend"
+            elif price_change > 0.5:
+                return "uptrend"
+            elif price_change < -2:
+                return "strong_downtrend"
+            elif price_change < -0.5:
+                return "downtrend"
+            else:
+                return "sideways"
+
+        except Exception as e:
+            logger.error(f"Ошибка при определении трендового контекста: {e}")
+            return "unknown"
+
+    def _get_signal_type(self, index: int, doji_type: str) -> str:
+        """
+        Определение типа сигнала на основе Doji
+
+        Args:
+            index (int): Индекс свечи
+            doji_type (str): Тип Doji
+
+        Returns:
+            str: Тип сигнала (bullish/bearish/neutral)
+        """
+        if index < 2 or index >= len(self.data) - 1:
+            return "neutral"
+
+        try:
+            prev_candle = self.data.iloc[index - 1]
+            current = self.data.iloc[index]
+
+            # Определяем направление предыдущей свечи
+            prev_direction = "bullish" if prev_candle['Close'] > prev_candle['Open'] else "bearish"
+
+            # Сигналы для разных типов Doji
+            if doji_type == "dragonfly_doji":
+                # Dragonfly Doji обычно бычий сигнал
+                return "bullish"
+            elif doji_type == "gravestone_doji":
+                # Gravestone Doji обычно медвежий сигнал
+                return "bearish"
+            elif doji_type == "perfect_doji":
+                # Perfect Doji требует подтверждения
+                return "neutral"
+            else:
+                # Обычный Doji - нейтральный сигнал
+                return "neutral"
+
+        except Exception as e:
+            logger.error(f"Ошибка при определении типа сигнала: {e}")
+            return "neutral"
+
+
+class HammerPattern(BasePattern):
+    """
+    Класс для обнаружения паттерна Hammer (молот)
+    """
+
+    def detect(self, min_body_ratio: float = 0.3, max_upper_wick: float = 0.1,
+               min_lower_wick_ratio: float = 2.0) -> List[Dict[str, Any]]:
+        """
+        Обнаружение паттерна Hammer
+
+        Args:
+            min_body_ratio (float): Минимальное соотношение тела к диапазону
+            max_upper_wick (float): Максимальное соотношение верхней тени к диапазону
+            min_lower_wick_ratio (float): Минимальное соотношение нижней тени к телу
+
+        Returns:
+            list: Список обнаруженных паттернов Hammer
+        """
+        patterns = []
+
+        if self.data is None or self.data.empty:
+            logger.warning("Нет данных для обнаружения паттерна Hammer")
+            return patterns
+
+        try:
+            for i in range(1, len(self.data) - 1):
+                current = self.data.iloc[i]
+
+                # Проверяем, что есть необходимые колонки
+                if not all(col in current for col in ['Open', 'High', 'Low', 'Close']):
+                    continue
+
+                # Рассчитываем размеры
+                body_size = abs(current['Close'] - current['Open'])
+                total_range = current['High'] - current['Low']
+
+                if total_range == 0:
+                    continue
+
+                body_ratio = body_size / total_range
+
+                # Проверяем условие маленького тела
+                if body_ratio < min_body_ratio:
+                    # Рассчитываем тени
+                    upper_wick = current['High'] - max(current['Open'], current['Close'])
+                    lower_wick = min(current['Open'], current['Close']) - current['Low']
+
+                    # Проверяем верхнюю тень
+                    upper_wick_ratio = upper_wick / total_range
+
+                    if upper_wick_ratio <= max_upper_wick and lower_wick > 0:
+                        # Проверяем соотношение нижней тени к телу
+                        if body_size > 0 and lower_wick >= body_size * min_lower_wick_ratio:
+                            # Определяем, является ли паттерн бычьим или медвежьим
+                            is_bullish = current['Close'] > current['Open']
+
+                            # Определяем тип паттерна
+                            if is_bullish:
+                                pattern_type = "hammer"
+                            else:
+                                pattern_type = "inverted_hammer"
+
+                            # Создаем описание паттерна
+                            pattern = {
+                                'index': i,
+                                'pattern_type': pattern_type,
+                                'timestamp': self.data.index[i],
+                                'open': current['Open'],
+                                'high': current['High'],
+                                'low': current['Low'],
+                                'close': current['Close'],
+                                'body_size': body_size,
+                                'total_range': total_range,
+                                'body_ratio': body_ratio,
+                                'upper_wick': upper_wick,
+                                'lower_wick': lower_wick,
+                                'lower_wick_ratio': lower_wick / body_size if body_size > 0 else 0,
+                                'is_bullish': is_bullish,
+                                'volume': current.get('Volume', 0),
+                                'volume_ratio': self._get_volume_ratio(i),
+                                'confidence': 0.8 - (body_ratio * 0.5),  # Корректировка уверенности
+                                'position_in_trend': self._get_position_in_trend(i),
+                                'signal': "bullish" if is_bullish else "neutral"
+                            }
+
+                            patterns.append(pattern)
+
+            logger.info(f"Обнаружено {len(patterns)} паттернов Hammer")
+            self.patterns = patterns
+            return patterns
+
+        except Exception as e:
+            logger.error(f"Ошибка при обнаружении паттерна Hammer: {e}")
+            return []
+
+    def _get_volume_ratio(self, index: int, lookback: int = 10) -> float:
+        """
+        Расчет соотношения объема
+
+        Args:
+            index (int): Индекс свечи
+            lookback (int): Количество свечей для расчета среднего объема
+
+        Returns:
+            float: Соотношение объема
+        """
+        if index < lookback or 'Volume' not in self.data.columns:
+            return 1.0
+
+        try:
+            current_volume = self.data.iloc[index]['Volume']
+
+            # Рассчитываем средний объем за предыдущие свечи
+            start_idx = max(0, index - lookback)
+            avg_volume = self.data.iloc[start_idx:index]['Volume'].mean()
+
+            if avg_volume > 0:
+                return current_volume / avg_volume
+            else:
+                return 1.0
+
+        except Exception as e:
+            logger.error(f"Ошибка при расчете соотношения объема: {e}")
+            return 1.0
+
+    def _get_position_in_trend(self, index: int, lookback: int = 10) -> str:
+        """
+        Определение позиции в тренде
+
+        Args:
+            index (int): Индекс свечи
+            lookback (int): Количество свечей для анализа
+
+        Returns:
+            str: Позиция в тренде
+        """
+        if index < lookback:
+            return "unknown"
+
+        try:
+            # Получаем данные для анализа
+            start_idx = max(0, index - lookback)
+            data_slice = self.data.iloc[start_idx:index + 1]
+
+            if len(data_slice) < 5:
+                return "unknown"
+
+            # Определяем максимумы и минимумы
+            highs = data_slice['High'].values
+            lows = data_slice['Low'].values
+            current_high = highs[-1]
+            current_low = lows[-1]
+
+            max_high = highs.max()
+            min_low = lows.min()
+
+            # Определяем позицию
+            if current_high >= max_high * 0.99:
+                return "new_high"
+            elif current_low <= min_low * 1.01:
+                return "new_low"
+            else:
+                return "within_range"
+
+        except Exception as e:
+            logger.error(f"Ошибка при определении позиции в тренде: {e}")
+            return "unknown"
+
+
+class EngulfingPattern(BasePattern):
+    """
+    Класс для обнаружения паттерна Engulfing (поглощение)
+    """
+
+    def detect(self, min_body_ratio: float = 1.5, volume_increase: float = 1.2) -> List[Dict[str, Any]]:
+        """
+        Обнаружение паттерна Engulfing
+
+        Args:
+            min_body_ratio (float): Минимальное соотношение тел свечей
+            volume_increase (float): Минимальное увеличение объема
+
+        Returns:
+            list: Список обнаруженных паттернов Engulfing
+        """
+        patterns = []
+
+        if self.data is None or self.data.empty:
+            logger.warning("Нет данных для обнаружения паттерна Engulfing")
+            return patterns
+
+        try:
+            for i in range(2, len(self.data)):
+                current = self.data.iloc[i]
+                previous = self.data.iloc[i - 1]
+
+                # Проверяем, что есть необходимые колонки
+                required_cols = ['Open', 'High', 'Low', 'Close']
+                if not all(col in current for col in required_cols) or \
+                        not all(col in previous for col in required_cols):
+                    continue
+
+                # Определяем направления свечей
+                current_bullish = current['Close'] > current['Open']
+                previous_bullish = previous['Close'] > previous['Open']
+
+                # Engulfing должен быть противоположного направления
+                if current_bullish == previous_bullish:
+                    continue
+
+                # Размеры тел
+                current_body = abs(current['Close'] - current['Open'])
+                previous_body = abs(previous['Close'] - previous['Open'])
+
+                if previous_body == 0:
+                    continue
+
+                # Соотношение тел
+                body_ratio = current_body / previous_body
+
+                # Проверяем условие поглощения
+                if body_ratio >= min_body_ratio:
+                    # Проверяем полное поглощение
+                    is_full_engulfing = (
+                            current['High'] >= previous['High'] and
+                            current['Low'] <= previous['Low']
                     )
-                    patterns.append(pattern)
-        
-        logger.debug(f"Найдено {len(patterns)} паттернов Доджи")
-        return patterns
-    
-    def get_signal(self) -> str:
-        """Доджи обычно сигнализирует о неопределенности, но конкретные типы дают сигналы"""
-        if self.pattern_type == "dragonfly_doji":
-            # Дракония муха - бычий разворот
-            return "buy"
-        elif self.pattern_type == "gravestone_doji":
-            # Надгробие - медвежий разворот
-            return "sell"
-        elif self.pattern_type == "long_legged_doji":
-            # Длинноногий доджи - сильная неопределенность
-            return "hold"
-        else:
-            # Обычный доджи
-            return "hold"
 
-class HammerPattern(Pattern):
-    """Паттерн Молот и Повешенный"""
-    
-    def detect(self, data: pd.DataFrame) -> List['HammerPattern']:
-        patterns = []
-        
-        if len(data) < 3:
-            return patterns
-        
-        for i in range(2, len(data)):
-            current = data.iloc[i]
-            prev1 = data.iloc[i-1]
-            prev2 = data.iloc[i-2]
-            
-            open_price = current['open']
-            close_price = current['close']
-            high_price = current['high']
-            low_price = current['low']
-            
-            body_size = abs(close_price - open_price)
-            total_range = high_price - low_price
-            
-            if total_range > 0:
-                # Определение молота/повешенного
-                upper_shadow = high_price - max(open_price, close_price)
-                lower_shadow = min(open_price, close_price) - low_price
-                
-                # Условия для молота/повешенного:
-                # 1. Длинная нижняя тень (минимум 2/3 от всего диапазона)
-                # 2. Маленькая верхняя тень
-                # 3. Тело маленькое
-                is_long_lower_shadow = lower_shadow >= total_range * 0.66
-                is_small_upper_shadow = upper_shadow <= total_range * 0.1
-                is_small_body = body_size <= total_range * 0.33
-                
-                if is_long_lower_shadow and is_small_upper_shadow and is_small_body:
-                    # Определяем контекст тренда
-                    prev_trend_up = prev2['close'] < prev1['close'] < close_price
-                    prev_trend_down = prev2['close'] > prev1['close'] > close_price
-                    
-                    # Определяем бычье или медвежье тело
-                    is_bullish_body = close_price > open_price
-                    
-                    if prev_trend_down and is_bullish_body:
-                        # Молот (бычий разворот внизу нисходящего тренда)
-                        pattern_type = "hammer"
-                        confidence = 0.8
-                        if lower_shadow >= total_range * 0.75:
-                            confidence = 0.9
-                    elif prev_trend_up and not is_bullish_body:
-                        # Повешенный (медвежий разворот вверху восходящего тренда)
-                        pattern_type = "hanging_man"
-                        confidence = 0.8
-                        if lower_shadow >= total_range * 0.75:
-                            confidence = 0.9
-                    else:
-                        # Не в контексте тренда - менее надежно
-                        pattern_type = "hammer" if is_bullish_body else "hanging_man"
-                        confidence = 0.5
-                    
-                    pattern = HammerPattern(
-                        symbol=data['symbol'].iloc[i] if 'symbol' in data.columns else "Unknown",
-                        timestamp=data.index[i],
-                        pattern_type=pattern_type,
-                        confidence=confidence,
-                        data={
-                            'open': open_price,
-                            'high': high_price,
-                            'low': low_price,
-                            'close': close_price,
-                            'body_size': body_size,
-                            'total_range': total_range,
-                            'upper_shadow': upper_shadow,
-                            'lower_shadow': lower_shadow,
-                            'is_bullish': is_bullish_body
-                        }
+                    # Проверяем поглощение тела
+                    is_body_engulfing = (
+                            max(current['Open'], current['Close']) >= max(previous['Open'], previous['Close']) and
+                            min(current['Open'], current['Close']) <= min(previous['Open'], previous['Close'])
                     )
-                    patterns.append(pattern)
-        
-        logger.debug(f"Найдено {len(patterns)} паттернов Молот/Повешенный")
-        return patterns
-    
-    def get_signal(self) -> str:
-        """Сигнал зависит от типа паттерна"""
-        if self.pattern_type == "hammer":
-            return "buy"
-        elif self.pattern_type == "hanging_man":
-            return "sell"
-        return "hold"
 
-class EngulfingPattern(Pattern):
-    """Паттерн Поглощение"""
-    
-    def detect(self, data: pd.DataFrame) -> List['EngulfingPattern']:
-        patterns = []
-        
-        if len(data) < 3:
-            return patterns
-        
-        for i in range(1, len(data)):
-            current = data.iloc[i]
-            previous = data.iloc[i-1]
-            
-            curr_open = current['open']
-            curr_close = current['close']
-            prev_open = previous['open']
-            prev_close = previous['close']
-            
-            # Определяем направление свечей
-            prev_bullish = prev_close > prev_open
-            curr_bullish = curr_close > curr_open
-            
-            # Размеры тел
-            prev_body = abs(prev_close - prev_open)
-            curr_body = abs(curr_close - curr_open)
-            
-            # Условия поглощения
-            is_engulfing = False
-            pattern_type = ""
-            
-            if prev_bullish and not curr_bullish:
-                # Медвежье поглощение: бычья свеча, затем медвежья большего размера
-                is_engulfing = (curr_open > prev_close and curr_close < prev_open)
-                pattern_type = "bearish_engulfing"
-            elif not prev_bullish and curr_bullish:
-                # Бычье поглощение: медвежья свеча, затем бычья большего размера
-                is_engulfing = (curr_open < prev_close and curr_close > prev_open)
-                pattern_type = "bullish_engulfing"
-            
-            # Проверяем размер (текущая свеча должна быть значительно больше)
-            if is_engulfing and curr_body > prev_body * 1.5:
-                # Проверяем контекст тренда
-                if i >= 2:
-                    prev_trend = data.iloc[i-2]['close']
-                    if pattern_type == "bullish_engulfing" and prev_close < prev_trend:
-                        confidence = 0.9  # Разворот внизу нисходящего тренда
-                    elif pattern_type == "bearish_engulfing" and prev_close > prev_trend:
-                        confidence = 0.9  # Разворот вверху восходящего тренда
-                    else:
-                        confidence = 0.7
-                else:
-                    confidence = 0.7
-                
-                # Увеличиваем уверенность если свеча очень большая
-                if curr_body > prev_body * 2:
-                    confidence = min(confidence + 0.1, 1.0)
-                
-                pattern = EngulfingPattern(
-                    symbol=data['symbol'].iloc[i] if 'symbol' in data.columns else "Unknown",
-                    timestamp=data.index[i],
-                    pattern_type=pattern_type,
-                    confidence=confidence,
-                    data={
-                        'prev_open': prev_open,
-                        'prev_close': prev_close,
-                        'curr_open': curr_open,
-                        'curr_close': curr_close,
-                        'prev_body': prev_body,
-                        'curr_body': curr_body,
-                        'size_ratio': curr_body / prev_body if prev_body > 0 else 0
-                    }
-                )
-                patterns.append(pattern)
-        
-        logger.debug(f"Найдено {len(patterns)} паттернов Поглощение")
-        return patterns
-    
-    def get_signal(self) -> str:
-        """Сигнал зависит от типа поглощения"""
-        if self.pattern_type == "bullish_engulfing":
-            return "buy"
-        elif self.pattern_type == "bearish_engulfing":
-            return "sell"
-        return "hold"
+                    if is_body_engulfing or is_full_engulfing:
+                        # Проверяем объем
+                        current_volume = current.get('Volume', 1)
+                        previous_volume = previous.get('Volume', 1)
+                        volume_ratio = current_volume / previous_volume if previous_volume > 0 else 1
 
-class MorningStarPattern(Pattern):
-    """Паттерн Утренняя звезда и Вечерняя звезда"""
-    
-    def detect(self, data: pd.DataFrame) -> List['MorningStarPattern']:
-        patterns = []
-        
-        if len(data) < 3:
+                        if volume_ratio >= volume_increase:
+                            # Определяем тип паттерна
+                            if current_bullish:
+                                pattern_type = "bullish_engulfing"
+                                signal = "bullish"
+                            else:
+                                pattern_type = "bearish_engulfing"
+                                signal = "bearish"
+
+                            # Создаем описание паттерна
+                            pattern = {
+                                'index': i,
+                                'pattern_type': pattern_type,
+                                'timestamp': self.data.index[i],
+                                'current_open': current['Open'],
+                                'current_close': current['Close'],
+                                'current_high': current['High'],
+                                'current_low': current['Low'],
+                                'previous_open': previous['Open'],
+                                'previous_close': previous['Close'],
+                                'previous_high': previous['High'],
+                                'previous_low': previous['Low'],
+                                'current_body': current_body,
+                                'previous_body': previous_body,
+                                'body_ratio': body_ratio,
+                                'volume_ratio': volume_ratio,
+                                'is_full_engulfing': is_full_engulfing,
+                                'is_body_engulfing': is_body_engulfing,
+                                'signal': signal,
+                                'confidence': min(0.9, body_ratio / 3),
+                                'price_action': self._analyze_price_action(i),
+                                'trend_context': self._get_engulfing_trend_context(i)
+                            }
+
+                            patterns.append(pattern)
+
+            logger.info(f"Обнаружено {len(patterns)} паттернов Engulfing")
+            self.patterns = patterns
             return patterns
-        
-        for i in range(2, len(data)):
-            first = data.iloc[i-2]
-            second = data.iloc[i-1]
-            third = data.iloc[i]
-            
-            # Цены свечей
-            first_open = first['open']
-            first_close = first['close']
-            second_open = second['open']
-            second_close = second['close']
-            third_open = third['open']
-            third_close = third['close']
-            
-            # Определяем направление свечей
-            first_bullish = first_close > first_open
-            second_bullish = second_close > second_open
-            third_bullish = third_close > third_open
-            
-            # Размеры тел
-            first_body = abs(first_close - first_open)
-            second_body = abs(second_close - second_open)
-            third_body = abs(third_close - third_open)
-            
-            # Диапазоны свечей
-            first_range = first['high'] - first['low']
-            second_range = second['high'] - second['low']
-            third_range = third['high'] - third['low']
-            
-            # Условия для Утренней звезды (бычий разворот)
-            is_morning_star = (
-                not first_bullish and  # Первая - медвежья
-                second_body <= second_range * 0.3 and  # Вторая - маленькая свеча (доджи или спиннинг топ)
-                third_bullish and  # Третья - бычья
-                third_close > first_body * 0.5 + first_open  # Третья закрывается выше середины первой
-            )
-            
-            # Условия для Вечерней звезды (медвежий разворот)
-            is_evening_star = (
-                first_bullish and  # Первая - бычья
-                second_body <= second_range * 0.3 and  # Вторая - маленькая свеча
-                not third_bullish and  # Третья - медвежья
-                third_close < first_close - first_body * 0.5  # Третья закрывается ниже середины первой
-            )
-            
-            # Проверяем наличие гэпов для увеличения уверенности
-            if is_morning_star or is_evening_star:
-                # Проверяем гэпы между свечами
-                gap_down = second['high'] < first['low']  # Гэп вниз между первой и второй
-                gap_up = third['low'] > second['high']    # Гэп вверх между второй и третьей
-                
-                pattern_type = "morning_star" if is_morning_star else "evening_star"
-                
-                # Базовая уверенность
-                confidence = 0.7
-                
-                # Увеличиваем уверенность при наличии гэпов
-                if (is_morning_star and gap_down) or (is_evening_star and gap_up):
-                    confidence = 0.9
-                
-                # Увеличиваем уверенность если третья свеча длинная
-                if third_body > first_body * 0.8:
-                    confidence = min(confidence + 0.1, 1.0)
-                
-                pattern = MorningStarPattern(
-                    symbol=data['symbol'].iloc[i] if 'symbol' in data.columns else "Unknown",
-                    timestamp=data.index[i],
-                    pattern_type=pattern_type,
-                    confidence=confidence,
-                    data={
-                        'first_candle': {
-                            'open': first_open, 'close': first_close,
-                            'high': first['high'], 'low': first['low'],
-                            'is_bullish': first_bullish
-                        },
-                        'second_candle': {
-                            'open': second_open, 'close': second_close,
-                            'high': second['high'], 'low': second['low'],
-                            'is_bullish': second_bullish,
-                            'body_ratio': second_body / second_range if second_range > 0 else 0
-                        },
-                        'third_candle': {
-                            'open': third_open, 'close': third_close,
-                            'high': third['high'], 'low': third['low'],
-                            'is_bullish': third_bullish
-                        },
-                        'has_gap_down': gap_down,
-                        'has_gap_up': gap_up
-                    }
-                )
-                patterns.append(pattern)
-        
-        logger.debug(f"Найдено {len(patterns)} паттернов Утренняя/Вечерняя звезда")
-        return patterns
-    
-    def get_signal(self) -> str:
-        """Сигнал зависит от типа звезды"""
-        if self.pattern_type == "morning_star":
-            return "buy"
-        elif self.pattern_type == "evening_star":
-            return "sell"
-        return "hold"
+
+        except Exception as e:
+            logger.error(f"Ошибка при обнаружении паттерна Engulfing: {e}")
+            return []
+
+    def _analyze_price_action(self, index: int, window: int = 5) -> Dict[str, Any]:
+        """
+        Анализ ценового действия вокруг паттерна
+
+        Args:
+            index (int): Индекс свечи с паттерном
+            window (int): Окно анализа
+
+        Returns:
+            dict: Результаты анализа ценового действия
+        """
+        result = {
+            'before_trend': 'unknown',
+            'after_trend': 'unknown',
+            'volatility_before': 0,
+            'volatility_after': 0
+        }
+
+        if index < window or index + window >= len(self.data):
+            return result
+
+        try:
+            # Анализ до паттерна
+            before_data = self.data.iloc[index - window:index]
+            if len(before_data) > 1:
+                before_start = before_data.iloc[0]['Close']
+                before_end = before_data.iloc[-1]['Close']
+                result['before_trend'] = 'up' if before_end > before_start else 'down'
+                result['volatility_before'] = before_data['Close'].std()
+
+            # Анализ после паттерна (если данные доступны)
+            if index + 1 < len(self.data):
+                after_end_idx = min(index + window + 1, len(self.data))
+                after_data = self.data.iloc[index + 1:after_end_idx]
+
+                if len(after_data) > 1:
+                    after_start = after_data.iloc[0]['Close']
+                    after_end = after_data.iloc[-1]['Close']
+                    result['after_trend'] = 'up' if after_end > after_start else 'down'
+                    result['volatility_after'] = after_data['Close'].std()
+
+        except Exception as e:
+            logger.error(f"Ошибка при анализе ценового действия: {e}")
+
+        return result
+
+    def _get_engulfing_trend_context(self, index: int, lookback: int = 20) -> str:
+        """
+        Определение трендового контекста для паттерна Engulfing
+
+        Args:
+            index (int): Индекс свечи
+            lookback (int): Количество свечей для анализа
+
+        Returns:
+            str: Контекст тренда
+        """
+        if index < lookback:
+            return "insufficient_data"
+
+        try:
+            # Получаем данные для анализа
+            start_idx = max(0, index - lookback)
+            data_slice = self.data.iloc[start_idx:index]
+
+            if len(data_slice) < 5:
+                return "insufficient_data"
+
+            # Анализируем тренд
+            closes = data_slice['Close'].values
+            price_change = (closes[-1] - closes[0]) / closes[0] * 100
+
+            # Рассчитываем скользящие средние
+            sma_short = closes[-10:].mean() if len(closes) >= 10 else closes.mean()
+            sma_long = closes.mean()
+
+            # Определяем контекст
+            if price_change > 3 and sma_short > sma_long:
+                return "strong_uptrend"
+            elif price_change > 1:
+                return "uptrend"
+            elif price_change < -3 and sma_short < sma_long:
+                return "strong_downtrend"
+            elif price_change < -1:
+                return "downtrend"
+            else:
+                return "sideways"
+
+        except Exception as e:
+            logger.error(f"Ошибка при определении трендового контекста: {e}")
+            return "unknown"
+
+
+# Создаем экземпляры классов для удобства
+doji_pattern = DojiPattern(None)
+hammer_pattern = HammerPattern(None)
+engulfing_pattern = EngulfingPattern(None)
 

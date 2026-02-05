@@ -1,406 +1,484 @@
-"""
-Базовый класс для всех паттернов
-"""
-
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, Tuple
+import pandas as pd
 import numpy as np
-from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import logging
 
-@dataclass
-class PatternPoint:
-    """Точка паттерна"""
-    index: int  # Индекс свечи
-    price: float  # Цена точки
-    time: Optional[str] = None  # Временная метка
-    type: Optional[str] = None  # Тип точки (high, low, pivot и т.д.)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class PatternResult:
-    """Результат обнаружения паттерна"""
-    name: str
-    direction: str  # bullish, bearish, neutral
-    points: List[PatternPoint]
-    quality: float  # 0.0 - 1.0
-    confidence: float  # 0.0 - 1.0
-    targets: Dict[str, float] = field(default_factory=dict)  # Целевые уровни
-    metadata: Dict[str, Any] = field(default_factory=dict)
+logger = logging.getLogger(__name__)
 
 class BasePattern(ABC):
-    """Абстрактный базовый класс для всех паттернов"""
-
-    def __init__(self, name: str, min_points: int = 3):
-        self.name = name
-        self.min_points = min_points
-        self.pattern_type = self.__class__.__module__.split('.')[-1]
-
-    @abstractmethod
-    def detect(self, data: Dict[str, np.ndarray]) -> List[PatternResult]:
+    """
+    Базовый абстрактный класс для всех паттернов
+    """
+    
+    def __init__(self, data: Optional[pd.DataFrame] = None):
         """
-        Детектирование паттерна
-
+        Инициализация базового паттерна
+        
         Args:
-            data: Входные данные OHLC
-
+            data (pd.DataFrame): Финансовые данные для анализа
+        """
+        self.data = data
+        self.patterns = []
+        self.metrics = {}
+        self.validation_rules = {}
+        self._initialize()
+        
+    def _initialize(self):
+        """Инициализация внутренних структур"""
+        self.patterns = []
+        self.metrics = {}
+        self.validation_rules = {
+            'min_confidence': 0.5,
+            'min_volume_ratio': 0.8,
+            'max_volatility': 0.05
+        }
+        
+    @abstractmethod
+    def detect(self, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Абстрактный метод для обнаружения паттернов
+        
         Returns:
-            Список обнаруженных паттернов
+            list: Список обнаруженных паттернов
         """
         pass
-
-    def validate_points(self, points: List[PatternPoint]) -> bool:
-        """Валидация точек паттерна"""
-        if len(points) < self.min_points:
-            return False
-
-        # Проверка уникальности индексов
-        indices = [p.index for p in points]
-        if len(set(indices)) != len(indices):
-            return False
-
-        # Проверка порядка индексов
-        if sorted(indices) != indices:
-            return False
-
-        return True
-
-    def calculate_quality(self, points: List[PatternPoint],
-                         ideal_pattern: List[Tuple[float, float]]) -> float:
+        
+    def calculate_metrics(self) -> Dict[str, Any]:
         """
-        Расчет качества паттерна на основе отклонения от идеальной формы
-
-        Args:
-            points: Фактические точки паттерна
-            ideal_pattern: Идеальные относительные координаты [(x_rel, y_rel), ...]
-
+        Расчет метрик для обнаруженных паттернов
+        
         Returns:
-            Оценка качества 0.0-1.0
+            dict: Метрики паттернов
         """
-        if len(points) != len(ideal_pattern):
-            return 0.0
-
-        # Нормализация координат
-        indices = [p.index for p in points]
-        prices = [p.price for p in points]
-
-        min_idx = min(indices)
-        max_idx = max(indices)
-        min_price = min(prices)
-        max_price = max(prices)
-
-        if max_idx == min_idx or max_price == min_price:
-            return 0.5
-
-        # Преобразование в относительные координаты
-        actual_points = []
-        for i, point in enumerate(points):
-            x_rel = (point.index - min_idx) / (max_idx - min_idx)
-            y_rel = (point.price - min_price) / (max_price - min_price)
-            actual_points.append((x_rel, y_rel))
-
-        # Расчет среднеквадратичной ошибки
-        mse = 0.0
-        for actual, ideal in zip(actual_points, ideal_pattern):
-            dx = actual[0] - ideal[0]
-            dy = actual[1] - ideal[1]
-            mse += dx*dx + dy*dy
-
-        mse /= len(actual_points)
-
-        # Преобразование MSE в качество (чем меньше ошибка, тем выше качество)
-        quality = 1.0 / (1.0 + 10.0 * mse)
-        return min(max(quality, 0.0), 1.0)
-
-    def calculate_confidence(self, points: List[PatternPoint],
-                           data: Dict[str, np.ndarray]) -> float:
-        """
-        Расчет уверенности в паттерне
-
-        Args:
-            points: Точки паттерна
-            data: Входные данные
-
-        Returns:
-            Оценка уверенности 0.0-1.0
-        """
-        if not points:
-            return 0.0
-
-        # 1. Проверка свечей вокруг паттерна
-        candle_score = self._evaluate_candles_around_pattern(points, data)
-
-        # 2. Проверка объема
-        volume_score = self._evaluate_volume(points, data)
-
-        # 3. Проверка тренда
-        trend_score = self._evaluate_trend(points, data)
-
-        # Итоговая уверенность
-        confidence = (candle_score + volume_score + trend_score) / 3.0
-        return min(max(confidence, 0.0), 1.0)
-
-    def _evaluate_candles_around_pattern(self, points: List[PatternPoint],
-                                       data: Dict[str, np.ndarray]) -> float:
-        """Оценка свечей вокруг паттерна"""
-        if len(points) < 2:
-            return 0.5
-
-        closes = data.get('close', [])
-        if len(closes) == 0:
-            return 0.5
-
-        start_idx = points[0].index
-        end_idx = points[-1].index
-
-        # Анализируем свечи внутри паттерна
-        pattern_candles = closes[start_idx:end_idx+1]
-
-        if len(pattern_candles) < 2:
-            return 0.5
-
-        # Проверяем, есть ли длинные тени (признак борьбы)
-        if 'high' in data and 'low' in data:
-            highs = data['high'][start_idx:end_idx+1]
-            lows = data['low'][start_idx:end_idx+1]
-
-            avg_wick_size = np.mean((highs - closes[start_idx:end_idx+1]) +
-                                   (closes[start_idx:end_idx+1] - lows))
-            if avg_wick_size > 0:
-                # Большие тени - снижаем уверенность
-                wick_ratio = avg_wick_size / (np.max(highs) - np.min(lows))
-                return max(0.0, 1.0 - wick_ratio * 2)
-
-        return 0.7
-
-    def _evaluate_volume(self, points: List[PatternPoint],
-                        data: Dict[str, np.ndarray]) -> float:
-        """Оценка объема"""
-        if 'volume' not in data:
-            return 0.5
-
-        volumes = data['volume']
-        if len(volumes) == 0:
-            return 0.5
-
-        start_idx = points[0].index
-        end_idx = points[-1].index
-
-        pattern_volumes = volumes[start_idx:end_idx+1]
-
-        if len(pattern_volumes) == 0:
-            return 0.5
-
-        # Проверяем, выше ли объем на паттерне, чем средний
-        if start_idx > 20:
-            avg_volume_before = np.mean(volumes[start_idx-20:start_idx])
-        else:
-            avg_volume_before = np.mean(volumes[:start_idx]) if start_idx > 0 else 0
-
-        if avg_volume_before > 0:
-            volume_ratio = np.mean(pattern_volumes) / avg_volume_before
-            # Высокий объем на паттерне - хороший знак
-            if volume_ratio > 1.5:
-                return 0.9
-            elif volume_ratio > 1.0:
-                return 0.7
-            else:
-                return 0.4
-
-        return 0.5
-
-    def _evaluate_trend(self, points: List[PatternPoint],
-                       data: Dict[str, np.ndarray]) -> float:
-        """Оценка тренда"""
-        if 'close' not in data:
-            return 0.5
-
-        closes = data['close']
-        if len(closes) < 10:
-            return 0.5
-
-        start_idx = points[0].index
-
-        # Анализируем тренд до паттерна
-        lookback = min(20, start_idx)
-        if lookback > 5:
-            prices_before = closes[start_idx-lookback:start_idx]
-            if len(prices_before) > 1:
-                # Линейная регрессия
-                x = np.arange(len(prices_before))
-                slope, _ = np.polyfit(x, prices_before, 1)
-
-                # Для разворотных паттернов хотим видеть сильный предыдущий тренд
-                # Для продолжения - слабый тренд или консолидацию
-                trend_strength = abs(slope)
-
-                if self.name.lower() in ['head_shoulders', 'double_top', 'double_bottom']:
-                    # Разворотные паттерны
-                    return min(1.0, trend_strength * 100)
-                else:
-                    # Паттерны продолжения
-                    return max(0.0, 1.0 - trend_strength * 100)
-
-        return 0.5
-
-    def calculate_targets(self, points: List[PatternPoint],
-                         pattern_type: str) -> Dict[str, float]:
-        """
-        Расчет целевых уровней для паттерна
-
-        Args:
-            points: Точки паттерна
-            pattern_type: Тип паттерна
-
-        Returns:
-            Словарь с целевыми уровнями
-        """
-        if len(points) < 2:
-            return {}
-
-        prices = [p.price for p in points]
-        indices = [p.index for p in points]
-
-        # Базовая реализация - высота паттерна
-        pattern_height = max(prices) - min(prices)
-
-        # Точка входа (последняя точка паттерна)
-        entry_price = points[-1].price
-
-        # Определение направления
-        direction = self._determine_direction(points)
-
-        targets = {
-            'entry_price': entry_price,
-            'pattern_height': pattern_height
-        }
-
-        # Добавление конкретных целей в зависимости от типа паттерна
-        if pattern_type == 'head_shoulders':
-            neckline = self._calculate_neckline(points)
-            if neckline is not None:
-                targets['neckline'] = neckline
-                if direction == 'bearish':
-                    targets['stop_loss'] = max(prices) * 1.01
-                    targets['take_profit'] = entry_price - pattern_height
-                else:
-                    targets['stop_loss'] = min(prices) * 0.99
-                    targets['take_profit'] = entry_price + pattern_height
-
-        elif pattern_type == 'double_top':
-            resistance = max(prices)
-            targets['resistance'] = resistance
-            if direction == 'bearish':
-                targets['stop_loss'] = resistance * 1.01
-                targets['take_profit'] = entry_price - pattern_height
-
-        elif pattern_type == 'double_bottom':
-            support = min(prices)
-            targets['support'] = support
-            if direction == 'bullish':
-                targets['stop_loss'] = support * 0.99
-                targets['take_profit'] = entry_price + pattern_height
-
-        elif pattern_type in ['triangle', 'wedge', 'flag']:
-            # Для паттернов продолжения
-            if direction == 'bullish':
-                targets['stop_loss'] = min(prices) * 0.99
-                targets['take_profit'] = entry_price + pattern_height
-            else:
-                targets['stop_loss'] = max(prices) * 1.01
-                targets['take_profit'] = entry_price - pattern_height
-
-        return targets
-
-    def _determine_direction(self, points: List[PatternPoint]) -> str:
-        """Определение направления паттерна"""
-        if len(points) < 2:
-            return 'neutral'
-
-        prices = [p.price for p in points]
-
-        # Простой алгоритм определения направления
-        first_half = prices[:len(prices)//2]
-        second_half = prices[len(prices)//2:]
-
-        avg_first = np.mean(first_half)
-        avg_second = np.mean(second_half)
-
-        if avg_second > avg_first * 1.01:
-            return 'bullish'
-        elif avg_second < avg_first * 0.99:
-            return 'bearish'
-        else:
-            return 'neutral'
-
-    def _calculate_neckline(self, points: List[PatternPoint]) -> Optional[float]:
-        """Расчет линии шеи для паттерна Голова и Плечи"""
-        if len(points) < 4:
-            return None
-
-        # Ищем две точки для линии шеи (обычно точки 1 и 3 в 5-точечном паттерне)
-        if len(points) >= 5:
-            # Для Head and Shoulders: точки 1 и 4 (0-indexed: 0 и 3)
-            neckline_points = [points[0], points[3]]
-        elif len(points) >= 4:
-            # Для Inverse Head and Shoulders: точки 1 и 3 (0-indexed: 0 и 2)
-            neckline_points = [points[0], points[2]]
-        else:
-            return None
-
-        # Линейная интерполяция
-        x1, y1 = neckline_points[0].index, neckline_points[0].price
-        x2, y2 = neckline_points[1].index, neckline_points[1].price
-
-        if x2 == x1:
-            return None
-
-        # Уравнение линии: y = slope * x + intercept
-        slope = (y2 - y1) / (x2 - x1)
-        intercept = y1 - slope * x1
-
-        # Возвращаем цену на последнем баре паттерна
-        last_idx = points[-1].index
-        return slope * last_idx + intercept
-
-    def create_result(self,
-                     name: str,
-                     points: List[PatternPoint],
-                     quality: float,
-                     confidence: float,
-                     targets: Optional[Dict[str, float]] = None) -> PatternResult:
-        """
-        Создание результата паттерна
-
-        Args:
-            name: Название паттерна
-            points: Точки паттерна
-            quality: Качество паттерна
-            confidence: Уверенность
-            targets: Целевые уровни
-
-        Returns:
-            PatternResult
-        """
-        if targets is None:
-            targets = {}
-
-        direction = self._determine_direction(points)
-
-        # Автогенерация стоп-лосса и тейк-профита если не заданы
-        if 'stop_loss' not in targets or 'take_profit' not in targets:
-            auto_targets = self.calculate_targets(points, name)
-            targets.update(auto_targets)
-
-        return PatternResult(
-            name=name,
-            direction=direction,
-            points=points,
-            quality=quality,
-            confidence=confidence,
-            targets=targets,
-            metadata={
-                'pattern_type': self.pattern_type,
-                'detector': self.__class__.__name__
+        if not self.patterns:
+            self.metrics = {
+                'error': 'No patterns detected',
+                'total_patterns': 0,
+                'timestamp': datetime.now()
             }
-        )
+            return self.metrics
+            
+        try:
+            # Базовые метрики
+            metrics = {
+                'total_patterns': len(self.patterns),
+                'pattern_types': {},
+                'avg_confidence': 0,
+                'min_confidence': 1,
+                'max_confidence': 0,
+                'success_rate': 0,
+                'risk_reward_stats': {},
+                'timestamp': datetime.now()
+            }
+            
+            # Сбор данных для агрегации
+            confidences = []
+            success_flags = []
+            risk_rewards = []
+            volatilities = []
+            volumes = []
+            
+            pattern_type_stats = {}
+            
+            for pattern in self.patterns:
+                # Статистика по типам
+                p_type = pattern.get('pattern_type', 'unknown')
+                pattern_type_stats[p_type] = pattern_type_stats.get(p_type, 0) + 1
+                
+                # Сбор данных
+                conf = pattern.get('confidence', 0)
+                if conf is not None:
+                    confidences.append(conf)
+                
+                success = pattern.get('success', None)
+                if success is not None:
+                    success_flags.append(success)
+                
+                rr = pattern.get('risk_reward_ratio', None)
+                if rr is not None:
+                    risk_rewards.append(rr)
+                
+                vol = pattern.get('volatility', None)
+                if vol is not None:
+                    volatilities.append(vol)
+                
+                vol_ratio = pattern.get('volume_ratio', None)
+                if vol_ratio is not None:
+                    volumes.append(vol_ratio)
+            
+            # Обновляем статистику по типам
+            metrics['pattern_types'] = pattern_type_stats
+            
+            # Агрегация уверенности
+            if confidences:
+                metrics['avg_confidence'] = float(np.mean(confidences))
+                metrics['min_confidence'] = float(np.min(confidences))
+                metrics['max_confidence'] = float(np.max(confidences))
+                metrics['confidence_std'] = float(np.std(confidences))
+            
+            # Статистика успешности
+            if success_flags:
+                success_rate = sum(success_flags) / len(success_flags) * 100
+                metrics['success_rate'] = float(success_rate)
+                metrics['success_count'] = int(sum(success_flags))
+                metrics['failure_count'] = int(len(success_flags) - sum(success_flags))
+            
+            # Статистика риск/вознаграждение
+            if risk_rewards:
+                metrics['risk_reward_stats'] = {
+                    'avg': float(np.mean(risk_rewards)),
+                    'min': float(np.min(risk_rewards)),
+                    'max': float(np.max(risk_rewards)),
+                    'median': float(np.median(risk_rewards)),
+                    'std': float(np.std(risk_rewards))
+                }
+            
+            # Статистика волатильности
+            if volatilities:
+                metrics['volatility_stats'] = {
+                    'avg': float(np.mean(volatilities)),
+                    'max': float(np.max(volatilities)),
+                    'min': float(np.min(volatilities))
+                }
+            
+            # Статистика объема
+            if volumes:
+                metrics['volume_stats'] = {
+                    'avg_ratio': float(np.mean(volumes)),
+                    'max_ratio': float(np.max(volumes)),
+                    'min_ratio': float(np.min(volumes))
+                }
+            
+            # Временные метрики
+            if len(self.patterns) > 1:
+                try:
+                    timestamps = []
+                    for pattern in self.patterns:
+                        ts = pattern.get('timestamp')
+                        if isinstance(ts, datetime):
+                            timestamps.append(ts.timestamp())
+                        elif isinstance(ts, str):
+                            try:
+                                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                timestamps.append(dt.timestamp())
+                            except:
+                                pass
+                    
+                    if len(timestamps) > 1:
+                        timestamps.sort()
+                        time_diffs = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+                        metrics['time_between_patterns_seconds'] = float(np.mean(time_diffs))
+                        metrics['time_between_patterns_hours'] = float(np.mean(time_diffs) / 3600)
+                except Exception as e:
+                    logger.error(f"Ошибка расчета временных метрик: {e}")
+            
+            self.metrics = metrics
+            logger.info(f"Рассчитаны метрики для {len(self.patterns)} паттернов")
+            return metrics
+            
+        except Exception as e:
+            error_msg = f"Ошибка расчета метрик: {e}"
+            logger.error(error_msg)
+            self.metrics = {
+                'error': error_msg,
+                'total_patterns': len(self.patterns),
+                'timestamp': datetime.now()
+            }
+            return self.metrics
+            
+    def validate(self, min_confidence: float = 0.6, 
+                min_volume_ratio: float = 0.8,
+                max_volatility: float = 0.05) -> 'BasePattern':
+        """
+        Валидация паттернов по заданным критериям
+        
+        Args:
+            min_confidence (float): Минимальная уверенность
+            min_volume_ratio (float): Минимальное соотношение объема
+            max_volatility (float): Максимальная волатильность
+            
+        Returns:
+            BasePattern: Текущий экземпляр для цепочки вызовов
+        """
+        if not self.patterns:
+            logger.warning("Нет паттернов для валидации")
+            return self
+            
+        validated_patterns = []
+        validation_errors = []
+        
+        # Обновляем правила валидации
+        self.validation_rules = {
+            'min_confidence': min_confidence,
+            'min_volume_ratio': min_volume_ratio,
+            'max_volatility': max_volatility,
+            'validation_time': datetime.now()
+        }
+        
+        for i, pattern in enumerate(self.patterns):
+            is_valid = True
+            errors = []
+            
+            try:
+                # Проверка уверенности
+                confidence = pattern.get('confidence', 0)
+                if confidence < min_confidence:
+                    is_valid = False
+                    errors.append(f'Low confidence: {confidence:.2f} < {min_confidence}')
+                
+                # Проверка объема
+                volume_ratio = pattern.get('volume_ratio', 1)
+                if volume_ratio < min_volume_ratio:
+                    is_valid = False
+                    errors.append(f'Low volume: {volume_ratio:.2f} < {min_volume_ratio}')
+                
+                # Проверка волатильности
+                volatility = pattern.get('volatility', 0)
+                if volatility > max_volatility:
+                    pattern['high_volatility_warning'] = True
+                    errors.append(f'High volatility: {volatility:.3f} > {max_volatility}')
+                    # Высокая волатильность не делает паттерн невалидным, только предупреждение
+                
+                # Проверка данных
+                required_bars = pattern.get('required_bars', 0)
+                if self.data is not None and len(self.data) < required_bars:
+                    is_valid = False
+                    errors.append(f'Insufficient data: {len(self.data)} < {required_bars}')
+                
+                # Проверка индекса
+                pattern_index = pattern.get('index', -1)
+                if self.data is not None and (pattern_index < 0 or pattern_index >= len(self.data)):
+                    is_valid = False
+                    errors.append(f'Invalid index: {pattern_index}')
+                
+                if is_valid:
+                    pattern['is_validated'] = True
+                    pattern['validation_errors'] = []
+                    pattern['validation_time'] = datetime.now()
+                    validated_patterns.append(pattern)
+                else:
+                    pattern['is_validated'] = False
+                    pattern['validation_errors'] = errors
+                    validation_errors.append({
+                        'index': i,
+                        'pattern_type': pattern.get('pattern_type', 'unknown'),
+                        'errors': errors
+                    })
+                    
+            except Exception as e:
+                error_msg = f"Ошибка валидации паттерна {i}: {e}"
+                logger.error(error_msg)
+                pattern['is_validated'] = False
+                pattern['validation_errors'] = [error_msg]
+                validation_errors.append({
+                    'index': i,
+                    'pattern_type': pattern.get('pattern_type', 'unknown'),
+                    'errors': [error_msg]
+                })
+        
+        # Обновляем список паттернов
+        self.patterns = validated_patterns
+        
+        # Логируем результаты валидации
+        if validation_errors:
+            logger.warning(f"Валидация: {len(validation_errors)} паттернов не прошли проверку")
+            for error in validation_errors[:5]:  # Логируем первые 5 ошибок
+                logger.debug(f"Ошибка паттерна {error['index']} ({error['pattern_type']}): {error['errors']}")
+        else:
+            logger.info(f"Все {len(validated_patterns)} паттернов прошли валидацию")
+        
+        # Обновляем статистику валидации
+        self.validation_rules['total_validated'] = len(validated_patterns)
+        self.validation_rules['total_rejected'] = len(validation_errors)
+        self.validation_rules['validation_errors'] = validation_errors
+        
+        return self
+        
+    def get_patterns(self) -> List[Dict[str, Any]]:
+        """
+        Получение обнаруженных паттернов
+        
+        Returns:
+            list: Список паттернов
+        """
+        return self.patterns.copy()
+        
+    def get_metrics(self) -> Dict[str, Any]:
+        """
+        Получение рассчитанных метрик
+        
+        Returns:
+            dict: Метрики паттернов
+        """
+        return self.metrics.copy()
+        
+    def get_validation_rules(self) -> Dict[str, Any]:
+        """
+        Получение правил валидации
+        
+        Returns:
+            dict: Правила валидации
+        """
+        return self.validation_rules.copy()
+        
+    def clear(self) -> 'BasePattern':
+        """
+        Очистка обнаруженных паттернов
+        
+        Returns:
+            BasePattern: Текущий экземпляр для цепочки вызовов
+        """
+        self.patterns = []
+        self.metrics = {}
+        self.validation_rules = {}
+        logger.info("Паттерны очищены")
+        return self
+        
+    def filter_by_confidence(self, min_confidence: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Фильтрация паттернов по уверенности
+        
+        Args:
+            min_confidence (float): Минимальная уверенность
+            
+        Returns:
+            list: Отфильтрованные паттерны
+        """
+        filtered = [
+            p for p in self.patterns 
+            if p.get('confidence', 0) >= min_confidence
+        ]
+        logger.info(f"Отфильтровано {len(filtered)} паттернов с уверенностью >= {min_confidence}")
+        return filtered
+        
+    def filter_by_type(self, pattern_type: str) -> List[Dict[str, Any]]:
+        """
+        Фильтрация паттернов по типу
+        
+        Args:
+            pattern_type (str): Тип паттерна
+            
+        Returns:
+            list: Отфильтрованные паттерны
+        """
+        filtered = [
+            p for p in self.patterns 
+            if p.get('pattern_type', '').lower() == pattern_type.lower()
+        ]
+        logger.info(f"Отфильтровано {len(filtered)} паттернов типа '{pattern_type}'")
+        return filtered
+        
+    def save_patterns(self, filename: str) -> bool:
+        """
+        Сохранение паттернов в файл
+        
+        Args:
+            filename (str): Имя файла
+            
+        Returns:
+            bool: True если успешно
+        """
+        try:
+            import json
+            from datetime import datetime
+            
+            # Преобразуем datetime в строки
+            def datetime_converter(obj):
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                raise TypeError(f"Type {type(obj)} not serializable")
+            
+            data = {
+                'patterns': self.patterns,
+                'metrics': self.metrics,
+                'validation_rules': self.validation_rules,
+                'save_time': datetime.now().isoformat()
+            }
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, default=datetime_converter, indent=2)
+            
+            logger.info(f"Паттерны сохранены в {filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения паттернов в {filename}: {e}")
+            return False
+            
+    def load_patterns(self, filename: str) -> bool:
+        """
+        Загрузка паттернов из файла
+        
+        Args:
+            filename (str): Имя файла
+            
+        Returns:
+            bool: True если успешно
+        """
+        try:
+            import json
+            from datetime import datetime
+            
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Восстанавливаем datetime
+            def restore_datetime(obj):
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if isinstance(value, str):
+                            try:
+                                obj[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                            except:
+                                pass
+                        elif isinstance(value, list):
+                            for i, item in enumerate(value):
+                                if isinstance(item, str):
+                                    try:
+                                        value[i] = datetime.fromisoformat(item.replace('Z', '+00:00'))
+                                    except:
+                                        pass
+                return obj
+            
+            data = restore_datetime(data)
+            
+            self.patterns = data.get('patterns', [])
+            self.metrics = data.get('metrics', {})
+            self.validation_rules = data.get('validation_rules', {})
+            
+            logger.info(f"Загружено {len(self.patterns)} паттернов из {filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки паттернов из {filename}: {e}")
+            return False
+            
+    def __len__(self) -> int:
+        """
+        Возвращает количество обнаруженных паттернов
+        
+        Returns:
+            int: Количество паттернов
+        """
+        return len(self.patterns)
+        
+    def __str__(self) -> str:
+        """
+        Строковое представление паттернов
+        
+        Returns:
+            str: Информация о паттернах
+        """
+        if not self.patterns:
+            return "No patterns detected"
+            
+        pattern_types = {}
+        for pattern in self.patterns:
+            p_type = pattern.get('pattern_type', 'unknown')
+            pattern_types[p_type] = pattern_types.get(p_type, 0) + 1
+        
+        type_str = ', '.join([f"{k}: {v}" for k, v in pattern_types.items()])
+        return f"Patterns: {len(self.patterns)} total, Types: {type_str}"
 
